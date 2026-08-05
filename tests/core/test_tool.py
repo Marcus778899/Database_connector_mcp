@@ -2,7 +2,7 @@ import pytest
 from pydantic import ValidationError
 from typing import Any
 
-from core.tool import (
+from src.core.tool import (
     ContainerType,
     ProfileMode,
     ContainerInfo,

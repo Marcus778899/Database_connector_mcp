@@ -297,6 +297,7 @@ name = "database-mcp-connector"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "loggerhelper" },
     { name = "pydantic" },
 ]
 
@@ -336,6 +337,7 @@ dev = [
 requires-dist = [
     { name = "cryptography", marker = "extra == 'server'", specifier = ">=42" },
     { name = "fastmcp", marker = "extra == 'server'", specifier = ">=2.3" },
+    { name = "loggerhelper", path = "lib/loggerhelper-1.0.0-py3-none-any.whl" },
     { name = "psycopg", extras = ["binary"], marker = "extra == 'postgres'", specifier = ">=3.1" },
     { name = "pyarrow", marker = "extra == 'datalake'", specifier = ">=15" },
     { name = "pydantic", specifier = ">=2.7" },
@@ -655,6 +657,14 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/43/4b/674af6ef2f97d56f0ab5153bf0bfa28ccb6c3ed4d1babf4305449668807b/keyring-25.7.0.tar.gz", hash = "sha256:fe01bd85eb3f8fb3dd0405defdeac9a5b4f6f0439edbb3149577f244a2e8245b", size = 63516, upload-time = "2025-11-16T16:26:09.482Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/81/db/e655086b7f3a705df045bf0933bdd9c2f79bb3c97bfef1384598bb79a217/keyring-25.7.0-py3-none-any.whl", hash = "sha256:be4a0b195f149690c166e850609a477c532ddbfbaed96a404d4e43f8d5e2689f", size = 39160, upload-time = "2025-11-16T16:26:08.402Z" },
+]
+
+[[package]]
+name = "loggerhelper"
+version = "1.0.0"
+source = { path = "lib/loggerhelper-1.0.0-py3-none-any.whl" }
+wheels = [
+    { filename = "loggerhelper-1.0.0-py3-none-any.whl", hash = "sha256:78a505064b0475d1d1ca9e7ecb6830676d52c20f3b93b74f49477bc437863037" },
 ]
 
 [[package]]
