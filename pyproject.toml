@@ -5,6 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "loggerhelper",
     "pydantic>=2.7",
 ]
 
@@ -42,4 +43,7 @@ packages = ["mcp_connector"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-pythonpath = ["src"]
+pythonpath = ["."]
+
+[tool.uv.sources]
+loggerhelper = { path = "lib/loggerhelper-1.0.0-py3-none-any.whl" }
