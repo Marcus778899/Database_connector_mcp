@@ -1,12 +1,20 @@
 """
 Key and token issuing, run by whoever operates the server.
 
-Deliberately a separate command from `mcp-connector`: the server verifies
-tokens and must never be able to mint one. Nothing here runs inside it.
+An entry point, so it sits beside `main.py` rather than under `src/`: that tree
+is the library the server is built from, and this is a command run by hand, on
+an operator's machine, nowhere near a running server.
+
+Deliberately a separate command from `mcp-connector` as well. The server
+verifies tokens and must never be able to mint one, so the signing key is only
+ever handled here.
 
     mcp-connector-token keygen  --kid pm-explorer --keys-dir ./keys --out ./pm.pem
     mcp-connector-token issue   --key ./pm.pem --kid pm-explorer \\
         --scope list_containers --scope get_schema --lifetime 30d
+
+Named `issue_token`, not `token`: the repository root is on the import path,
+and a module named `token` there would shadow the standard library's.
 """
 
 from __future__ import annotations

@@ -2,9 +2,13 @@
 Who is allowed to call this server.
 
 The shape is forced by `mcp.json`: it can carry a static header but cannot
-compute a signature, so the signing happens offline (`cli.py`) and the server
-only ever verifies (`verifier.py`) against a directory of public keys
-(`keys.py`). The server therefore holds nothing it could mint a token with.
+compute a signature, so the signing happens offline and the server only ever
+verifies (`verifier.py`) against a directory of public keys (`keys.py`). The
+server therefore holds nothing it could mint a token with.
+
+`issue.py` is the signing half, and it lives here rather than in the entry
+point because it is worth testing on its own; the command that drives it is
+`issue_token.py`, in the repository root beside `main.py`.
 """
 
 from __future__ import annotations

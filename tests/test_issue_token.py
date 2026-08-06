@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from src.auth import cli
+import issue_token as cli
 from src.auth.keys import KEY_SUFFIX, PublicKeyDirectory
 from src.auth.verifier import SignedTokenVerifier
 
