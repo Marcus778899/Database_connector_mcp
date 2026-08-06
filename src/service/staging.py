@@ -85,8 +85,8 @@ def _reject_source_overlap(staging: Path, source: str | Path | None) -> None:
         return
     if staging.expanduser().resolve() == source_path.expanduser().resolve():
         raise StagingPathConflictError(
-            f"staging path {staging} is the source database; point STAGING_DB "
-            "somewhere else"
+            f"staging path {staging} is the source database; point "
+            "MCP_STAGING_DB somewhere else"
         )
 
 

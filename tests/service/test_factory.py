@@ -63,19 +63,25 @@ def test_create_adapter_rejects_unknown_engine():
 # ---- load_adapter_class ----
 
 
-def test_load_implemented_adapter():
-    cls = load_adapter_class(SourceEngine.DATALAKE)
-    assert cls.__name__ == "DatalakeAdapter"
+@pytest.mark.parametrize(
+    ("engine", "expected"),
+    [
+        (SourceEngine.SQLITE, "SqliteAdapter"),
+        (SourceEngine.DATALAKE, "DatalakeAdapter"),
+    ],
+)
+def test_load_implemented_adapter(engine: SourceEngine, expected: str):
+    assert load_adapter_class(engine).__name__ == expected
 
 
-def test_adapter_class_satisfies_the_factory_protocol():
-    assert isinstance(load_adapter_class(SourceEngine.DATALAKE), AdapterFactory)
+@pytest.mark.parametrize("engine", [SourceEngine.SQLITE, SourceEngine.DATALAKE])
+def test_adapter_class_satisfies_the_factory_protocol(engine: SourceEngine):
+    assert isinstance(load_adapter_class(engine), AdapterFactory)
 
 
 @pytest.mark.parametrize(
     "engine",
     [
-        SourceEngine.SQLITE,
         SourceEngine.POSTGRES,
         SourceEngine.MYSQL,
         SourceEngine.MSSQL,
