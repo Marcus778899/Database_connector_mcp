@@ -108,18 +108,17 @@ database"; over stdio there is nothing to defend, because spawning the process
 already hands over the credential.
 
 `mcp.json` can carry a static header but cannot compute a signature, so the
-signing happens offline and this server only ever verifies. Two commands, run by
-whoever operates it:
+signing happens outside the serving process. Same command, one word apart:
 
 ```bash
-uv run mcp-connector-token keygen --kid pm-explorer --keys-dir ./keys --out ./pm-explorer.pem
+uv run mcp-connector token keygen --kid pm-explorer --keys-dir ./keys --out ./pm-explorer.pem
 ```
 
 That writes `./keys/pm-explorer.pub`, which the server reads, and the signing key,
-which it never sees. Then per token:
+which the server never reads. Then per token:
 
 ```bash
-uv run mcp-connector-token issue --key ./pm-explorer.pem --kid pm-explorer --scope list_containers --scope get_schema --lifetime 30d
+uv run mcp-connector token issue --key ./pm-explorer.pem --kid pm-explorer --scope list_containers --scope get_schema --lifetime 30d
 ```
 
 The result goes in the agent's `Authorization: Bearer …` header. Serve with:
@@ -147,6 +146,38 @@ shared secret would be a forgery anyone could produce.
 Authentication is not authorisation. A valid token still gets a tool error for a
 tool outside its scopes, and the refusal is recorded in the audit trail like any
 other call.
+
+### In a container
+
+`token keygen --if-missing` succeeds quietly when the signing key is already
+there, which is what an entrypoint that runs on every start needs — generating a
+fresh pair would invalidate every token already handed out. It also puts the
+public half back if only that is gone, since the two can sit on different
+volumes.
+
+```bash
+#!/bin/sh
+set -e
+mcp-connector token keygen --kid pm-explorer \
+    --keys-dir /keys --out /secrets/pm-explorer.pem --if-missing
+mcp-connector token issue --key /secrets/pm-explorer.pem --kid pm-explorer \
+    --scope list_containers --scope get_schema --scope get_sample \
+    --lifetime 30d --out /tokens/pm-explorer.jwt
+exec mcp-connector --engine sqlite --connection-ref shop \
+    --transport http --host 0.0.0.0 --require-auth --authorized-keys-dir /keys
+```
+
+Hand `/tokens/pm-explorer.jwt` to the agent that needs it — that is the thing
+that goes in `mcp.json`, not the public key, which never leaves the server.
+
+One thing to be deliberate about: this puts the signing key on the server's
+host, which is the arrangement the split was meant to avoid — whoever takes the
+container can then mint tokens for any subject, and the audit trail's account of
+who did what stops being evidence. It is a defensible trade for a single-tenant
+deployment, where that container already holds the database credential. Keep
+`/secrets` a mounted volume rather than a baked-in layer, and if the audit trail
+ever has to stand up to scrutiny, move `keygen` out to wherever you run it by
+hand and let the container do nothing but `issue` — or nothing at all.
 
 ## Tools
 

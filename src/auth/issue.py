@@ -76,6 +76,30 @@ def generate_keypair(kid: str) -> KeyPair:
     return KeyPair(kid=kid, private_pem=private_pem, public_pem=public_pem)
 
 
+def public_key_of(private_pem: str) -> str:
+    """
+    Derive the public half from a signing key.
+
+    For the restart case: the signing key survives on its volume while the
+    directory the server reads does not, and regenerating the pair instead
+    would invalidate every token already issued.
+    """
+    try:
+        private = serialization.load_pem_private_key(
+            private_pem.encode("utf-8"), password=None
+        )
+    except ValueError as exc:
+        raise IssueError(f"not a usable signing key: {exc}") from exc
+    return (
+        private.public_key()
+        .public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        .decode("utf-8")
+    )
+
+
 def install_public_key(pair: KeyPair, keys_dir: str | Path) -> Path:
     """Put the public half where the server will look for it."""
     directory = Path(keys_dir)

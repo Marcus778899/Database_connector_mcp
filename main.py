@@ -19,6 +19,8 @@ from fastmcp import FastMCP
 from pydantic import ValidationError
 
 from src.auth import AuthConfigurationError
+from src.auth.commands import COMMAND as TOKEN_COMMAND
+from src.auth.commands import add_token_command, run_token_command
 from src.core.config import (
     MissingConnectionEnvError,
     ServerConfig,
@@ -101,6 +103,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="serve a network transport without auth on purpose. "
         "env MCP_ALLOW_INSECURE_HTTP",
     )
+    # Optional, so serving stays the bare form: `mcp-connector --engine sqlite …`
+    # is what every mcp.json in the wild already says.
+    commands = parser.add_subparsers(dest="command")
+    add_token_command(commands)
     return parser
 
 
@@ -243,6 +249,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     load_repo_dotenv()
 
     args = build_parser().parse_args(argv)
+    if getattr(args, "command", None) == TOKEN_COMMAND:
+        # issuing only: nothing below this line runs, so no source is opened
+        # and no port is bound
+        return run_token_command(args)
+
     try:
         config = config_from_args(args)
         mcp = build(config)
