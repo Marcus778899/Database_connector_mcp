@@ -373,6 +373,7 @@ INVENTORY_TOOLS = [
     "inventory_cancel",
     "inventory_columns",
     "inventory_containers",
+    "inventory_search",
     "inventory_start",
     "inventory_status",
     "inventory_summary",
@@ -387,7 +388,9 @@ def test_the_inventory_tools_appear_when_a_service_is_given(config, adapter, inv
     exposed = _tools(build_server(config, adapter, inventory=inventory))
 
     assert set(INVENTORY_TOOLS) <= set(exposed)
-    assert len(exposed) == 12
+    # inventory_export is not among them: this config has no export directory
+    assert len(exposed) == 13
+    assert "inventory_export" not in exposed
 
 
 def test_a_scan_can_be_started_and_polled(config, adapter, inventory):
@@ -443,11 +446,12 @@ def test_recorded_columns_include_the_profile(config, adapter, inventory):
             "inventory_columns", {"container": "users", "database": "datalake"}
         )
 
-    columns = _session(build_server(config, adapter, inventory=inventory), body)
+    page = _session(build_server(config, adapter, inventory=inventory), body)
 
-    assert [c.column_name for c in columns] == ["id", "tag"]
-    assert columns[0].profile is not None
-    assert columns[0].profile["null_ratio"]["null_ratio"] == 0.2
+    assert [c.column_name for c in page.columns] == ["id", "tag"]
+    assert page.next_cursor is None
+    assert page.columns[0].profile is not None
+    assert page.columns[0].profile["null_ratio"]["null_ratio"] == 0.2
 
 
 def test_an_unknown_job_is_a_tool_error(config, adapter, inventory):
@@ -534,13 +538,13 @@ def test_a_description_written_through_the_tool_survives_a_forced_rescan(
             "inventory_columns", {"container": "users", "database": "datalake"}
         )
 
-    written, columns = _session(mcp, body)
+    written, page = _session(mcp, body)
 
     assert (written.containers_updated, written.columns_updated) == (1, 2)
     assert written.unknown_columns == []
-    assert [c.description for c in columns] == ["surrogate key", "cohort"]
-    assert columns[0].description_source == "ai"
-    assert columns[1].sensitivity == "pii"
+    assert [c.description for c in page.columns] == ["surrogate key", "cohort"]
+    assert page.columns[0].description_source == "ai"
+    assert page.columns[1].sensitivity == "pii"
 
 
 def test_an_unknown_column_comes_back_rather_than_failing_the_write(
@@ -646,3 +650,158 @@ def test_shutdown_stops_the_inventory_workers(config, adapter, inventory):
     asyncio.run(run())
 
     assert all(not worker.is_alive() for worker in inventory._workers.values())
+
+
+# ---- search and export ----
+
+
+def test_search_finds_a_column_through_the_tool(config, adapter, inventory):
+    mcp = build_server(config, adapter, inventory=inventory)
+
+    async def body(call):
+        inventory.wait(await call("inventory_start", {}), timeout=20)
+        return await call("inventory_search", {"keyword": "tag"})
+
+    hits = _session(mcp, body)
+
+    assert [(h.container_name, h.column_name) for h in hits] == [
+        ("orders", "tag"),
+        ("users", "tag"),
+    ]
+    assert all(h.match_in == "name" for h in hits)
+
+
+def test_search_is_audited_by_how_much_came_back(config, adapter, inventory):
+    trail = AuditLogger(config.audit_log_path)
+    mcp = build_server(config, adapter, audit=trail, inventory=inventory)
+
+    async def body(call):
+        inventory.wait(await call("inventory_start", {}), timeout=20)
+        await call("inventory_search", {"keyword": "id"})
+
+    _session(mcp, body)
+
+    record = trail.records()[-1]
+    assert record["tool"] == "inventory_search"
+    assert record["rows_returned"] == 2
+    assert record["params"]["keyword"] == "id"
+
+
+def test_columns_are_paged_through_the_tool(config, adapter, inventory):
+    mcp = build_server(config, adapter, inventory=inventory)
+
+    async def body(call):
+        inventory.wait(await call("inventory_start", {}), timeout=20)
+        first = await call(
+            "inventory_columns",
+            {"container": "users", "database": "datalake", "limit": 1},
+        )
+        rest = await call(
+            "inventory_columns",
+            {
+                "container": "users",
+                "database": "datalake",
+                "limit": 1,
+                "cursor": first.next_cursor,
+            },
+        )
+        return first, rest
+
+    first, rest = _session(mcp, body)
+
+    assert [c.column_name for c in first.columns] == ["id"]
+    assert first.next_cursor == "1"
+    assert [c.column_name for c in rest.columns] == ["tag"]
+    assert rest.next_cursor is None
+
+
+def test_export_is_not_served_without_somewhere_to_write(config, adapter, inventory):
+    """Better than a tool that is present and fails on every call."""
+    assert "inventory_export" not in _tools(
+        build_server(config, adapter, inventory=inventory)
+    )
+
+
+def test_export_appears_when_an_export_directory_is_set(
+    config, adapter, inventory, tmp_path: Path
+):
+    config = config.model_copy(update={"export_dir": tmp_path / "exports"})
+
+    assert "inventory_export" in _tools(
+        build_server(config, adapter, inventory=inventory)
+    )
+
+
+def test_an_export_returns_a_path_and_not_the_catalog(
+    config, adapter, inventory, tmp_path: Path
+):
+    exports = tmp_path / "exports"
+    exports.mkdir()
+    config = config.model_copy(update={"export_dir": exports})
+    mcp = build_server(config, adapter, inventory=inventory)
+
+    async def body(call):
+        inventory.wait(await call("inventory_start", {}), timeout=20)
+        return await call("inventory_export", {"format": "markdown"})
+
+    result = _session(mcp, body)
+
+    assert Path(result.path).is_relative_to(exports)
+    assert result.containers == 2
+    assert result.bytes_written > 0
+    # where and how much, and nothing that could carry the catalog itself
+    assert set(vars(result)) == {"path", "bytes_written", "containers", "columns"}
+    assert Path(result.path).read_text(encoding="utf-8"), "the content is in the file"
+
+
+def test_an_export_path_outside_the_directory_is_refused(
+    config, adapter, inventory, tmp_path: Path
+):
+    """The check that makes the tool safe to expose: the caller is an agent
+    relaying a path it was given."""
+    exports = tmp_path / "exports"
+    exports.mkdir()
+    config = config.model_copy(update={"export_dir": exports})
+    mcp = build_server(config, adapter, inventory=inventory)
+
+    with pytest.raises(ToolError, match="outside the export directory"):
+        _call(mcp, "inventory_export", {"path": "../escaped.md"})
+
+    assert not (tmp_path / "escaped.md").exists()
+
+
+def test_an_export_is_audited_by_what_it_wrote(
+    config, adapter, inventory, tmp_path: Path
+):
+    exports = tmp_path / "exports"
+    exports.mkdir()
+    config = config.model_copy(update={"export_dir": exports})
+    trail = AuditLogger(config.audit_log_path)
+    mcp = build_server(config, adapter, audit=trail, inventory=inventory)
+
+    async def body(call):
+        inventory.wait(await call("inventory_start", {}), timeout=20)
+        await call("inventory_export", {"format": "csv"})
+
+    _session(mcp, body)
+
+    record = trail.records()[-1]
+    assert record["tool"] == "inventory_export"
+    assert record["bytes_written"] > 0
+    assert record["rows_returned"] == 4
+
+
+def test_a_bad_cursor_is_a_tool_error_not_a_silent_restart(config, adapter, inventory):
+    """An agent handed page one in answer to "the page after X" has no way to
+    tell it is going in circles."""
+    mcp = build_server(config, adapter, inventory=inventory)
+
+    async def body(call):
+        inventory.wait(await call("inventory_start", {}), timeout=20)
+        return await call(
+            "inventory_columns",
+            {"container": "users", "database": "datalake", "cursor": "nonsense"},
+        )
+
+    with pytest.raises(ToolError, match="next_cursor"):
+        _session(mcp, body)

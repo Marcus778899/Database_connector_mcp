@@ -30,6 +30,8 @@ INVENTORY_TOOLS = {
     "inventory_summary",
     "inventory_containers",
     "inventory_columns",
+    "inventory_search",
+    "inventory_annotate",
 }
 
 
@@ -306,3 +308,20 @@ def test_main_reports_a_configuration_error(capsys: pytest.CaptureFixture[str]):
     captured = capsys.readouterr()
     assert captured.out == ""
     assert "no connection" in captured.err
+
+
+def test_the_export_tool_follows_the_export_directory(source_env: str, tmp_path: Path):
+    """Configured end to end: the flag decides whether the tool exists at all."""
+    without = entry.build(
+        ServerConfig(connection_ref=source_env, staging_db_path=tmp_path / "staging.db")
+    )
+    assert "inventory_export" not in _tool_names(without)
+
+    with_export = entry.build(
+        ServerConfig(
+            connection_ref=source_env,
+            staging_db_path=tmp_path / "staging2.db",
+            export_dir=tmp_path / "exports",
+        )
+    )
+    assert "inventory_export" in _tool_names(with_export)

@@ -26,6 +26,24 @@ NO_SCHEMA = ""
 MARKER = "database-mcp-connector/staging"
 SCHEMA_VERSION = 2
 
+# Page sizes for the two reads that can otherwise return a whole catalog.
+DEFAULT_COLUMN_PAGE = 100
+DEFAULT_SEARCH_LIMIT = 50
+
+# How much of a description a search hit carries. Enough to judge whether this
+# is the column you meant; `inventory_columns` has the whole thing. Without a
+# bound, one long description makes a whole result set expensive, and a hit is
+# supposed to be cheap by construction rather than by luck.
+SEARCH_DESCRIPTION_CHARS = 120
+
+# Every column but the profile, which is most of a wide table's weight.
+_COLUMNS_WITHOUT_PROFILE = (
+    "database, schema_name, container_name, column_name, ordinal, native_type, "
+    "nullable, is_pk, is_fk, native_description, description, description_source, "
+    "description_updated_at, references_container, references_column, "
+    "sensitivity, sensitivity_source, scanned_at"
+)
+
 # Who wrote a description. The server decides this, never the caller.
 SOURCE_NATIVE = "native"
 SOURCE_AI = "ai"
@@ -109,6 +127,45 @@ def _now() -> str:
 def _blank_to_none(text: str) -> str | None:
     """A description of whitespace is a description no one wants back."""
     return text.strip() or None
+
+
+def _escape_like(text: str) -> str:
+    """
+    Neutralise LIKE's own wildcards.
+
+    Searching for `user_id` must not match `userXid`: `_` is a single-character
+    wildcard, and a caller looking for a column name is the commonest way to
+    meet one.
+    """
+    for char in ("\\", "%", "_"):
+        text = text.replace(char, f"\\{char}")
+    return text
+
+
+def _summarise(text: str | None) -> str | None:
+    """A description cut to what a search result can afford to carry."""
+    if text is None or len(text) <= SEARCH_DESCRIPTION_CHARS:
+        return text
+    return text[:SEARCH_DESCRIPTION_CHARS].rstrip() + "…"
+
+
+def _ordinal_cursor(cursor: str) -> int:
+    """
+    A cursor is the last ordinal returned, and nothing else is one.
+
+    Starting from the top instead would answer "the page after X" with page one
+    — the same rows again, with a cursor that leads back to them, and no way
+    for the caller to tell it is going in circles. A cursor is machine-made, so
+    one that will not parse means something is wrong upstream and saying so is
+    the only useful answer.
+    """
+    try:
+        return int(cursor)
+    except ValueError as exc:
+        raise InvalidCursorError(
+            f"{cursor!r} is not a cursor from a previous page; pass back the "
+            "`next_cursor` you were given, or nothing to start from the first"
+        ) from exc
 
 
 def _reject_source_overlap(staging: Path, source: str | Path | None) -> None:
@@ -222,6 +279,31 @@ class StoredContainerPage(BaseModel):
     next_cursor: str | None = None
 
 
+class StoredColumnPage(BaseModel):
+    columns: list[StoredColumn]
+    next_cursor: str | None = None
+
+
+class SearchHit(BaseModel):
+    """
+    One match, kept deliberately narrow.
+
+    No profile: this is what an agent reads to decide where to look, and a
+    hundred hits carrying their statistics is the context problem the search
+    exists to avoid. `inventory_columns` is the next call, on one container.
+    """
+
+    database: str
+    schema_name: str
+    container_name: str
+    # None for a container hit, the column's name for a column hit
+    column_name: str | None = None
+    native_type: str | None = None
+    description: str | None = None
+    # whether the keyword was found in the name or in a description
+    match_in: str
+
+
 class InventorySummary(BaseModel):
     database: str | None = None
     containers: int = 0
@@ -249,6 +331,10 @@ class OutdatedStagingSchemaError(StagingError):
 
 class UnknownStagedContainerError(Exception):
     """Nothing has been inventoried under that name."""
+
+
+class InvalidCursorError(Exception):
+    """The cursor did not come from a page this store handed out."""
 
 
 class StagingStore:
@@ -696,16 +782,152 @@ class StagingStore:
         )
 
     def columns(
-        self, database: str, container: str, schema: str | None = None
-    ) -> list[StoredColumn]:
+        self,
+        database: str,
+        container: str,
+        schema: str | None = None,
+        *,
+        limit: int = DEFAULT_COLUMN_PAGE,
+        cursor: str | None = None,
+        include_profile: bool = True,
+    ) -> StoredColumnPage:
+        """
+        One page of a container's columns, in ordinal order.
+
+        Paged because a wide table is the other way an inventory floods a
+        caller's context, and `include_profile=False` because on such a table
+        the statistics are most of the weight — the escape hatch for reading
+        the shape of a 300-column table without its every top-values list.
+        """
+        selected = "*" if include_profile else _COLUMNS_WITHOUT_PROFILE
+        clauses = ["database=?", "schema_name=?", "container_name=?"]
+        params: list[Any] = [database, schema or NO_SCHEMA, container]
+        if cursor is not None:
+            # keyset on the ordering column, as elsewhere; ordinals are unique
+            # within one container
+            clauses.append("ordinal>?")
+            params.append(_ordinal_cursor(cursor))
+        params.append(limit + 1)  # one extra row tells us whether more remain
+
         rows = self._rows(
-            "SELECT * FROM columns WHERE database=? AND schema_name=? "
-            "AND container_name=? ORDER BY ordinal",
-            (database, schema or NO_SCHEMA, container),
+            f"SELECT {selected} FROM columns WHERE {' AND '.join(clauses)} "  # noqa: S608
+            "ORDER BY ordinal LIMIT ?",
+            params,
         )
-        result = []
-        for row in rows:
+        page = []
+        for row in rows[:limit]:
             item = dict(row)
-            item["profile"] = json.loads(item["profile"]) if item["profile"] else None
-            result.append(StoredColumn(**item))
-        return result
+            raw = item.get("profile")
+            item["profile"] = json.loads(raw) if raw else None
+            page.append(StoredColumn(**item))
+        return StoredColumnPage(
+            columns=page,
+            next_cursor=str(page[-1].ordinal) if len(rows) > limit else None,
+        )
+
+    def search(
+        self,
+        keyword: str,
+        database: str | None = None,
+        *,
+        kind: str = "all",
+        limit: int = DEFAULT_SEARCH_LIMIT,
+    ) -> list[SearchHit]:
+        """
+        Containers and columns whose name or description mentions `keyword`.
+
+        The entry point for anyone who cannot read the whole catalog: without
+        it the only way in is paging through every container, which puts the
+        catalog into the context window one page at a time.
+
+        `LIKE` over the `columns_by_name` index rather than FTS5. A full scan of
+        a few hundred thousand rows is tens of milliseconds in SQLite, against
+        which FTS5 costs an index to keep in step with two writers and a
+        dependency on how CPython was compiled. Worth revisiting when something
+        is actually measured to be slow.
+        """
+        if not keyword.strip():
+            return []
+        pattern = f"%{_escape_like(keyword.strip())}%"
+        hits: list[SearchHit] = []
+        if kind in ("all", "container"):
+            hits.extend(self._container_hits(pattern, database, limit))
+        if kind in ("all", "column"):
+            hits.extend(self._column_hits(pattern, database, limit))
+        # The order decides what survives the limit below, so it is ranking and
+        # not tidiness. A keyword in a name is what the caller meant more often
+        # than the same word buried in prose; and among equals a container is
+        # the broader answer — "orders" almost always means the table, not some
+        # `orders_count` column, and there are far fewer of them to lose.
+        hits.sort(
+            key=lambda hit: (
+                hit.match_in != "name",
+                hit.column_name is not None,
+                hit.container_name,
+                hit.column_name or "",
+            )
+        )
+        return hits[:limit]
+
+    def _container_hits(
+        self, pattern: str, database: str | None, limit: int
+    ) -> list[SearchHit]:
+        clauses = [
+            "(container_name LIKE ? ESCAPE '\\' OR description LIKE ? ESCAPE '\\' "
+            "OR native_description LIKE ? ESCAPE '\\')"
+        ]
+        params: list[Any] = [pattern, pattern, pattern]
+        if database:
+            clauses.append("database=?")
+            params.append(database)
+        params.append(limit)
+        rows = self._rows(
+            "SELECT database, schema_name, container_name, description, "  # noqa: S608
+            f"native_description, container_name LIKE ? ESCAPE '\\' AS by_name "
+            f"FROM containers WHERE {' AND '.join(clauses)} "
+            "ORDER BY container_name LIMIT ?",
+            [pattern, *params],
+        )
+        return [
+            SearchHit(
+                database=row["database"],
+                schema_name=row["schema_name"],
+                container_name=row["container_name"],
+                description=_summarise(row["description"] or row["native_description"]),
+                match_in="name" if row["by_name"] else "description",
+            )
+            for row in rows
+        ]
+
+    def _column_hits(
+        self, pattern: str, database: str | None, limit: int
+    ) -> list[SearchHit]:
+        clauses = [
+            "(column_name LIKE ? ESCAPE '\\' OR description LIKE ? ESCAPE '\\' "
+            "OR native_description LIKE ? ESCAPE '\\')"
+        ]
+        params: list[Any] = [pattern, pattern, pattern]
+        if database:
+            clauses.append("database=?")
+            params.append(database)
+        params.append(limit)
+        rows = self._rows(
+            "SELECT database, schema_name, container_name, column_name, "  # noqa: S608
+            "native_type, description, native_description, "
+            f"column_name LIKE ? ESCAPE '\\' AS by_name "
+            f"FROM columns WHERE {' AND '.join(clauses)} "
+            "ORDER BY container_name, ordinal LIMIT ?",
+            [pattern, *params],
+        )
+        return [
+            SearchHit(
+                database=row["database"],
+                schema_name=row["schema_name"],
+                container_name=row["container_name"],
+                column_name=row["column_name"],
+                native_type=row["native_type"],
+                description=_summarise(row["description"] or row["native_description"]),
+                match_in="name" if row["by_name"] else "description",
+            )
+            for row in rows
+        ]
