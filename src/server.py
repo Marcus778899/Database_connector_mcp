@@ -22,7 +22,15 @@ from src.core.log import log
 from src.service.audit import AuditLogger
 from src.service.inventory import InventoryService, ScanStatus
 from src.service.pool import AdapterPool, AdapterProvider, SingleAdapter
-from src.service.staging import InventorySummary, StoredColumn, StoredContainerPage
+from src.service.staging import (
+    SOURCE_AI,
+    SOURCE_HUMAN,
+    AnnotateResult,
+    ColumnAnnotation,
+    InventorySummary,
+    StoredColumn,
+    StoredContainerPage,
+)
 
 # No token means stdio: the client spawned us and holds our environment.
 LOCAL_KEY_ID = "local"
@@ -30,6 +38,9 @@ LOCAL_KEY_ID = "local"
 # Tool name -> the caller's id, or a refusal. `_identity` with the server's
 # authentication requirement already bound in.
 Identify = Callable[[str], str]
+
+# A key may only claim its descriptions are a person's if it carries this.
+HUMAN_ANNOTATION_SCOPE = "annotate:human"
 
 
 def build_server(
@@ -96,6 +107,20 @@ def _identity(tool: str, *, require_auth: bool = False) -> str:
     if tool not in (token.scopes or []):
         raise ToolError(f"{token.subject or token.client_id} may not call {tool}")
     return token.subject or token.client_id or LOCAL_KEY_ID
+
+
+def _annotation_source() -> str:
+    """
+    Who a description came from — decided here, never taken from the caller.
+
+    An agent that could label its own guesses `human` would make the field
+    worthless, so a description counts as a person's only when the key that
+    carried it was granted that scope.
+    """
+    token = get_access_token()
+    if token is not None and HUMAN_ANNOTATION_SCOPE in (token.scopes or []):
+        return SOURCE_HUMAN
+    return SOURCE_AI
 
 
 def _register_tools(
@@ -298,6 +323,46 @@ def _register_inventory_tools(
             columns = _guard(store.columns)(database, container, schema)
             ctx.rows_returned = len(columns)
             return columns
+
+    @mcp.tool
+    def inventory_annotate(
+        database: str,
+        container: str,
+        schema: str | None = None,
+        container_description: str | None = None,
+        columns: list[ColumnAnnotation] | None = None,
+    ) -> AnnotateResult:
+        """
+        Describe what an inventoried table and its columns actually hold.
+
+        The only tool here that writes, and it writes to the inventory alone —
+        the source database is never touched. A rescan keeps what is written
+        here; a field left out is left as it was, and a blank one clears it.
+        Column names that are not in the inventory come back in
+        `unknown_columns` instead of being ignored.
+        """
+        key_id = identify("inventory_annotate")
+        source = _annotation_source()
+        params = {
+            "database": database,
+            "container": container,
+            "schema": schema,
+            "source": source,
+        }
+        with trail.operation(
+            key_id=key_id, tool="inventory_annotate", params=params
+        ) as ctx:
+            result = _guard(store.annotate)(
+                database,
+                container,
+                schema,
+                container_description=container_description,
+                columns=columns or (),
+                source=source,
+            )
+            # what a write cost, the counterpart of rows_returned for a read
+            ctx.extra["columns_written"] = result.columns_updated
+            return result
 
 
 def _guard(func: Any) -> Any:

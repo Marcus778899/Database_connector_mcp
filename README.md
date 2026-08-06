@@ -67,7 +67,8 @@ Every other setting has a flag and an `MCP_*` variable, and the flag wins:
 | `--audit-log` | `MCP_AUDIT_LOG` | unset — log only |
 | `--audit-max-mb` | `MCP_AUDIT_MAX_MB` | `10` — `0` never rotates |
 | `--audit-backups` | `MCP_AUDIT_BACKUPS` | `5` |
-| `--profile-mode` | `MCP_PROFILE_MODES` | none gathered |
+| `--profile-mode` | `MCP_PROFILE_MODES` | unset — chosen per column |
+| `--no-profile` | `MCP_PROFILE=false` | off — statistics are gathered |
 | `--server-name` | `MCP_SERVER_NAME` | `etl-agent-mcp` |
 | `--require-auth` | `MCP_REQUIRE_AUTH` | `false` |
 | `--allow-insecure-http` | `MCP_ALLOW_INSECURE_HTTP` | `false` |
@@ -76,6 +77,11 @@ Every other setting has a flag and an `MCP_*` variable, and the flag wins:
 scan there is nowhere to put what it gathers, so the inventory tools are not
 served at all rather than served and broken. It must not point at the database
 being inventoried; the store refuses that.
+
+`--profile-mode` applies the modes you name to every column. Left unset, each
+column gets what its type warrants — a range for a number or a date, the
+commonest values for a categorical one, and nothing beyond a null ratio for a
+type that means nothing to us. `--no-profile` turns it off entirely.
 
 ## Connect an agent
 
@@ -191,8 +197,8 @@ Read-only against the source. Five answer live:
 | `get_sample` | a few rows, capped by `--max-sample-limit` |
 | `profile_column` | one statistic about one column |
 
-Six more appear when `--staging-db` is set. A scan of a large source outlasts any
-single tool call, so it runs in the background:
+Seven more appear when `--staging-db` is set. A scan of a large source outlasts
+any single tool call, so it runs in the background:
 
 | tool | what it does |
 |---|---|
@@ -202,9 +208,34 @@ single tool call, so it runs in the background:
 | `inventory_summary` | counts over what has been inventoried — **ask for this first** |
 | `inventory_containers` | one page of inventoried containers |
 | `inventory_columns` | recorded columns of one container |
+| `inventory_annotate` | describe a table or its columns |
 
 A scan resumes from its cursor if it dies, and skips containers whose schema
 fingerprint has not changed.
+
+## Descriptions
+
+A schema without descriptions is a list of names and types, which is exactly
+what a PM cannot read. So the inventory keeps two kinds of description, in
+separate columns:
+
+- **`native_description`** — the source's own comment. A scan reads it and
+  overwrites it, and it is part of the fingerprint, so a comment edited upstream
+  is a change worth rescanning for. sqlite has no comments at all.
+- **`description`** — written through `inventory_annotate` by an agent or a
+  person. **A scan never touches it**, and it stays out of the fingerprint so
+  that writing one cannot trigger its own rescan.
+
+`inventory_annotate` is the only tool here that writes, and the only thing it
+can write to is the inventory — the source database is never touched by
+anything in this server. Who a description came from is decided by the server
+from the caller's key, not claimed by the caller: `human` needs a token
+carrying the `annotate:human` scope, and everything else is `ai`.
+
+The staging file carries its layout version. A file written by an older build is
+refused with instructions rather than migrated: an inventory is derived data
+that a rescan reproduces, so the only thing genuinely lost is what was
+annotated.
 
 ## Develop
 

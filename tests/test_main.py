@@ -161,6 +161,26 @@ def test_the_audit_rotation_is_configurable():
     assert config.audit_backups == 2
 
 
+def test_unset_leaves_the_choice_to_the_engine():
+    """None and [] are different downstream: per-column choice, or nothing."""
+    assert _config([]).profile_modes is None
+
+
+def test_no_profile_turns_profiling_off_entirely():
+    assert _config(["--no-profile"]).profile_modes == []
+    assert _config([], {"MCP_PROFILE": "false"}).profile_modes == []
+
+
+def test_asking_for_profiling_without_naming_modes_leaves_the_choice_open():
+    assert _config(["--profile"]).profile_modes is None
+
+
+def test_no_profile_beats_the_modes_it_contradicts():
+    config = _config(["--no-profile", "--profile-mode", "null_ratio"])
+
+    assert config.profile_modes == []
+
+
 def test_booleans_come_from_the_environment():
     config = _config(
         ["--transport", "http", "--host", "0.0.0.0"], {"MCP_REQUIRE_AUTH": "true"}

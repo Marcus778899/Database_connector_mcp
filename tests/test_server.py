@@ -369,6 +369,7 @@ def inventory(config, adapter, tmp_path: Path) -> Iterator[Any]:
 
 
 INVENTORY_TOOLS = [
+    "inventory_annotate",
     "inventory_cancel",
     "inventory_columns",
     "inventory_containers",
@@ -386,7 +387,7 @@ def test_the_inventory_tools_appear_when_a_service_is_given(config, adapter, inv
     exposed = _tools(build_server(config, adapter, inventory=inventory))
 
     assert set(INVENTORY_TOOLS) <= set(exposed)
-    assert len(exposed) == 11
+    assert len(exposed) == 12
 
 
 def test_a_scan_can_be_started_and_polled(config, adapter, inventory):
@@ -502,6 +503,137 @@ def test_starting_a_scan_is_audited_with_its_job_id(config, adapter, inventory):
     (record,) = trail.records()
     assert record["tool"] == "inventory_start"
     assert record["job_id"] == job_id
+
+
+# ---- annotation ----
+
+
+def test_a_description_written_through_the_tool_survives_a_forced_rescan(
+    config, adapter, inventory
+):
+    """The regression the write path exists for: rescanning used to wipe every
+    description it had just been given."""
+    mcp = build_server(config, adapter, inventory=inventory)
+
+    async def body(call):
+        inventory.wait(await call("inventory_start", {}), timeout=20)
+        written = await call(
+            "inventory_annotate",
+            {
+                "database": "datalake",
+                "container": "users",
+                "container_description": "everyone who signed up",
+                "columns": [
+                    {"column": "id", "description": "surrogate key"},
+                    {"column": "tag", "description": "cohort", "sensitivity": "pii"},
+                ],
+            },
+        )
+        inventory.wait(await call("inventory_start", {"force": True}), timeout=20)
+        return written, await call(
+            "inventory_columns", {"container": "users", "database": "datalake"}
+        )
+
+    written, columns = _session(mcp, body)
+
+    assert (written.containers_updated, written.columns_updated) == (1, 2)
+    assert written.unknown_columns == []
+    assert [c.description for c in columns] == ["surrogate key", "cohort"]
+    assert columns[0].description_source == "ai"
+    assert columns[1].sensitivity == "pii"
+
+
+def test_an_unknown_column_comes_back_rather_than_failing_the_write(
+    config, adapter, inventory
+):
+    mcp = build_server(config, adapter, inventory=inventory)
+
+    async def body(call):
+        inventory.wait(await call("inventory_start", {}), timeout=20)
+        return await call(
+            "inventory_annotate",
+            {
+                "database": "datalake",
+                "container": "users",
+                "columns": [
+                    {"column": "id", "description": "surrogate key"},
+                    {"column": "nope", "description": "not a column"},
+                ],
+            },
+        )
+
+    result = _session(mcp, body)
+
+    assert result.unknown_columns == ["nope"]
+    assert result.columns_updated == 1
+
+
+def test_annotating_something_never_inventoried_is_a_tool_error(
+    config, adapter, inventory
+):
+    with pytest.raises(ToolError, match="inventory_start"):
+        _call(
+            build_server(config, adapter, inventory=inventory),
+            "inventory_annotate",
+            {
+                "database": "datalake",
+                "container": "ghost",
+                "container_description": "nothing here",
+            },
+        )
+
+
+def test_a_write_is_audited_by_how_much_it_wrote(config, adapter, inventory):
+    """rows_returned accounts for reads; a write needs its own counterpart."""
+    trail = AuditLogger(config.audit_log_path)
+    mcp = build_server(config, adapter, audit=trail, inventory=inventory)
+
+    async def body(call):
+        inventory.wait(await call("inventory_start", {}), timeout=20)
+        await call(
+            "inventory_annotate",
+            {
+                "database": "datalake",
+                "container": "users",
+                "columns": [{"column": "id", "description": "surrogate key"}],
+            },
+        )
+
+    _session(mcp, body)
+
+    record = trail.records()[-1]
+    assert record["tool"] == "inventory_annotate"
+    assert record["columns_written"] == 1
+    assert record["params"]["source"] == "ai"
+
+
+def test_no_token_means_the_description_is_not_a_persons(config, adapter, inventory):
+    """An agent must not be able to label its own guesses as a person's work."""
+    from src.server import _annotation_source
+
+    assert _annotation_source() == "ai"
+
+
+def test_only_a_key_granted_the_scope_writes_as_a_person(monkeypatch):
+    """The half of `annotate:human` that had nothing to read it until tokens
+    existed: the scope is granted when the key is issued, and claiming it in
+    the call is not an option the caller has."""
+    from src import server as server_module
+
+    def carrying(*scopes: str):
+        monkeypatch.setattr(
+            server_module,
+            "get_access_token",
+            lambda: SimpleNamespace(
+                scopes=list(scopes), subject="pm-alice", client_id="pm-alice"
+            ),
+        )
+
+    carrying("inventory_annotate")
+    assert server_module._annotation_source() == "ai"
+
+    carrying("inventory_annotate", server_module.HUMAN_ANNOTATION_SCOPE)
+    assert server_module._annotation_source() == "human"
 
 
 def test_shutdown_stops_the_inventory_workers(config, adapter, inventory):

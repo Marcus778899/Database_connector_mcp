@@ -37,6 +37,9 @@ class FakeAdapter:
         self.schema_calls: list[str] = []
         self.profile_calls: list[tuple[str, str, str]] = []
         self.page_size_seen = page_size_seen if page_size_seen is not None else []
+        # what this engine would pick for a column when the caller names nothing
+        self.chosen_modes: tuple[ProfileMode, ...] = (ProfileMode.NULL_RATIO,)
+        self.distinct_count = 1
 
     def list_databases(self) -> list[str]:
         return [self.database]
@@ -91,7 +94,12 @@ class FakeAdapter:
         self.profile_calls.append((container, column, str(mode)))
         if container in self.fail_profile_of:
             raise RuntimeError("profiling blew up")
+        if mode == ProfileMode.DISTINCT_COUNT:
+            return ProfileResult(distinct_count=self.distinct_count)
         return ProfileResult(null_ratio=0.5)
+
+    def default_profile_modes(self, column: ColumnInfo) -> tuple[ProfileMode, ...]:
+        return self.chosen_modes
 
     def close(self) -> None:
         pass
@@ -337,12 +345,88 @@ def test_a_failure_in_the_catalog_itself_marks_the_scan_failed(
 # ---- profiling ----
 
 
-def test_profiling_is_off_unless_asked_for(adapter: FakeAdapter, store: StagingStore):
+def test_the_adapter_picks_the_modes_when_no_one_else_does(
+    adapter: FakeAdapter, store: StagingStore
+):
+    """Nothing configured is not "gather nothing": it hands the choice to the
+    engine, which is the only layer that knows what its type names mean."""
+    adapter.chosen_modes = (ProfileMode.MIN_MAX,)
     service = _service(adapter, store)
+
     service.wait(service.start("main"), timeout=10)
 
-    assert adapter.profile_calls == []
-    assert store.summary("main").columns_profiled == 0
+    assert {call[2] for call in adapter.profile_calls} == {"min_max"}
+    assert store.summary("main").columns_profiled == 4
+
+
+def test_the_modes_are_chosen_per_column_not_per_scan(
+    adapter: FakeAdapter, store: StagingStore
+):
+    seen: list[str] = []
+
+    def modes_for(column: ColumnInfo) -> tuple[ProfileMode, ...]:
+        seen.append(column.name)
+        if column.name == "email":
+            return (ProfileMode.TOP_VALUES,)
+        return (ProfileMode.MIN_MAX,)
+
+    adapter.default_profile_modes = modes_for  # type: ignore[method-assign]
+    service = _service(adapter, store)
+
+    service.wait(service.start("main"), timeout=10)
+
+    assert sorted(seen) == ["email", "id", "id", "total"]
+    assert ("users", "email", "top_values") in adapter.profile_calls
+    assert ("users", "id", "min_max") in adapter.profile_calls
+
+
+def test_top_values_is_skipped_when_the_column_has_too_many(
+    adapter: FakeAdapter, store: StagingStore
+):
+    """The twenty commonest values of a column with a million of them describe
+    nothing, and the query is the expensive one."""
+    adapter.chosen_modes = (ProfileMode.DISTINCT_COUNT, ProfileMode.TOP_VALUES)
+    adapter.distinct_count = InventoryService.TOP_VALUES_MAX_DISTINCT + 1
+    service = _service(adapter, store)
+
+    service.wait(service.start("main"), timeout=10)
+
+    assert {call[2] for call in adapter.profile_calls} == {"distinct_count"}
+
+
+def test_top_values_is_gathered_when_the_column_is_narrow(
+    adapter: FakeAdapter, store: StagingStore
+):
+    adapter.chosen_modes = (ProfileMode.DISTINCT_COUNT, ProfileMode.TOP_VALUES)
+    adapter.distinct_count = InventoryService.TOP_VALUES_MAX_DISTINCT
+    service = _service(adapter, store)
+
+    service.wait(service.start("main"), timeout=10)
+
+    assert {call[2] for call in adapter.profile_calls} == {
+        "distinct_count",
+        "top_values",
+    }
+
+
+def test_a_caller_who_names_top_values_gets_it_whatever_the_cardinality(
+    adapter: FakeAdapter, store: StagingStore
+):
+    adapter.distinct_count = InventoryService.TOP_VALUES_MAX_DISTINCT * 100
+    service = _service(adapter, store)
+
+    service.wait(
+        service.start(
+            "main",
+            profile_modes=[ProfileMode.DISTINCT_COUNT, ProfileMode.TOP_VALUES],
+        ),
+        timeout=10,
+    )
+
+    assert {call[2] for call in adapter.profile_calls} == {
+        "distinct_count",
+        "top_values",
+    }
 
 
 def test_requested_modes_are_profiled_and_stored(
@@ -386,6 +470,18 @@ def test_an_empty_list_means_gather_nothing(adapter: FakeAdapter, store: Staging
     service = _service(adapter, store, default_profile_modes=[ProfileMode.NULL_RATIO])
 
     service.wait(service.start("main", profile_modes=[]), timeout=10)
+
+    assert adapter.profile_calls == []
+
+
+def test_an_empty_default_means_gather_nothing_either(
+    adapter: FakeAdapter, store: StagingStore
+):
+    """The way a server turns profiling off for good, distinct from leaving it
+    unset and getting the engine's per-column choice."""
+    service = _service(adapter, store, default_profile_modes=[])
+
+    service.wait(service.start("main"), timeout=10)
 
     assert adapter.profile_calls == []
 

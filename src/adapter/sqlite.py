@@ -207,20 +207,28 @@ class SqliteAdapter(SqlAdapterBase):
         if not rows:
             # a view whose source table is gone still sits in sqlite_master
             raise UnknownContainerError(container)
-        return [
-            ColumnInfo(
-                name=row["name"],
-                # PRAGMA counts columns from zero, the contract from one
-                ordinal=row["cid"] + 1,
-                # sqlite allows a column with no declared type; report that
-                # honestly rather than inventing an affinity for it
-                native_type=row["type"] or "",
-                nullable=not row["notnull"],
-                is_pk=bool(row["pk"]),
-                is_fk=row["name"] in foreign_keys,
+        columns = []
+        for row in rows:
+            target, target_column = foreign_keys.get(row["name"], (None, None))
+            columns.append(
+                ColumnInfo(
+                    name=row["name"],
+                    # PRAGMA counts columns from zero, the contract from one
+                    ordinal=row["cid"] + 1,
+                    # sqlite allows a column with no declared type; report that
+                    # honestly rather than inventing an affinity for it
+                    native_type=row["type"] or "",
+                    nullable=not row["notnull"],
+                    is_pk=bool(row["pk"]),
+                    is_fk=target is not None,
+                    # sqlite has no column comments at all, so
+                    # `native_description` stays None here and a written
+                    # description is the only one this engine will ever have
+                    references_container=target,
+                    references_column=target_column,
+                )
             )
-            for row in rows
-        ]
+        return columns
 
     def get_sample(
         self, container: str, limit: int = AdapterBase._DEFAULT_SAMPLE_LIMIT
@@ -301,8 +309,7 @@ class SqliteAdapter(SqlAdapterBase):
         return int(rows[0]["n"])
 
     def _foreign_keys(self, quoted: str) -> dict[str, tuple[str, str | None]]:
-        """Source column -> (target container, target column). Only the flag
-        reaches `ColumnInfo` today; the target lands there with the relationship
-        work."""
+        """Source column -> (target container, target column). `to` is NULL when
+        the reference names no column, meaning the target's primary key."""
         rows = self._rows(f"PRAGMA foreign_key_list({quoted})")
         return {row["from"]: (row["table"], row["to"]) for row in rows}

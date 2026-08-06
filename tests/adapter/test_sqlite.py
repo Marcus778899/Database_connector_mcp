@@ -219,6 +219,21 @@ def test_get_schema_marks_a_foreign_key(adapter: SqliteAdapter):
     assert columns["amount"].is_fk is False
 
 
+def test_get_schema_says_what_the_foreign_key_points_at(adapter: SqliteAdapter):
+    """ "This one joins to something" is not an answer to "how do these tables
+    join"; PRAGMA foreign_key_list already knows the target."""
+    columns = {c.name: c for c in adapter.get_schema("orders")}
+
+    assert columns["user_id"].references_container == "users"
+    assert columns["user_id"].references_column == "id"
+    assert columns["amount"].references_container is None
+
+
+def test_sqlite_has_no_comments_to_report(adapter: SqliteAdapter):
+    """Which is the reason a written description is worth storing at all."""
+    assert all(c.native_description is None for c in adapter.get_schema("users"))
+
+
 def test_a_column_with_no_declared_type_reports_no_type(db: Path):
     conn = sqlite3.connect(db)
     conn.execute("CREATE TABLE loose (whatever)")
