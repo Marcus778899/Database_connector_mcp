@@ -1,0 +1,31 @@
+name: Sync main to develop
+
+# 每次 release PR 合併進 main 後，把 main 帶回 develop，讓 develop 永遠從最新的
+# 穩定點繼續開發。
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    name: Sync develop
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Sync develop with main
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B develop origin/develop
+          # release PR 以 merge commit 合併時，develop 一定是 main 的祖先，快轉即可。
+          # 若不是（例如改用 squash merge），退回一般 merge。
+          git merge --ff-only origin/main || git merge --no-edit origin/main
+          git push origin develop
