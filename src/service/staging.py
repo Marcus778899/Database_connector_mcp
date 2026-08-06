@@ -498,7 +498,9 @@ class StagingStore:
                     for column in current
                 ],
             )
-            # A column that really did disappear still has to go.
+            # A column that really did disappear still has to go. With nothing
+            # left to keep, the unrestricted DELETE is the right statement: the
+            # container has no columns any more.
             names = [column.name for column in current]
             placeholders = ",".join("?" * len(names))
             self._conn.execute(
@@ -561,6 +563,10 @@ class StagingStore:
 
         A field left None is left as it was; a blank string clears it. `source`
         is decided by the caller's identity, not by the annotation.
+
+        One transaction on purpose: an agent describing a table and its columns
+        is making one statement about it, so a crash must not leave the table
+        described and its columns not.
         """
         schema_key = schema or NO_SCHEMA
         key = (database, schema_key, container)

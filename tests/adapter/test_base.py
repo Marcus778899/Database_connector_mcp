@@ -386,9 +386,16 @@ def test_a_categorical_column_gets_counted_before_it_is_listed(native_type: str)
     )
 
 
-@pytest.mark.parametrize("native_type", ["BLOB", "geometry", ""])
+@pytest.mark.parametrize("native_type", ["BLOB", "geometry", "bytea", ""])
 def test_an_unreadable_type_gets_only_what_is_true_of_anything(native_type: str):
     """sqlite allows a column with no declared type at all."""
+    assert _modes_for(native_type) == (ProfileMode.NULL_RATIO,)
+
+
+@pytest.mark.parametrize("native_type", ["POINT", "multipolygon", "varbinary(16)"])
+def test_a_type_that_merely_contains_a_hint_is_not_taken_for_one(native_type: str):
+    """ "point" contains "int". Asking a geometry column for its range is not
+    wrong so much as meaningless, and it costs a query per column to find out."""
     assert _modes_for(native_type) == (ProfileMode.NULL_RATIO,)
 
 

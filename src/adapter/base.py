@@ -34,7 +34,19 @@ class AdapterBase(ABC):
     _CATALOG_TTL: ClassVar[float] = 60.0
 
     # Substrings of a native type name, matched case-insensitively in this
-    # order. Temporal comes first because "interval" contains "int".
+    # order, which is what keeps "int" from claiming "interval" and "point".
+    # Opaque first: a type no statistic describes, and the group that catches
+    # the substring's false positives.
+    _OPAQUE_TYPE_HINTS: ClassVar[tuple[str, ...]] = (
+        "blob",
+        "binary",
+        "bytea",
+        "geometry",
+        "geography",
+        "point",
+        "polygon",
+        "linestring",
+    )
     _TEMPORAL_TYPE_HINTS: ClassVar[tuple[str, ...]] = (
         "date",
         "time",
@@ -119,14 +131,18 @@ class AdapterBase(ABC):
 
         A `min_max` over free text and a `top_values` over a high-cardinality
         column are pure waste, and a scan pays for them once per column of every
-        container. Matching on the type name is a guess, so an unrecognised type
-        gets the one statistic that means something for any of them.
+        container. Matching a substring of the type name is a guess — "point"
+        contains "int" — so the groups are tried in an order that resolves the
+        overlaps, and an unrecognised type gets the one statistic that means
+        something for any of them.
 
         `distinct_count` comes before `top_values` deliberately: the scan uses
         the count it produces to decide whether the top values are worth asking
         for at all. An engine whose type names this cannot read overrides it.
         """
         native = column.native_type.lower()
+        if any(hint in native for hint in self._OPAQUE_TYPE_HINTS):
+            return (ProfileMode.NULL_RATIO,)
         if any(hint in native for hint in self._TEMPORAL_TYPE_HINTS):
             return (ProfileMode.NULL_RATIO, ProfileMode.MIN_MAX)
         if any(hint in native for hint in self._NUMERIC_TYPE_HINTS):

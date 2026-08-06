@@ -3,11 +3,17 @@ from __future__ import annotations
 import threading
 import uuid
 from collections.abc import Sequence
-from typing import Any, ClassVar
+from typing import ClassVar
 
 from pydantic import BaseModel
 
-from src.core.contracts import ProfileMode, ProfileResult
+from src.core.contracts import (
+    ColumnInfo,
+    ContainerInfo,
+    ProfileMode,
+    ProfileResult,
+    SourceAdaptor,
+)
 from src.core.log import log
 from src.service.pool import AdapterProvider
 from src.service.staging import StagingStore, schema_hash
@@ -224,8 +230,8 @@ class InventoryService:
 
     def _scan_container(
         self,
-        adapter: Any,
-        info: Any,
+        adapter: SourceAdaptor,
+        info: ContainerInfo,
         *,
         profile_modes: tuple[ProfileMode, ...] | None,
         force: bool,
@@ -263,9 +269,9 @@ class InventoryService:
 
     def _profile_column(
         self,
-        adapter: Any,
-        info: Any,
-        column: Any,
+        adapter: SourceAdaptor,
+        info: ContainerInfo,
+        column: ColumnInfo,
         profile_modes: tuple[ProfileMode, ...] | None,
     ) -> None:
         """Gather the statistics for one column, in order.
@@ -292,7 +298,11 @@ class InventoryService:
                 distinct = result.distinct_count
 
     def _profile_one(
-        self, adapter: Any, info: Any, column: str, mode: ProfileMode
+        self,
+        adapter: SourceAdaptor,
+        info: ContainerInfo,
+        column: str,
+        mode: ProfileMode,
     ) -> ProfileResult | None:
         try:
             result = adapter.profile_column(info.container_name, column, mode)
