@@ -15,8 +15,18 @@ from src.core.contracts import (
     SourceAdaptor,
 )
 from src.core.log import log
+from src.service import sensitivity
 from src.service.pool import AdapterProvider
 from src.service.staging import StagingStore, schema_hash
+
+# Comparing two shapes needs both of them whole, and a container's columns are
+# bounded by the container.
+_ALL_COLUMNS = 100_000
+
+# Rows read to judge a column whose name gives nothing away. Enough to tell an
+# address column from a note, few enough that a scan does not become a read of
+# the data it is cataloguing.
+_SENSITIVITY_SAMPLE = 20
 
 
 class ScanAlreadyRunningError(Exception):
@@ -178,6 +188,10 @@ class InventoryService:
     ) -> None:
         cancel = self._cancels[job_id]
         done = failed = skipped = 0
+        # A run that started from a cursor never looked at what came before it,
+        # so it cannot say what is missing.
+        covers_everything = cursor is None
+        seen: set[tuple[str, str, str]] = set()
         try:
             adapter = self._provider.get(database)
             while True:
@@ -190,8 +204,11 @@ class InventoryService:
                         log.info(f"inventory scan {job_id} cancelled after {done}")
                         return
 
+                    seen.add(
+                        (info.database, info.schema_name or "", info.container_name)
+                    )
                     outcome = self._scan_container(
-                        adapter, info, profile_modes=profile_modes, force=force
+                        job_id, adapter, info, profile_modes=profile_modes, force=force
                     )
                     if outcome == "failed":
                         failed += 1
@@ -213,6 +230,7 @@ class InventoryService:
                     break
                 cursor = page.next_cursor
 
+            self._record_removals(job_id, database, seen, covers_everything)
             self._store.finish_scan(job_id, "done")
             log.info(
                 f"inventory scan {job_id} finished: {done} scanned, "
@@ -230,6 +248,7 @@ class InventoryService:
 
     def _scan_container(
         self,
+        job_id: str,
         adapter: SourceAdaptor,
         info: ContainerInfo,
         *,
@@ -251,21 +270,160 @@ class InventoryService:
             return "failed"
 
         current = schema_hash(columns, native_description=info.native_description)
-        if not force:
-            stored = self._store.stored_schema_hash(
-                info.database, info.schema_name, info.container_name
-            )
-            if stored == current:
-                return "skipped"
+        stored = self._store.stored_schema_hash(
+            info.database, info.schema_name, info.container_name
+        )
+        if stored == current and not force:
+            return "skipped"
+
+        # Before the write, while the previous shape is still on record.
+        self._record_change(job_id, info, stored, current, columns)
 
         self._store.upsert_container(info, hash_=current)
         self._store.replace_columns(
             info.database, info.schema_name, info.container_name, columns
         )
 
+        self._detect_sensitivity(adapter, info, columns)
+
         for column in columns:
             self._profile_column(adapter, info, column, profile_modes)
         return "done"
+
+    def _detect_sensitivity(
+        self,
+        adapter: SourceAdaptor,
+        info: ContainerInfo,
+        columns: Sequence[ColumnInfo],
+    ) -> None:
+        """
+        Decide which of a container's columns hold personal data.
+
+        The names are free to judge. The values cost one small read, and only
+        buy anything for the columns whose names give nothing away — so the
+        read is skipped entirely when the names have already settled every
+        column, and a source that refuses it is not an error.
+
+        Only the verdict is stored. The rows read here go no further than this
+        function.
+        """
+        by_name = {
+            column.name: level
+            for column in columns
+            if (level := sensitivity.from_name(column.name)) is not None
+        }
+        undecided = [column.name for column in columns if column.name not in by_name]
+
+        levels = dict(by_name)
+        if undecided:
+            try:
+                rows = adapter.get_sample(
+                    info.container_name, limit=_SENSITIVITY_SAMPLE
+                )
+            except Exception as exc:  # noqa: BLE001 - detection is not the scan's job
+                log.info(f"no sample to judge {info.container_name!r} by: {exc}")
+                rows = []
+            for name in undecided:
+                level = sensitivity.from_values([row.get(name) for row in rows])
+                if level is not None:
+                    levels[name] = level
+
+        if not levels:
+            return
+        written = self._store.record_sensitivity(
+            info.database,
+            info.schema_name,
+            info.container_name,
+            levels,
+            source=sensitivity.SOURCE_DETECTED,
+        )
+        log.info(f"{info.container_name}: {written} columns marked sensitive")
+
+    def _record_change(
+        self,
+        job_id: str,
+        info: ContainerInfo,
+        stored: str | None,
+        current: str,
+        columns: Sequence[ColumnInfo],
+    ) -> None:
+        """
+        Note what moved, if anything did.
+
+        Called before the container is written, because the comparison needs
+        the previous shape and the write is what destroys it. A forced rescan
+        of something unchanged records nothing: `force` is about re-reading,
+        not about inventing history.
+        """
+        if stored == current:
+            return
+        if stored is None:
+            self._store.record_change(
+                job_id,
+                info.database,
+                info.schema_name,
+                info.container_name,
+                change_type="container_added",
+                new_hash=current,
+            )
+            return
+
+        previous = {
+            column.column_name: column
+            for column in self._store.columns(
+                info.database,
+                info.container_name,
+                info.schema_name,
+                limit=_ALL_COLUMNS,
+                include_profile=False,
+            ).columns
+        }
+        now = {column.name: column for column in columns}
+        retyped = [
+            f"{name}: {previous[name].native_type} → {now[name].native_type}"
+            for name in sorted(set(previous) & set(now))
+            if previous[name].native_type != now[name].native_type
+        ]
+        detail = {
+            "added": sorted(set(now) - set(previous)),
+            "removed": sorted(set(previous) - set(now)),
+            "retyped": retyped,
+        }
+        self._store.record_change(
+            job_id,
+            info.database,
+            info.schema_name,
+            info.container_name,
+            change_type="schema_changed",
+            old_hash=stored,
+            new_hash=current,
+            detail={key: value for key, value in detail.items() if value} or None,
+        )
+
+    def _record_removals(
+        self,
+        job_id: str,
+        database: str | None,
+        seen: set[tuple[str, str, str]],
+        covered: bool,
+    ) -> None:
+        """
+        Record the containers staging knows about that this scan never saw.
+
+        Only when the run covered the whole catalog: a scan that resumed from a
+        cursor never looked at what came before it, and calling those dropped
+        would be a fabrication — the one kind of error an append-only history
+        cannot take back.
+        """
+        if not covered:
+            return
+        for key in sorted(self._store.container_keys(database) - seen):
+            db, schema, name = key
+            log.info(f"{name!r} is no longer in the catalog of {db!r}")
+            self._store.record_change(
+                job_id, db, schema, name, change_type="container_removed"
+            )
+            self._store.forget_container(db, schema, name)
 
     def _profile_column(
         self,

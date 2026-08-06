@@ -10,20 +10,24 @@ from fastmcp.exceptions import ToolError
 from fastmcp.server.dependencies import get_access_token
 
 from src.auth import verifier_from_config
+from src.auth.permissions import Permissions
 from src.core.config import ServerConfig
 from src.core.contracts import (
     ColumnInfo,
     ContainerPage,
     ProfileMode,
     ProfileResult,
+    Sensitivity,
     SourceAdaptor,
 )
 from src.core.log import log
+from src.service import sensitivity
 from src.service.audit import AuditLogger
+from src.service.export import ExportFormat, ExportResult, export_inventory
 from src.service.inventory import InventoryService, ScanStatus
 from src.service.pool import AdapterPool, AdapterProvider, SingleAdapter
-from src.service.export import ExportFormat, ExportResult, export_inventory
 from src.service.staging import (
+    DEFAULT_CHANGE_LIMIT,
     DEFAULT_COLUMN_PAGE,
     DEFAULT_SEARCH_LIMIT,
     SOURCE_AI,
@@ -31,6 +35,8 @@ from src.service.staging import (
     AnnotateResult,
     ColumnAnnotation,
     InventorySummary,
+    Relationship,
+    SchemaChange,
     SearchHit,
     StoredColumnPage,
     StoredContainerPage,
@@ -41,7 +47,7 @@ LOCAL_KEY_ID = "local"
 
 # Tool name -> the caller's id, or a refusal. `_identity` with the server's
 # authentication requirement already bound in.
-Identify = Callable[[str], str]
+Identify = Callable[[str], tuple[str, Permissions]]
 
 # A key may only claim its descriptions are a person's if it carries this.
 HUMAN_ANNOTATION_SCOPE = "annotate:human"
@@ -84,10 +90,10 @@ def build_server(
 
     # Bound once: every tool asks the same question, and whether an unauthenticated
     # call is acceptable is a property of the server, not of the tool.
-    identify = partial(_identity, require_auth=config.require_auth)
+    identify = partial(_caller, require_auth=config.require_auth)
 
     mcp: FastMCP = FastMCP(name=config.server_name, auth=auth, lifespan=lifespan)
-    _register_tools(mcp, config, provider, trail, identify)
+    _register_tools(mcp, config, provider, trail, identify, inventory)
     if inventory is not None:
         _register_inventory_tools(mcp, config, inventory, trail, identify)
     return mcp
@@ -107,28 +113,96 @@ def _identity(tool: str, *, require_auth: bool) -> str:
     at registration, and a security check that can be skipped by forgetting a
     keyword is one that eventually will be.
     """
+    return _caller(tool, require_auth=require_auth)[0]
+
+
+def _caller(tool: str, *, require_auth: bool) -> tuple[str, Permissions]:
+    """
+    Who is calling and what they are allowed, or a refusal.
+
+    One lookup for both, because every check after this one — which database,
+    which container, raw rows or masked — asks the same token the same
+    question, and reading it twice invites the two answers to drift.
+    """
     token = get_access_token()
     if token is None:
         if require_auth:
             raise ToolError(f"{tool} requires an authenticated caller")
-        return LOCAL_KEY_ID
-    if tool not in (token.scopes or []):
-        raise ToolError(f"{token.subject or token.client_id} may not call {tool}")
-    return token.subject or token.client_id or LOCAL_KEY_ID
+        return LOCAL_KEY_ID, Permissions.local()
+
+    # `claims` is optional on the SDK's own token type, so it is read rather
+    # than assumed: another auth provider may hand one over without it.
+    rights = Permissions.from_claims(
+        list(token.scopes or []), getattr(token, "claims", None) or {}
+    )
+    name = token.subject or token.client_id or LOCAL_KEY_ID
+    if not rights.may_call(tool):
+        raise ToolError(f"{name} may not call {tool}")
+    return name, rights
 
 
-def _annotation_source() -> str:
+def _require_access(
+    name: str, rights: Permissions, *, database: str | None, container: str | None
+) -> None:
+    """
+    Whether this key may look at this thing at all.
+
+    Refused by name rather than silently emptied: an agent told a table is not
+    there will go looking for it elsewhere, and an agent told it may not look
+    will ask someone for access.
+    """
+    if not rights.may_use_database(database):
+        raise ToolError(f"{name} may not read database {database!r}")
+    if container is not None and not rights.may_read(container):
+        raise ToolError(f"{name} may not read {container!r}")
+
+
+def _annotation_source(rights: Permissions | None = None) -> str:
     """
     Who a description came from — decided here, never taken from the caller.
 
     An agent that could label its own guesses `human` would make the field
     worthless, so a description counts as a person's only when the key that
-    carried it was granted that scope.
+    carried it was granted that.
     """
-    token = get_access_token()
-    if token is not None and HUMAN_ANNOTATION_SCOPE in (token.scopes or []):
-        return SOURCE_HUMAN
-    return SOURCE_AI
+    if rights is None:
+        token = get_access_token()
+        if token is None:
+            return SOURCE_AI
+        rights = Permissions.from_claims(
+            list(token.scopes or []), getattr(token, "claims", None) or {}
+        )
+    return SOURCE_HUMAN if rights.annotate_as_human else SOURCE_AI
+
+
+def _known_sensitivity(
+    inventory: InventoryService | None,
+    provider: AdapterProvider,
+    database: str | None,
+    container: str,
+) -> dict[str, Sensitivity]:
+    """
+    What the inventory already decided about this container's columns, which
+    beats deciding again from a handful of rows — it may have been corrected by
+    a person.
+
+    Empty when there is no inventory, which is not a gap: masking then judges
+    the sample in front of it, so a server with no staging database still does
+    not put raw email addresses into a context.
+    """
+    if inventory is None:
+        return {}
+    try:
+        # The tools take `database` optionally and the inventory is keyed by
+        # the real name, so an omitted one has to be resolved rather than
+        # quietly missing every recorded verdict.
+        names = provider.list_databases() if database is None else [database]
+        if not names:
+            return {}
+        return inventory.store.sensitivity_of(names[0], container)
+    except Exception as exc:  # noqa: BLE001 - never fail a read over this
+        log.warning(f"cannot read recorded sensitivity for {container!r}: {exc}")
+        return {}
 
 
 def _register_tools(
@@ -137,6 +211,7 @@ def _register_tools(
     provider: AdapterProvider,
     trail: AuditLogger,
     identify: Identify,
+    inventory: InventoryService | None,
 ) -> None:
     def _adapter(database: str | None) -> SourceAdaptor:
         try:
@@ -147,10 +222,13 @@ def _register_tools(
     @mcp.tool
     def list_databases() -> list[str]:
         """Databases this connection can inventory."""
-        with trail.operation(
-            key_id=identify("list_databases"), tool="list_databases", params={}
-        ) as ctx:
-            result = provider.list_databases()
+        key_id, rights = identify("list_databases")
+        with trail.operation(key_id=key_id, tool="list_databases", params={}) as ctx:
+            result = [
+                name
+                for name in provider.list_databases()
+                if rights.may_use_database(name)
+            ]
             ctx.rows_returned = len(result)
             return result
 
@@ -165,7 +243,8 @@ def _register_tools(
         One page of tables / views / collections. Pass `next_cursor` back as
         `cursor` to continue; it is None on the last page.
         """
-        key_id = identify("list_containers")
+        key_id, rights = identify("list_containers")
+        _require_access(key_id, rights, database=database, container=None)
         adapter = _adapter(database)
         params = {
             "database": database,
@@ -179,6 +258,13 @@ def _register_tools(
             page = _guard(adapter.list_containers)(
                 database=database, schema=schema, limit=limit, cursor=cursor
             )
+            # Filtered, not refused: a page is a listing, and the names a key
+            # may not read are not its business either. The cursor still comes
+            # from the unfiltered page, so paging does not stall on a run of
+            # containers this key cannot see.
+            page.containers = [
+                info for info in page.containers if rights.may_read(info.container_name)
+            ]
             ctx.rendered_sql = adapter.pop_rendered_sql()
             ctx.rows_returned = len(page.containers)
             return page
@@ -186,7 +272,8 @@ def _register_tools(
     @mcp.tool
     def get_schema(container: str, database: str | None = None) -> list[ColumnInfo]:
         """Columns of one container, with key and nullability flags."""
-        key_id = identify("get_schema")
+        key_id, rights = identify("get_schema")
+        _require_access(key_id, rights, database=database, container=container)
         adapter = _adapter(database)
         with trail.operation(
             key_id=key_id,
@@ -200,21 +287,50 @@ def _register_tools(
 
     @mcp.tool
     def get_sample(
-        container: str, limit: int = 3, database: str | None = None
+        container: str,
+        limit: int = 3,
+        database: str | None = None,
+        mask: bool = True,
     ) -> list[dict[str, Any]]:
-        """A few rows, capped by the server's max_sample_limit."""
-        key_id = identify("get_sample")
+        """
+        A few rows, capped by the server's max_sample_limit.
+
+        Personal data is masked by default — `a***@***.com` — because these
+        rows go into an agent's context and from there into everything that
+        context touches. `mask=False` returns them as they are, and a key
+        needs to have been granted that.
+        """
+        key_id, rights = identify("get_sample")
+        _require_access(key_id, rights, database=database, container=container)
+        if not mask and not rights.allow_raw_sample:
+            raise ToolError(
+                f"{key_id} may not read unmasked rows; call without mask=False"
+            )
         adapter = _adapter(database)
         capped = max(0, min(limit, config.max_sample_limit))
         with trail.operation(
             key_id=key_id,
             tool="get_sample",
-            params={"container": container, "limit": capped, "database": database},
+            params={
+                "container": container,
+                "limit": capped,
+                "database": database,
+                "mask": mask,
+            },
         ) as ctx:
             rows = _guard(adapter.get_sample)(container, limit=capped)
             ctx.rendered_sql = adapter.pop_rendered_sql()
             ctx.rows_returned = len(rows)
-            return rows
+            if not mask:
+                # Worth being able to answer "who has seen raw rows, and of
+                # what" without reading the whole trail for it.
+                ctx.extra["unmasked"] = True
+                return rows
+            hidden = sensitivity.sensitive_columns(
+                rows, _known_sensitivity(inventory, provider, database, container)
+            )
+            ctx.extra["masked_columns"] = sorted(hidden)
+            return sensitivity.mask_rows(rows, hidden)
 
     @mcp.tool
     def profile_column(
@@ -227,7 +343,8 @@ def _register_tools(
         One statistic about one column. `approximate` is True when the source
         stopped short of a full scan.
         """
-        key_id = identify("profile_column")
+        key_id, rights = identify("profile_column")
+        _require_access(key_id, rights, database=database, container=container)
         adapter = _adapter(database)
         with trail.operation(
             key_id=key_id,
@@ -265,7 +382,8 @@ def _register_inventory_tools(
         `inventory_status`. Unchanged containers are skipped unless `force`, and
         an unfinished run continues from its cursor unless `resume` is False.
         """
-        key_id = identify("inventory_start")
+        key_id, rights = identify("inventory_start")
+        _require_access(key_id, rights, database=database, container=None)
         params = {"database": database, "force": force, "resume": resume}
         with trail.operation(
             key_id=key_id, tool="inventory_start", params=params
@@ -279,7 +397,7 @@ def _register_inventory_tools(
     @mcp.tool
     def inventory_status(job_id: str) -> ScanStatus:
         """How far a scan has got, and why it stopped."""
-        key_id = identify("inventory_status")
+        key_id, rights = identify("inventory_status")
         with trail.operation(
             key_id=key_id, tool="inventory_status", params={"job_id": job_id}
         ):
@@ -288,7 +406,7 @@ def _register_inventory_tools(
     @mcp.tool
     def inventory_cancel(job_id: str) -> bool:
         """Stop a scan after the container in flight. Progress is kept."""
-        key_id = identify("inventory_cancel")
+        key_id, rights = identify("inventory_cancel")
         with trail.operation(
             key_id=key_id, tool="inventory_cancel", params={"job_id": job_id}
         ):
@@ -297,7 +415,8 @@ def _register_inventory_tools(
     @mcp.tool
     def inventory_summary(database: str | None = None) -> InventorySummary:
         """Counts over what has been inventoried. Ask for this before the rows."""
-        key_id = identify("inventory_summary")
+        key_id, rights = identify("inventory_summary")
+        _require_access(key_id, rights, database=database, container=None)
         with trail.operation(
             key_id=key_id, tool="inventory_summary", params={"database": database}
         ):
@@ -310,12 +429,16 @@ def _register_inventory_tools(
         cursor: str | None = None,
     ) -> StoredContainerPage:
         """One page of inventoried containers, newest scan state included."""
-        key_id = identify("inventory_containers")
+        key_id, rights = identify("inventory_containers")
+        _require_access(key_id, rights, database=database, container=None)
         params = {"database": database, "limit": limit, "cursor": cursor}
         with trail.operation(
             key_id=key_id, tool="inventory_containers", params=params
         ) as ctx:
             page = _guard(store.containers)(database, limit=limit, cursor=cursor)
+            page.containers = [
+                row for row in page.containers if rights.may_read(row.container_name)
+            ]
             ctx.rows_returned = len(page.containers)
             return page
 
@@ -335,7 +458,8 @@ def _register_inventory_tools(
         profiles are most of the weight, so `include_profile=False` is the way
         to read its shape without them.
         """
-        key_id = identify("inventory_columns")
+        key_id, rights = identify("inventory_columns")
+        _require_access(key_id, rights, database=database, container=container)
         params = {
             "container": container,
             "database": database,
@@ -359,6 +483,47 @@ def _register_inventory_tools(
             return page
 
     @mcp.tool
+    def inventory_relationships(database: str | None = None) -> list[Relationship]:
+        """
+        Every foreign key in the inventory, as edges.
+
+        "How do these two tables join" is the first question anyone asks of a
+        database they did not build. Enough to draw an ER diagram from.
+        """
+        key_id, rights = identify("inventory_relationships")
+        _require_access(key_id, rights, database=database, container=None)
+        with trail.operation(
+            key_id=key_id,
+            tool="inventory_relationships",
+            params={"database": database},
+        ) as ctx:
+            edges = _guard(store.relationships)(database)
+            ctx.rows_returned = len(edges)
+            return edges
+
+    @mcp.tool
+    def inventory_changes(
+        database: str | None = None,
+        since: str | None = None,
+        limit: int = DEFAULT_CHANGE_LIMIT,
+    ) -> list[SchemaChange]:
+        """
+        What the upstream schema did between scans, newest first.
+
+        A container appearing or disappearing, and the columns added, removed
+        or retyped within one. `since` is an ISO timestamp.
+        """
+        key_id, rights = identify("inventory_changes")
+        _require_access(key_id, rights, database=database, container=None)
+        params = {"database": database, "since": since, "limit": limit}
+        with trail.operation(
+            key_id=key_id, tool="inventory_changes", params=params
+        ) as ctx:
+            changes = _guard(store.changes)(database, since=since, limit=limit)
+            ctx.rows_returned = len(changes)
+            return changes
+
+    @mcp.tool
     def inventory_search(
         keyword: str,
         database: str | None = None,
@@ -372,7 +537,8 @@ def _register_inventory_tools(
         `inventory_columns` for the one container that looked right. Hits carry
         no statistics, so a hundred of them still cost little.
         """
-        key_id = identify("inventory_search")
+        key_id, rights = identify("inventory_search")
+        _require_access(key_id, rights, database=database, container=None)
         params = {
             "keyword": keyword,
             "database": database,
@@ -382,7 +548,13 @@ def _register_inventory_tools(
         with trail.operation(
             key_id=key_id, tool="inventory_search", params=params
         ) as ctx:
-            hits = _guard(store.search)(keyword, database, kind=kind, limit=limit)
+            hits = [
+                hit
+                for hit in _guard(store.search)(
+                    keyword, database, kind=kind, limit=limit
+                )
+                if rights.may_read(hit.container_name)
+            ]
             ctx.rows_returned = len(hits)
             return hits
 
@@ -403,8 +575,9 @@ def _register_inventory_tools(
         Column names that are not in the inventory come back in
         `unknown_columns` instead of being ignored.
         """
-        key_id = identify("inventory_annotate")
-        source = _annotation_source()
+        key_id, rights = identify("inventory_annotate")
+        _require_access(key_id, rights, database=database, container=container)
+        source = _annotation_source(rights)
         params = {
             "database": database,
             "container": container,
@@ -447,7 +620,7 @@ def _register_inventory_tools(
         row per column, `dbt_yaml` a `schema.yml` for a dbt project. `path` is
         relative to the server's export directory and cannot leave it.
         """
-        key_id = identify("inventory_export")
+        key_id, rights = identify("inventory_export")
         params = {"format": format, "database": database, "path": path}
         with trail.operation(
             key_id=key_id, tool="inventory_export", params=params
@@ -458,6 +631,7 @@ def _register_inventory_tools(
                 format=format,
                 database=database,
                 path=path,
+                permits=rights.may_read,
             )
             ctx.rows_returned = result.columns
             ctx.extra["bytes_written"] = result.bytes_written

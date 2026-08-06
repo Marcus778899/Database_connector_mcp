@@ -24,11 +24,12 @@ from src.core.log import log
 NO_SCHEMA = ""
 
 MARKER = "database-mcp-connector/staging"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # Page sizes for the two reads that can otherwise return a whole catalog.
 DEFAULT_COLUMN_PAGE = 100
 DEFAULT_SEARCH_LIMIT = 50
+DEFAULT_CHANGE_LIMIT = 100
 
 # How much of a description a search hit carries. Enough to judge whether this
 # is the column you meant; `inventory_columns` has the whole thing. Without a
@@ -117,6 +118,24 @@ CREATE INDEX IF NOT EXISTS columns_by_container
 
 -- For searching by column name across the whole catalog.
 CREATE INDEX IF NOT EXISTS columns_by_name ON columns (column_name);
+
+-- Append-only: `schema_hash` keeps only the latest state, but "what changed
+-- upstream this week" is what a data engineer asks first, and the hash needed
+-- to answer it was already being computed and thrown away.
+CREATE TABLE IF NOT EXISTS schema_changes (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id         TEXT NOT NULL,
+    database       TEXT NOT NULL,
+    schema_name    TEXT NOT NULL,
+    container_name TEXT NOT NULL,
+    change_type    TEXT NOT NULL,  -- container_added | container_removed | schema_changed
+    old_hash       TEXT,
+    new_hash       TEXT,
+    detail         TEXT,           -- JSON: the columns added, removed or retyped
+    detected_at    TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS changes_by_time ON schema_changes (detected_at);
 """
 
 
@@ -282,6 +301,33 @@ class StoredContainerPage(BaseModel):
 class StoredColumnPage(BaseModel):
     columns: list[StoredColumn]
     next_cursor: str | None = None
+
+
+class SchemaChange(BaseModel):
+    """One thing that moved upstream between two scans."""
+
+    id: int
+    job_id: str
+    database: str
+    schema_name: str
+    container_name: str
+    change_type: str
+    old_hash: str | None = None
+    new_hash: str | None = None
+    # what actually differed: added / removed / retyped column names
+    detail: dict[str, Any] | None = None
+    detected_at: str
+
+
+class Relationship(BaseModel):
+    """One foreign key, as an edge an agent can draw."""
+
+    database: str
+    schema_name: str
+    from_container: str
+    from_column: str
+    to_container: str
+    to_column: str | None = None
 
 
 class SearchHit(BaseModel):
@@ -630,6 +676,193 @@ class StagingStore:
                 ),
             )
             self._conn.commit()
+
+    # ---- sensitivity ----
+
+    def record_sensitivity(
+        self,
+        database: str,
+        schema: str | None,
+        container: str,
+        levels: dict[str, Sensitivity],
+        *,
+        source: str,
+    ) -> int:
+        """
+        What a scan decided about a container's columns.
+
+        Only over its own earlier verdicts: a level set by `annotate` was put
+        there by an agent or a person looking at the thing, and a pattern match
+        does not get to overrule that. Nothing of the values that led to the
+        decision is written — the verdict is the whole record.
+        """
+        schema_key = schema or NO_SCHEMA
+        written = 0
+        with self._lock:
+            for column, level in levels.items():
+                cursor = self._conn.execute(
+                    "UPDATE columns SET sensitivity=?, sensitivity_source=? "
+                    "WHERE database=? AND schema_name=? AND container_name=? "
+                    "AND column_name=? AND (sensitivity_source IS NULL "
+                    "OR sensitivity_source=?)",
+                    (
+                        str(level),
+                        source,
+                        database,
+                        schema_key,
+                        container,
+                        column,
+                        source,
+                    ),
+                )
+                written += cursor.rowcount
+            self._conn.commit()
+        return written
+
+    def sensitivity_of(
+        self, database: str, container: str, schema: str | None = None
+    ) -> dict[str, Sensitivity]:
+        """A container's recorded levels, for masking a sample of it."""
+        rows = self._rows(
+            "SELECT column_name, sensitivity FROM columns WHERE database=? "
+            "AND schema_name=? AND container_name=? AND sensitivity IS NOT NULL",
+            (database, schema or NO_SCHEMA, container),
+        )
+        return {
+            row["column_name"]: Sensitivity(row["sensitivity"])
+            for row in rows
+            if row["sensitivity"] in set(Sensitivity)
+        }
+
+    # ---- change history ----
+
+    def record_change(
+        self,
+        job_id: str,
+        database: str,
+        schema: str | None,
+        container: str,
+        *,
+        change_type: str,
+        old_hash: str | None = None,
+        new_hash: str | None = None,
+        detail: dict[str, Any] | None = None,
+    ) -> None:
+        """Append one change. Nothing here is ever updated or deleted: the
+        value is in the sequence, and a corrected history is not one."""
+        self._write(
+            """
+            INSERT INTO schema_changes (job_id, database, schema_name,
+                container_name, change_type, old_hash, new_hash, detail,
+                detected_at)
+            VALUES (?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                job_id,
+                database,
+                schema or NO_SCHEMA,
+                container,
+                change_type,
+                old_hash,
+                new_hash,
+                json.dumps(detail, ensure_ascii=False) if detail else None,
+                _now(),
+            ),
+        )
+
+    def changes(
+        self,
+        database: str | None = None,
+        *,
+        since: str | None = None,
+        limit: int = DEFAULT_CHANGE_LIMIT,
+    ) -> list[SchemaChange]:
+        """What moved, newest first. `since` is an ISO timestamp."""
+        clauses, params = [], []
+        if database:
+            clauses.append("database=?")
+            params.append(database)
+        if since:
+            clauses.append("detected_at>=?")
+            params.append(since)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(limit)
+        rows = self._rows(
+            f"SELECT * FROM schema_changes {where} "  # noqa: S608
+            "ORDER BY detected_at DESC, id DESC LIMIT ?",
+            params,
+        )
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["detail"] = json.loads(item["detail"]) if item["detail"] else None
+            result.append(SchemaChange(**item))
+        return result
+
+    def container_keys(self, database: str | None = None) -> set[tuple[str, str, str]]:
+        """
+        Every container recorded, as (database, schema, name).
+
+        For spotting the ones a scan no longer finds. Keys only — the point is
+        not to read the rows. The schema is part of it because two schemas can
+        hold the same name, and dropping the wrong one is not recoverable.
+        """
+        where, params = ("WHERE database=?", (database,)) if database else ("", ())
+        return {
+            (row["database"], row["schema_name"], row["container_name"])
+            for row in self._rows(
+                "SELECT database, schema_name, container_name "  # noqa: S608
+                f"FROM containers {where}",
+                params,
+            )
+        }
+
+    def forget_container(
+        self, database: str, schema: str | None, container: str
+    ) -> None:
+        """Drop a container and its columns, for one that is gone upstream."""
+        schema_key = schema or NO_SCHEMA
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM columns WHERE database=? AND schema_name=? "
+                "AND container_name=?",
+                (database, schema_key, container),
+            )
+            self._conn.execute(
+                "DELETE FROM containers WHERE database=? AND schema_name=? "
+                "AND container_name=?",
+                (database, schema_key, container),
+            )
+            self._conn.commit()
+
+    # ---- relationships ----
+
+    def relationships(self, database: str | None = None) -> list[Relationship]:
+        """
+        Every foreign key as an edge.
+
+        "How do these two tables join" is the first question anyone asks of a
+        database they did not build, and `is_fk` on its own cannot answer it.
+        """
+        where, params = ("AND database=?", (database,)) if database else ("", ())
+        rows = self._rows(
+            "SELECT database, schema_name, container_name, column_name, "  # noqa: S608
+            f"references_container, references_column FROM columns "
+            f"WHERE references_container IS NOT NULL {where} "
+            "ORDER BY container_name, ordinal",
+            params,
+        )
+        return [
+            Relationship(
+                database=row["database"],
+                schema_name=row["schema_name"],
+                from_container=row["container_name"],
+                from_column=row["column_name"],
+                to_container=row["references_container"],
+                to_column=row["references_column"],
+            )
+            for row in rows
+        ]
 
     # ---- annotations ----
 
