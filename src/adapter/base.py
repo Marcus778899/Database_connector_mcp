@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import re
+import threading
+import time
 from abc import ABC, abstractmethod
 from typing import Any, ClassVar
 
@@ -27,11 +29,16 @@ class AdapterBase(ABC):
     # False when `database` names the whole source instead of selecting one inside it.
     SUPPORTS_MULTIPLE_DATABASES: ClassVar[bool] = True
 
+    # How long the allowlist reuses a catalog walk or a schema read. Zero
+    # disables caching. Only validation caches; the tools always read through.
+    _CATALOG_TTL: ClassVar[float] = 60.0
+
     def __init__(
         self,
         *,
         database: str = "",
         max_sample_limit: int | None = None,
+        catalog_ttl: float | None = None,
     ) -> None:
         self._database = database
         # per instance, so it must not be written back onto the class
@@ -39,6 +46,13 @@ class AdapterBase(ABC):
             self._MAX_SAMPLE_LIMIT if max_sample_limit is None else max_sample_limit
         )
         self._statement_log: list[str] = []
+
+        self._catalog_ttl = self._CATALOG_TTL if catalog_ttl is None else catalog_ttl
+        # Reentrant: validating a column reads the schema, and an engine's
+        # get_schema validates the container, which comes back through here.
+        self._catalog_lock = threading.RLock()
+        self._catalog_cache: tuple[float, frozenset[str]] | None = None
+        self._schema_cache: dict[str, tuple[float, list[ColumnInfo]]] = {}
 
     # ---- contract: abstract so a missing tool fails on construction ----
 
@@ -80,17 +94,56 @@ class AdapterBase(ABC):
 
     # ---- policy ----
 
-    def _known_containers(self) -> set[str]:
-        """Every container name. Stopping at page one would reject the rest as
-        unknown, so the full walk is deliberate."""
+    def _fresh(self, stamp: float) -> bool:
+        return self._catalog_ttl > 0 and (time.monotonic() - stamp) < self._catalog_ttl
+
+    def _known_containers(self) -> frozenset[str]:
+        """
+        Every container name, reused for `catalog_ttl` seconds.
+
+        The allowlist is consulted once per container *and* once per column of
+        every scan, so without the cache each of those walks the whole catalog.
+        The cost is that a container created seconds ago reads as unknown until
+        the entry expires; `invalidate_catalog_cache` is the way out.
+        """
+        with self._catalog_lock:
+            cached = self._catalog_cache
+            if cached is not None and self._fresh(cached[0]):
+                return cached[1]
+            names = self._walk_containers()
+            self._catalog_cache = (time.monotonic(), names)
+            return names
+
+    def _walk_containers(self) -> frozenset[str]:
+        """Uncached walk of every page. Stopping at page one would reject the
+        rest as unknown, so the full walk is deliberate. An engine that can list
+        names more cheaply than it can list containers overrides this, not the
+        caching wrapper."""
         names: set[str] = set()
         cursor: str | None = None
         while True:
             page = self.list_containers(limit=self._MAX_PAGE_SIZE, cursor=cursor)
             names.update(c.container_name for c in page.containers)
             if page.next_cursor is None or page.next_cursor == cursor:
-                return names
+                return frozenset(names)
             cursor = page.next_cursor
+
+    def _cached_schema(self, container: str) -> list[ColumnInfo]:
+        """A container's columns, for validation only — `get_schema` as a tool
+        must keep reading through to the source."""
+        with self._catalog_lock:
+            cached = self._schema_cache.get(container)
+            if cached is not None and self._fresh(cached[0]):
+                return cached[1]
+            columns = self.get_schema(container)
+            self._schema_cache[container] = (time.monotonic(), columns)
+            return columns
+
+    def invalidate_catalog_cache(self) -> None:
+        """Forget both caches, so the next validation re-reads the source."""
+        with self._catalog_lock:
+            self._catalog_cache = None
+            self._schema_cache.clear()
 
     def _cap_limit(self, limit: int) -> int:
         return max(0, min(limit, self._max_sample_limit))
@@ -137,7 +190,7 @@ class SqlAdapterBase(AdapterBase):
         return self._quote(container)
 
     def _require_column(self, container: str, column: str) -> str:
-        cols = {c.name for c in self.get_schema(container)}
+        cols = {c.name for c in self._cached_schema(container)}
         if column not in cols:
             raise UnknownColumnError(f"{container}.{column}")
         return self._quote(column)

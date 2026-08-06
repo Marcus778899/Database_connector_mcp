@@ -48,10 +48,12 @@ class InventoryService:
         store: StagingStore,
         *,
         page_size: int | None = None,
+        default_profile_modes: Sequence[ProfileMode] | None = None,
     ) -> None:
         self._provider = provider
         self._store = store
         self._page_size = page_size or self.DEFAULT_PAGE_SIZE
+        self._default_profile_modes = tuple(default_profile_modes or ())
         self._lock = threading.Lock()
         self._workers: dict[str, threading.Thread] = {}
         self._cancels: dict[str, threading.Event] = {}
@@ -77,7 +79,15 @@ class InventoryService:
 
         `resume` continues an unfinished run from its cursor; `force` rescans
         containers whose schema has not changed.
+
+        `profile_modes` falls back to the server's default; an empty sequence is
+        respected as "gather no statistics".
         """
+        modes = (
+            self._default_profile_modes
+            if profile_modes is None
+            else tuple(profile_modes)
+        )
         with self._lock:
             if database in self._running_databases:
                 raise ScanAlreadyRunningError(
@@ -100,7 +110,7 @@ class InventoryService:
             self._running_databases.add(database)
             worker = threading.Thread(
                 target=self._run,
-                args=(job_id, database, cursor, tuple(profile_modes or ()), force),
+                args=(job_id, database, cursor, modes, force),
                 name=f"inventory-scan[{database or 'default'}]",
                 daemon=True,
             )

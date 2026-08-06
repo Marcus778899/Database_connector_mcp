@@ -125,6 +125,104 @@ def test_require_container_accepts_a_name_on_a_later_page():
     assert OnePerPage()._require_container("users") == '"users"'
 
 
+def test_known_containers_is_immutable():
+    """The cache hands the same object to every caller."""
+    assert isinstance(DummyAdapter()._known_containers(), frozenset)
+
+
+# ---- catalog cache ----
+
+
+class CountingAdapter(DummySqlAdapter):
+    """Counts what actually reaches the source."""
+
+    def __init__(self, **kwargs):
+        self.walks = 0
+        self.schema_reads = 0
+        super().__init__(**kwargs)
+
+    def _walk_containers(self):
+        self.walks += 1
+        return super()._walk_containers()
+
+    def get_schema(self, container):
+        self.schema_reads += 1
+        return super().get_schema(container)
+
+
+def test_the_catalog_is_walked_once_per_ttl():
+    adapter = CountingAdapter()
+
+    assert adapter._known_containers() == adapter._known_containers()
+    assert adapter.walks == 1
+
+
+def test_validation_shares_one_walk_and_one_schema_read():
+    """Both checks run per column of every scan; each used to hit the source."""
+    adapter = CountingAdapter()
+
+    adapter._require_container("users")
+    adapter._require_column("users", "id")
+    adapter._require_column("users", "name")
+
+    assert adapter.walks == 1
+    assert adapter.schema_reads == 1
+
+
+def test_a_zero_ttl_disables_the_cache():
+    adapter = CountingAdapter(catalog_ttl=0)
+
+    adapter._known_containers()
+    adapter._known_containers()
+
+    assert adapter.walks == 2
+
+
+def test_an_expired_entry_is_read_again():
+    adapter = CountingAdapter(catalog_ttl=30)
+    adapter._known_containers()
+
+    assert adapter._catalog_cache is not None
+    stamp, names = adapter._catalog_cache
+    # age the entry rather than sleeping through the ttl
+    adapter._catalog_cache = (stamp - 60, names)
+
+    assert adapter._known_containers() == names
+    assert adapter.walks == 2
+
+
+def test_invalidating_the_cache_forces_a_reread():
+    """The way to see a container created since the last walk."""
+    adapter = CountingAdapter()
+    adapter._require_container("users")
+    adapter._require_column("users", "id")
+
+    adapter.invalidate_catalog_cache()
+    adapter._require_container("users")
+    adapter._require_column("users", "id")
+
+    assert adapter.walks == 2
+    assert adapter.schema_reads == 2
+
+
+def test_the_cache_does_not_leak_between_adapters():
+    first, second = CountingAdapter(), CountingAdapter()
+
+    first._known_containers()
+
+    assert second.walks == 0
+
+
+def test_get_schema_as_a_tool_still_reads_through():
+    """Only validation caches: a schema tool call must see the source."""
+    adapter = CountingAdapter()
+
+    adapter.get_schema("users")
+    adapter.get_schema("users")
+
+    assert adapter.schema_reads == 2
+
+
 def test_cap_page_size():
     adapter = DummyAdapter()
 
