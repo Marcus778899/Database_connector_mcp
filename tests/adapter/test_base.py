@@ -1,3 +1,5 @@
+from typing import Any
+
 import pytest
 
 from src.adapter.base import (
@@ -6,7 +8,13 @@ from src.adapter.base import (
     UnknownColumnError,
     UnknownContainerError,
 )
-from src.core.tool import ColumnInfo, ContainerInfo, ContainerType, ProfileMode
+from src.core.contracts import (
+    ColumnInfo,
+    ContainerInfo,
+    ContainerPage,
+    ContainerType,
+    ProfileMode,
+)
 
 USERS_COLUMNS = [
     ColumnInfo(
@@ -28,24 +36,34 @@ USERS_COLUMNS = [
 ]
 
 
-class _ContractMixin:
-    """The four tools a concrete adapter has to provide, kept out of the way."""
-
+class _ContractMixin(AdapterBase):
     def list_containers(
-        self, database: str | None = None, schema: str | None = None
-    ) -> list[ContainerInfo]:
-        return [
-            ContainerInfo(
-                database=self._database,
-                container_name="users",
-                container_type=ContainerType.TABLE,
-            )
-        ]
+        self,
+        database: str | None = None,
+        schema: str | None = None,
+        limit: int | None = None,
+        cursor: str | None = None,
+    ) -> ContainerPage:
+        names = ["orders", "users"]
+        if cursor is not None:
+            names = [n for n in names if n > cursor]
+        page = names[: self._cap_page_size(limit)]
+        return ContainerPage(
+            containers=[
+                ContainerInfo(
+                    database=self._database,
+                    container_name=name,
+                    container_type=ContainerType.TABLE,
+                )
+                for name in page
+            ],
+            next_cursor=page[-1] if page and len(names) > len(page) else None,
+        )
 
     def get_schema(self, container: str) -> list[ColumnInfo]:
         return USERS_COLUMNS if container == "users" else []
 
-    def get_sample(self, container: str, limit: int = 3) -> list[dict[str, object]]:
+    def get_sample(self, container: str, limit: int = 3) -> list[dict[str, Any]]:
         return [{"id": 1}][: self._cap_limit(limit)]
 
     def profile_column(self, container, column, mode):
@@ -71,11 +89,11 @@ def test_list_databases():
 
 
 def test_incomplete_adapter_cannot_be_constructed():
-    """A backend missing a tool must fail on construction, not on the MCP call."""
+    """A missing tool must fail on construction, not on the MCP call."""
 
     class Incomplete(AdapterBase):
-        def list_containers(self, database=None, schema=None):
-            return []
+        def list_containers(self, database=None, schema=None, limit=None, cursor=None):
+            return ContainerPage(containers=[])
 
     with pytest.raises(TypeError, match="abstract"):
         Incomplete()  # type: ignore[abstract]
@@ -88,7 +106,33 @@ def test_incomplete_adapter_cannot_be_constructed():
 
 
 def test_known_containers():
-    assert DummyAdapter()._known_containers() == {"users"}
+    assert DummyAdapter()._known_containers() == {"orders", "users"}
+
+
+def test_known_containers_follows_the_cursor_to_the_end():
+    """Page one alone would reject the rest as unknown."""
+
+    class OnePerPage(DummyAdapter):
+        _MAX_PAGE_SIZE = 1
+
+    assert OnePerPage()._known_containers() == {"orders", "users"}
+
+
+def test_require_container_accepts_a_name_on_a_later_page():
+    class OnePerPage(DummySqlAdapter):
+        _MAX_PAGE_SIZE = 1
+
+    assert OnePerPage()._require_container("users") == '"users"'
+
+
+def test_cap_page_size():
+    adapter = DummyAdapter()
+
+    assert adapter._cap_page_size(None) == AdapterBase._DEFAULT_PAGE_SIZE
+    assert adapter._cap_page_size(10) == 10
+    assert adapter._cap_page_size(10_000) == AdapterBase._MAX_PAGE_SIZE
+    assert adapter._cap_page_size(0) == 1
+    assert adapter._cap_page_size(-5) == 1
 
 
 # ---- policy ----
@@ -106,7 +150,6 @@ def test_max_sample_limit_is_per_instance():
     capped = DummyAdapter(max_sample_limit=10)
 
     assert capped._cap_limit(1000) == 10
-    # overriding one adapter must not leak into the class default
     assert DummyAdapter()._cap_limit(1000) == AdapterBase._MAX_SAMPLE_LIMIT
     assert AdapterBase._MAX_SAMPLE_LIMIT == 100
 
@@ -201,7 +244,6 @@ def test_sql_templates():
 
 
 def test_profile_mode_enum_is_fully_covered_by_templates():
-    """Each ProfileMode has a statement template behind it."""
     adapter = DummySqlAdapter()
     builders = {
         ProfileMode.DISTINCT_COUNT: adapter._sql_distinct_count,

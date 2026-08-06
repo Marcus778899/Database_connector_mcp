@@ -10,7 +10,7 @@ from pyarrow.fs import LocalFileSystem
 from src.adapter.base import UnknownColumnError, UnknownContainerError
 from src.adapter.datalake import DatalakeAdapter
 from src.core.config import ConnectionInfo
-from src.core.tool import ContainerType, ProfileMode, SourceAdaptor
+from src.core.contracts import ContainerType, ProfileMode, SourceAdaptor
 
 USERS = pa.table(
     {
@@ -38,10 +38,7 @@ def _write_text(path: Path, body: str) -> None:
 
 @pytest.fixture
 def lake(tmp_path: Path) -> Path:
-    """
-    A lake with one flat parquet dataset, one hive-partitioned parquet dataset,
-    a csv and a json dataset, plus directories that are not datasets at all.
-    """
+    """Flat parquet, hive-partitioned parquet, csv, json, plus non-datasets."""
     _write_parquet(tmp_path / "users")
     _write_parquet(tmp_path / "events" / "dt=2024-01-01")
     _write_parquet(tmp_path / "events" / "dt=2024-01-02")
@@ -51,7 +48,6 @@ def lake(tmp_path: Path) -> Path:
 
     (tmp_path / "empty").mkdir()
     _write_text(tmp_path / "notes" / "readme.txt", "not a dataset")
-    # a stray top-level file is not a container
     (tmp_path / "loose.parquet").write_bytes(b"")
     return tmp_path
 
@@ -65,13 +61,12 @@ def adapter(lake: Path) -> DatalakeAdapter:
 
 
 def test_satisfies_source_adaptor_protocol(adapter: DatalakeAdapter):
-    # the annotation is the point: a missing tool becomes a type error
     checked: SourceAdaptor = adapter
     assert isinstance(checked, SourceAdaptor)
 
 
 def test_list_containers_finds_every_supported_format(adapter: DatalakeAdapter):
-    containers = adapter.list_containers()
+    containers = adapter.list_containers().containers
 
     assert [c.container_name for c in containers] == [
         "cities",
@@ -85,18 +80,17 @@ def test_list_containers_finds_every_supported_format(adapter: DatalakeAdapter):
 
 
 def test_row_count_is_only_reported_when_it_is_free(adapter: DatalakeAdapter):
-    counts = {c.container_name: c.estimated_count for c in adapter.list_containers()}
+    page = adapter.list_containers()
+    counts = {c.container_name: c.estimated_count for c in page.containers}
 
-    # parquet keeps the count in its footer
     assert counts["users"] == 5
     assert counts["events"] == 10
-    # csv/json would have to be read end to end
     assert counts["cities"] is None
     assert counts["logs"] is None
 
 
 def test_list_containers_ignores_non_datasets(adapter: DatalakeAdapter):
-    names = {c.container_name for c in adapter.list_containers()}
+    names = {c.container_name for c in adapter.list_containers().containers}
 
     assert "empty" not in names
     assert "notes" not in names
@@ -104,7 +98,7 @@ def test_list_containers_ignores_non_datasets(adapter: DatalakeAdapter):
 
 
 def test_list_containers_rejects_a_scope_it_cannot_serve(adapter: DatalakeAdapter):
-    assert adapter.list_containers(database="datalake")
+    assert adapter.list_containers(database="datalake").containers
 
     with pytest.raises(UnknownContainerError, match="unknown database"):
         adapter.list_containers(database="somewhere_else")
@@ -122,7 +116,7 @@ def test_hive_partition_keys_are_part_of_the_schema(adapter: DatalakeAdapter):
 def test_trailing_slash_in_root_is_normalised(lake: Path):
     adapter = DatalakeAdapter(f"{lake}/", LocalFileSystem())
 
-    assert "events" in {c.container_name for c in adapter.list_containers()}
+    assert "events" in {c.container_name for c in adapter.list_containers().containers}
 
 
 def test_format_choice_is_stable_when_a_directory_mixes_formats(tmp_path: Path):
@@ -139,7 +133,7 @@ def test_deeper_nesting_than_probe_depth_is_not_discovered(tmp_path: Path):
     _write_parquet(tmp_path / "deep" / "a=1" / "b=2" / "c=3" / "d=4")
     adapter = DatalakeAdapter(str(tmp_path), LocalFileSystem())
 
-    assert adapter.list_containers() == []
+    assert adapter.list_containers().containers == []
 
 
 def test_list_databases(adapter: DatalakeAdapter):
@@ -159,7 +153,6 @@ def test_get_schema(adapter: DatalakeAdapter):
     assert [c.ordinal for c in columns] == [1, 2]
     assert columns[0].native_type == "int64"
     assert columns[0].nullable is True
-    # a data lake has no key metadata to report
     assert not any(c.is_pk or c.is_fk for c in columns)
 
 
@@ -173,7 +166,6 @@ def test_get_sample_is_capped_by_max_sample_limit(lake: Path):
 
     assert len(adapter.get_sample("users", limit=100)) == 2
 
-    # the cap is per adapter and must not leak onto the class
     uncapped = DatalakeAdapter(str(lake), LocalFileSystem())
     assert len(uncapped.get_sample("users", limit=4)) == 4
 
@@ -187,7 +179,6 @@ def test_unknown_container_is_rejected(adapter: DatalakeAdapter):
         adapter.get_schema("ghost")
     with pytest.raises(UnknownContainerError):
         adapter.get_sample("ghost")
-    # directories that hold no data file are not containers either
     with pytest.raises(UnknownContainerError):
         adapter.get_sample("empty")
 
@@ -223,7 +214,7 @@ def test_json_extensions(tmp_path: Path, suffix: str):
     _write_text(tmp_path / "logs" / f"part-0{suffix}", NDJSON)
     adapter = DatalakeAdapter(str(tmp_path), LocalFileSystem())
 
-    assert [c.container_name for c in adapter.list_containers()] == ["logs"]
+    assert [c.container_name for c in adapter.list_containers().containers] == ["logs"]
     distinct = adapter.profile_column("logs", "name", ProfileMode.DISTINCT_COUNT)
     assert distinct.distinct_count == 2
 
@@ -236,7 +227,6 @@ def test_json_dataset_can_be_profiled(adapter: DatalakeAdapter):
 
 
 def test_a_json_array_file_is_not_supported(tmp_path: Path):
-    """pyarrow reads line-delimited json only; a top-level array cannot be read."""
     _write_text(tmp_path / "arrayish" / "part-0.json", '[{"id": 1}, {"id": 2}]')
     adapter = DatalakeAdapter(str(tmp_path), LocalFileSystem())
 
@@ -268,7 +258,6 @@ def test_profile_top_values(adapter: DatalakeAdapter):
 
     assert result.top_values is not None
     top = [(v.value, v.count) for v in result.top_values]
-    # count desc, then value for a stable tie-break
     assert top == [("ada", 3), ("bob", 1), ("cid", 1)]
 
 
@@ -307,7 +296,6 @@ def test_profile_spans_every_partition(adapter: DatalakeAdapter):
 
 
 def test_profile_streams_in_batches(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    """A tiny batch size must not change any answer."""
     _write_parquet(tmp_path / "users")
     adapter = DatalakeAdapter(str(tmp_path), LocalFileSystem())
     monkeypatch.setattr(DatalakeAdapter, "_PROFILE_BATCH_ROWS", 2)
@@ -332,7 +320,6 @@ def test_hash_based_profiling_stops_at_the_row_bound(
     assert truncated.approximate is True
     assert truncated.distinct_count == 2  # only the first batch was read
 
-    # the streaming modes are exact
     exact = adapter.profile_column("users", "id", ProfileMode.NULL_RATIO)
     assert exact.approximate is False
     assert exact.null_ratio == 0.2
@@ -387,7 +374,7 @@ def test_from_connection_with_path(lake: Path):
     adapter = DatalakeAdapter.from_connection(ConnectionInfo(path=str(lake)))
 
     assert adapter.list_databases() == ["datalake"]
-    assert "users" in {c.container_name for c in adapter.list_containers()}
+    assert "users" in {c.container_name for c in adapter.list_containers().containers}
 
 
 def test_from_connection_with_uri(lake: Path):
@@ -434,3 +421,139 @@ def test_get_sample_jsonifies_non_native_types(tmp_path: Path):
     assert adapter.get_sample("orders") == [
         {"when": "2024-01-02T03:04:05", "amount": "1.20", "blob": "cmF3"}
     ]
+
+
+# ---- pagination ----
+
+
+def _walk(
+    adapter: DatalakeAdapter, limit: int, max_pages: int = 50
+) -> tuple[list[str], int]:
+    """Follow the cursor to the end. Bounded, or a cursor that never clears would
+    hang the suite instead of failing it."""
+    names: list[str] = []
+    cursor: str | None = None
+    for page_number in range(1, max_pages + 1):
+        page = adapter.list_containers(limit=limit, cursor=cursor)
+        names.extend(c.container_name for c in page.containers)
+        if page.next_cursor is None:
+            return names, page_number
+        assert page.next_cursor != cursor, "cursor did not advance"
+        cursor = page.next_cursor
+    raise AssertionError(f"cursor never cleared after {max_pages} pages")
+
+
+def test_a_page_carries_a_cursor_only_while_more_remain(adapter: DatalakeAdapter):
+    first = adapter.list_containers(limit=2)
+
+    assert [c.container_name for c in first.containers] == ["cities", "events"]
+    assert first.next_cursor == "events"
+
+    last = adapter.list_containers(limit=2, cursor=first.next_cursor)
+
+    assert [c.container_name for c in last.containers] == ["logs", "users"]
+    assert last.next_cursor is None
+
+
+def test_walking_the_cursor_sees_everything_exactly_once(adapter: DatalakeAdapter):
+    for limit in (1, 2, 3, 4, 100):
+        names, _ = _walk(adapter, limit)
+        assert names == ["cities", "events", "logs", "users"], f"limit={limit}"
+
+
+def test_page_size_one_still_terminates(adapter: DatalakeAdapter):
+    names, pages = _walk(adapter, 1)
+
+    assert names == ["cities", "events", "logs", "users"]
+    assert pages == 4
+
+
+def test_a_single_page_holding_everything_has_no_cursor(adapter: DatalakeAdapter):
+    page = adapter.list_containers(limit=4)
+
+    assert len(page.containers) == 4
+    assert page.next_cursor is None
+
+
+def test_the_default_page_size_applies_when_no_limit_is_given(tmp_path: Path):
+    for index in range(DatalakeAdapter._DEFAULT_PAGE_SIZE + 5):
+        _write_parquet(tmp_path / f"t{index:03d}")
+    adapter = DatalakeAdapter(str(tmp_path), LocalFileSystem())
+
+    page = adapter.list_containers()
+
+    assert len(page.containers) == DatalakeAdapter._DEFAULT_PAGE_SIZE
+    assert page.next_cursor is not None
+
+
+def test_page_size_is_capped(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(DatalakeAdapter, "_MAX_PAGE_SIZE", 2)
+    adapter = DatalakeAdapter(str(tmp_path), LocalFileSystem())
+    for name in ("a", "b", "c"):
+        _write_parquet(tmp_path / name)
+
+    assert len(adapter.list_containers(limit=999).containers) == 2
+
+
+def test_a_cursor_past_the_end_yields_an_empty_final_page(adapter: DatalakeAdapter):
+    page = adapter.list_containers(cursor="zzz")
+
+    assert page.containers == []
+    assert page.next_cursor is None
+
+
+def test_a_cursor_naming_a_removed_dataset_still_works(lake: Path):
+    adapter = DatalakeAdapter(str(lake), LocalFileSystem())
+
+    page = adapter.list_containers(cursor="events")
+    assert [c.container_name for c in page.containers] == ["logs", "users"]
+
+    import shutil
+
+    shutil.rmtree(lake / "events")
+
+    page = adapter.list_containers(cursor="events")
+    assert [c.container_name for c in page.containers] == ["logs", "users"]
+
+
+def test_a_dataset_added_mid_walk_does_not_shift_the_page(lake: Path):
+    adapter = DatalakeAdapter(str(lake), LocalFileSystem())
+    first = adapter.list_containers(limit=2)
+    assert first.next_cursor == "events"
+
+    _write_parquet(lake / "aaa_new")
+
+    rest = adapter.list_containers(limit=2, cursor=first.next_cursor)
+
+    assert [c.container_name for c in rest.containers] == ["logs", "users"]
+    assert "aaa_new" not in [c.container_name for c in rest.containers]
+
+
+def test_only_the_page_is_opened(tmp_path: Path):
+    """Listing used to count rows for every dataset in the lake."""
+    for name in ("a", "b", "c", "d"):
+        _write_parquet(tmp_path / name)
+    adapter = DatalakeAdapter(str(tmp_path), LocalFileSystem())
+
+    adapter.list_containers(limit=2)
+
+    rendered = adapter.pop_rendered_sql() or ""
+    assert rendered.count("scan") == 2
+    assert "/a " in rendered and "/b " in rendered
+    assert "/c " not in rendered and "/d " not in rendered
+
+
+def test_formats_without_metadata_counts_are_not_opened_at_all(
+    adapter: DatalakeAdapter,
+):
+    adapter.pop_rendered_sql()
+
+    page = adapter.list_containers(limit=1)
+
+    assert [c.container_name for c in page.containers] == ["cities"]  # the csv one
+    assert adapter.pop_rendered_sql() is None
+
+
+def test_scope_errors_beat_pagination(adapter: DatalakeAdapter):
+    with pytest.raises(UnknownContainerError, match="unknown database"):
+        adapter.list_containers(database="nope", limit=1)

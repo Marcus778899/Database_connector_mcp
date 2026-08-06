@@ -14,9 +14,11 @@ from src.adapter.base import (
     UnknownContainerError,
 )
 from src.core.config import ConnectionInfo
-from src.core.tool import (
+from src.core.log import log
+from src.core.contracts import (
     ColumnInfo,
     ContainerInfo,
+    ContainerPage,
     ContainerType,
     ProfileMode,
     ProfileResult,
@@ -36,20 +38,22 @@ _FORMATS = {
 # Only parquet keeps its row count in metadata; csv/json have to be read.
 _ROW_COUNT_FROM_METADATA = frozenset({"parquet"})
 
-# pyarrow.compute builds its kernels into module globals at import time and ships
-# no stubs, so count_distinct / value_counts / min_max are invisible to static
-# analysers. One untyped handle beats a `type: ignore` per call site.
+# pyarrow.compute builds its kernels into module globals at import time and ships no
+# stubs, so its functions are invisible to type checkers. One handle beats many ignores.
 pc: Any = _pc
 
 
 class DatalakeAdapter(AdapterBase):
     """SourceAdapter over a data lake（parquet/csv/json dataset）。"""
 
+    # `database` only labels the lake here; the root is fixed at construction
+    SUPPORTS_MULTIPLE_DATABASES: ClassVar[bool] = False
+
     # deepest partition nesting we probe for a data file
     _MAX_PROBE_DEPTH: ClassVar[int] = 3
     _PROFILE_BATCH_ROWS: ClassVar[int] = 65_536
-    # distinct_count/top_values hold one entry per distinct value, so they stop
-    # here and report the result as approximate
+    # distinct_count/top_values hold one entry per distinct value; past this the
+    # result is reported as approximate
     _MAX_PROFILE_ROWS: ClassVar[int] = 5_000_000
 
     def __init__(
@@ -89,10 +93,9 @@ class DatalakeAdapter(AdapterBase):
 
     def _detect_format(self, dir_path: str, depth: int = 0) -> str | None:
         """
-        Sniff a dataset's format from the first recognised data file, descending
-        into subdirectories so hive-partitioned datasets are visible too.
-        Entries are sorted to keep a mixed-format directory resolving the same
-        way on every call.
+        Format of the first recognised data file, descending into subdirectories
+        so hive-partitioned datasets are visible. Sorted, so a mixed-format
+        directory resolves the same way every time.
         """
         subdirs: list[str] = []
         entries = sorted(
@@ -127,11 +130,10 @@ class DatalakeAdapter(AdapterBase):
 
     def _dataset_format(self, container: str) -> str | None:
         """
-        Resolve one container without format-probing the whole lake.
+        Resolve one container without probing the whole lake.
 
         Doubles as the allowlist: only a direct child directory of the root
-        holding a recognised data file can be named, so `..` cannot walk out of
-        the lake and `a/b` cannot reach into a partition.
+        counts, so `..` and `a/b` cannot escape.
         """
         if container in ("", ".", "..") or "/" in container or "\\" in container:
             return None
@@ -142,8 +144,7 @@ class DatalakeAdapter(AdapterBase):
 
     def _open(self, name: str, fmt: str) -> pads.Dataset:
         self._record_sql(f"scan {self._root}/{name} ({fmt})")
-        # without partitioning="hive" a dt=2024-01-01 directory is read as data
-        # but dt never appears in the schema; a no-op on flat layouts
+        # without partitioning="hive" a dt=2024-01-01 key never reaches the schema
         return pads.dataset(
             f"{self._root}/{name}",
             format=fmt,
@@ -160,8 +161,19 @@ class DatalakeAdapter(AdapterBase):
     # 4 tools (READ ONLY)
 
     def list_containers(
-        self, database: str | None = None, schema: str | None = None
-    ) -> list[ContainerInfo]:
+        self,
+        database: str | None = None,
+        schema: str | None = None,
+        limit: int | None = None,
+        cursor: str | None = None,
+    ) -> ContainerPage:
+        """
+        One page of the catalog, ordered by name.
+
+        Keyset, not offset: the cursor is the last name returned, so datasets
+        appearing or disappearing mid-walk cannot make the caller skip or repeat
+        one. Only the page's datasets are opened.
+        """
         if database is not None and database != self._database:
             raise UnknownContainerError(f"unknown database：{database!r}")
         if schema is not None:
@@ -169,24 +181,32 @@ class DatalakeAdapter(AdapterBase):
                 f"the datalake has no schema layer, got schema={schema!r}"
             )
 
-        result: list[ContainerInfo] = []
-        for name, fmt in sorted(self._datasets().items()):
-            dataset = self._open(name, fmt)
-            result.append(
-                ContainerInfo(
-                    database=self._database,
-                    schema_name=None,
-                    container_name=name,
-                    container_type=ContainerType.TABLE,
-                    # counting csv/json means reading every row just to list
-                    estimated_count=(
-                        dataset.count_rows()
-                        if fmt in _ROW_COUNT_FROM_METADATA
-                        else None
-                    ),
-                )
+        names = sorted(self._datasets().items())
+        if cursor is not None:
+            names = [(name, fmt) for name, fmt in names if name > cursor]
+
+        page_size = self._cap_page_size(limit)
+        page, has_more = names[:page_size], len(names) > page_size
+
+        containers = [
+            ContainerInfo(
+                database=self._database,
+                schema_name=None,
+                container_name=name,
+                container_type=ContainerType.TABLE,
+                # counting csv/json means reading every row just to list
+                estimated_count=(
+                    self._open(name, fmt).count_rows()
+                    if fmt in _ROW_COUNT_FROM_METADATA
+                    else None
+                ),
             )
-        return result
+            for name, fmt in page
+        ]
+        return ContainerPage(
+            containers=containers,
+            next_cursor=page[-1][0] if has_more else None,
+        )
 
     def get_schema(self, container: str) -> list[ColumnInfo]:
         dataset = self._require_dataset(container)
@@ -225,9 +245,7 @@ class DatalakeAdapter(AdapterBase):
 
         raise ValueError(f"unsupported profile mode：{mode!r}")
 
-    # ---- profiling ----
-    # Batched throughout: to_table(columns=[column]) would pull a whole
-    # lake-sized column into memory.
+    # ---- profiling: batched, since to_table() would load the whole column ----
 
     def _column_batches(self, dataset: pads.Dataset, column: str) -> Iterator[Any]:
         scanner = dataset.scanner(columns=[column], batch_size=self._PROFILE_BATCH_ROWS)
@@ -270,6 +288,10 @@ class DatalakeAdapter(AdapterBase):
                 counts[value] += freq
             scanned += len(arr)
             if scanned >= self._MAX_PROFILE_ROWS:
+                log.warning(
+                    f"{mode} for {column!r} stopped at {scanned} rows "
+                    f"(_MAX_PROFILE_ROWS); the result is approximate"
+                )
                 approximate = True
                 break
 

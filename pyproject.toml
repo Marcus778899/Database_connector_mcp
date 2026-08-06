@@ -10,11 +10,11 @@ dependencies = [
 ]
 
 [project.scripts]
-mcp-connector = "mcp_connector.main:main"
+mcp-connector = "main:main"
 
 [project.optional-dependencies]
 server = [
-    "fastmcp>=2.3",
+    "fastmcp>=3.0",
     "pyjwt>=2.8",
     "cryptography>=42",
 ]
@@ -28,7 +28,7 @@ datalake = ["pyarrow>=17"]
 dev = [
     "pytest>=8.2",
     "pytest-asyncio>=0.23",
-    "fastmcp>=2.3",
+    "fastmcp>=3.0",
     "pyjwt>=2.8",
     "cryptography>=42",
     "pyarrow>=17",
@@ -39,7 +39,13 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["mcp_connector"]
+only-include = ["src", "main.py"]
+
+# So the CLI (`uvx pyright`) and Pylance in the editor agree.
+[tool.pyright]
+venvPath = "."
+venv = ".venv"
+include = ["src", "tests", "main.py"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
