@@ -5,13 +5,19 @@ import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
 
 import jwt
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from src.auth.keys import KEY_SUFFIX, MalformedKeyIdError, valid_kid
+from src.auth.permissions import (
+    CLAIM_ANNOTATE_AS_HUMAN,
+    CLAIM_CONTAINERS,
+    CLAIM_DATABASES,
+    CLAIM_RAW_SAMPLE,
+)
 from src.core.log import log
 
 # Ed25519: one curve, no parameters to choose badly, and a public key short
@@ -152,6 +158,11 @@ def issue_token(
     scopes: Sequence[str],
     lifetime: timedelta,
     issued_at: datetime | None = None,
+    databases: Sequence[str] = (),
+    allow_containers: Sequence[str] = (),
+    deny_containers: Sequence[str] = (),
+    allow_raw_sample: bool = False,
+    annotate_as_human: bool = False,
 ) -> str:
     """
     Sign one token, offline.
@@ -159,16 +170,31 @@ def issue_token(
     `mcp.json` can carry a static header but cannot compute a signature, so the
     signing happens here and the agent only ever holds the result. The private
     key never reaches the server.
+
+    Everything past `scopes` is written only when asked for, so a token granting
+    nothing beyond a list of tools is byte-for-byte what it was before those
+    claims existed — and one already issued keeps meaning exactly what it meant.
     """
     check_kid(kid)
     if not subject:
         raise IssueError("a token needs a subject: it becomes the audit trail's caller")
     now = issued_at or datetime.now(UTC)
-    payload = {
+    payload: dict[str, Any] = {
         "sub": subject,
         "aud": audience,
         "iat": int(now.timestamp()),
         "exp": int((now + lifetime).timestamp()),
         "scopes": list(scopes),
     }
+    if databases:
+        payload[CLAIM_DATABASES] = list(databases)
+    if allow_containers or deny_containers:
+        payload[CLAIM_CONTAINERS] = {
+            "allow": list(allow_containers),
+            "deny": list(deny_containers),
+        }
+    if allow_raw_sample:
+        payload[CLAIM_RAW_SAMPLE] = True
+    if annotate_as_human:
+        payload[CLAIM_ANNOTATE_AS_HUMAN] = True
     return jwt.encode(payload, private_pem, algorithm=ALGORITHM, headers={"kid": kid})

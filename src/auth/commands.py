@@ -82,6 +82,38 @@ def add_token_command(commands: argparse._SubParsersAction) -> None:
     )
     issue.add_argument("--lifetime", default="30d", help="30d, 12h, 90m (default 30d)")
     issue.add_argument(
+        "--database",
+        action="append",
+        default=[],
+        help="a database this token may read; repeatable. None means all of them.",
+    )
+    issue.add_argument(
+        "--allow-container",
+        action="append",
+        default=[],
+        help="a glob of containers this token may read, e.g. 'dim_*'; "
+        "repeatable. None means all but the denied.",
+    )
+    issue.add_argument(
+        "--deny-container",
+        action="append",
+        default=[],
+        help="a glob this token may never read, e.g. '*_pii'; repeatable. "
+        "Deny beats allow.",
+    )
+    issue.add_argument(
+        "--allow-raw-sample",
+        action="store_true",
+        help="let this token ask get_sample for unmasked rows. Off by default: "
+        "sampled rows go into an agent's context and stay there.",
+    )
+    issue.add_argument(
+        "--annotate-as-human",
+        action="store_true",
+        help="descriptions written with this token are recorded as a person's "
+        "rather than an agent's guesses.",
+    )
+    issue.add_argument(
         "--out", help="write the token here instead of to stdout, and say nothing else"
     )
 
@@ -135,6 +167,11 @@ def _issue(args: argparse.Namespace) -> int:
         audience=args.audience,
         scopes=args.scope,
         lifetime=parse_duration(args.lifetime),
+        databases=args.database,
+        allow_containers=args.allow_container,
+        deny_containers=args.deny_container,
+        allow_raw_sample=args.allow_raw_sample,
+        annotate_as_human=args.annotate_as_human,
     )
     if not args.scope:
         print(

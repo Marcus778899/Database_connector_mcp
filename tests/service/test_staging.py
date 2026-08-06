@@ -1128,3 +1128,188 @@ def test_a_container_hit_does_not_outrank_a_better_column_hit(store: StagingStor
         ("users", "name"),
         ("logs", "description"),
     ]
+
+
+# ---- change history ----
+
+
+def test_a_change_is_recorded_and_read_back(store: StagingStore):
+    store.record_change(
+        "job1",
+        "main",
+        None,
+        "users",
+        change_type="schema_changed",
+        old_hash="a",
+        new_hash="b",
+        detail={"added": ["email"]},
+    )
+
+    (change,) = store.changes()
+
+    assert change.change_type == "schema_changed"
+    assert (change.old_hash, change.new_hash) == ("a", "b")
+    assert change.detail == {"added": ["email"]}
+    assert change.detected_at
+
+
+def test_changes_come_back_newest_first(store: StagingStore):
+    for name in ("first", "second", "third"):
+        store.record_change("job1", "main", None, name, change_type="container_added")
+
+    assert [c.container_name for c in store.changes()] == ["third", "second", "first"]
+
+
+def test_changes_can_be_scoped_and_limited(store: StagingStore):
+    store.record_change("job1", "one", None, "a", change_type="container_added")
+    store.record_change("job1", "two", None, "b", change_type="container_added")
+
+    assert len(store.changes()) == 2
+    assert [c.database for c in store.changes("one")] == ["one"]
+    assert len(store.changes(limit=1)) == 1
+
+
+def test_changes_can_be_asked_for_since_a_time(store: StagingStore):
+    store.record_change("job1", "main", None, "old", change_type="container_added")
+    cutoff = store.changes()[0].detected_at
+
+    assert [c.container_name for c in store.changes(since=cutoff)] == ["old"]
+    assert store.changes(since="2999-01-01T00:00:00+00:00") == []
+
+
+def test_the_history_is_append_only(store: StagingStore):
+    """Two of the same change are two facts, not one repeated: the value is in
+    the sequence."""
+    for _ in range(2):
+        store.record_change(
+            "job1", "main", None, "users", change_type="container_added"
+        )
+
+    assert len(store.changes()) == 2
+
+
+def test_a_container_can_be_forgotten_with_its_columns(store: StagingStore):
+    _inventoried(store)
+
+    store.forget_container("main", None, "users")
+
+    assert store.containers("main").containers == []
+    assert store.columns("main", "users").columns == []
+
+
+def test_the_keys_of_what_is_recorded_carry_the_schema(store: StagingStore):
+    """Two schemas can hold the same name, and dropping the wrong one is not
+    recoverable."""
+    store.upsert_container(_container("users", schema_name="public"), hash_="h")
+    store.upsert_container(_container("users", schema_name="staging"), hash_="h")
+
+    assert store.container_keys("main") == {
+        ("main", "public", "users"),
+        ("main", "staging", "users"),
+    }
+
+
+# ---- relationships ----
+
+
+def test_a_foreign_key_comes_back_as_an_edge(store: StagingStore):
+    store.replace_columns(
+        "main",
+        None,
+        "orders",
+        [
+            _column("id", 1, "INTEGER", is_pk=True),
+            _column(
+                "user_id",
+                2,
+                "INTEGER",
+                is_fk=True,
+                references_container="users",
+                references_column="id",
+            ),
+        ],
+    )
+
+    (edge,) = store.relationships()
+
+    assert edge.from_container == "orders"
+    assert edge.from_column == "user_id"
+    assert edge.to_container == "users"
+    assert edge.to_column == "id"
+
+
+def test_a_column_pointing_nowhere_is_not_an_edge(store: StagingStore):
+    store.replace_columns("main", None, "orders", [_column("id"), _column("total", 2)])
+
+    assert store.relationships() == []
+
+
+def test_relationships_can_be_scoped_to_one_database(store: StagingStore):
+    for database in ("one", "two"):
+        store.replace_columns(
+            database,
+            None,
+            "orders",
+            [_column("user_id", 1, is_fk=True, references_container="users")],
+        )
+
+    assert len(store.relationships()) == 2
+    assert [e.database for e in store.relationships("one")] == ["one"]
+
+
+# ---- sensitivity ----
+
+
+def test_a_detected_level_is_recorded(store: StagingStore):
+    _inventoried(store)
+
+    written = store.record_sensitivity(
+        "main", None, "users", {"email": Sensitivity.PII}, source="detected"
+    )
+
+    assert written == 1
+    assert store.sensitivity_of("main", "users") == {"email": Sensitivity.PII}
+
+
+def test_detection_does_not_overrule_what_a_person_wrote(store: StagingStore):
+    """A pattern match does not get to overrule someone who looked at the
+    thing."""
+    _inventoried(store)
+    store.annotate(
+        "main",
+        "users",
+        columns=[ColumnAnnotation(column="email", sensitivity=Sensitivity.NONE)],
+    )
+
+    written = store.record_sensitivity(
+        "main", None, "users", {"email": Sensitivity.PII}, source="detected"
+    )
+
+    assert written == 0
+    assert store.sensitivity_of("main", "users") == {"email": Sensitivity.NONE}
+
+
+def test_a_later_scan_may_revise_its_own_earlier_verdict(store: StagingStore):
+    _inventoried(store)
+    store.record_sensitivity(
+        "main", None, "users", {"email": Sensitivity.NONE}, source="detected"
+    )
+
+    store.record_sensitivity(
+        "main", None, "users", {"email": Sensitivity.PII}, source="detected"
+    )
+
+    assert store.sensitivity_of("main", "users") == {"email": Sensitivity.PII}
+
+
+def test_only_the_verdict_is_stored(store: StagingStore):
+    """Nothing of the values that led to it: the staging file is not a second
+    copy of the data."""
+    _inventoried(store)
+    store.record_sensitivity(
+        "main", None, "users", {"email": Sensitivity.PII}, source="detected"
+    )
+
+    row = store._row("SELECT * FROM columns WHERE column_name='email'")
+    assert row is not None
+    assert "@" not in "".join(str(value) for value in tuple(row) if value)

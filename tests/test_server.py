@@ -371,8 +371,10 @@ def inventory(config, adapter, tmp_path: Path) -> Iterator[Any]:
 INVENTORY_TOOLS = [
     "inventory_annotate",
     "inventory_cancel",
+    "inventory_changes",
     "inventory_columns",
     "inventory_containers",
+    "inventory_relationships",
     "inventory_search",
     "inventory_start",
     "inventory_status",
@@ -389,7 +391,7 @@ def test_the_inventory_tools_appear_when_a_service_is_given(config, adapter, inv
 
     assert set(INVENTORY_TOOLS) <= set(exposed)
     # inventory_export is not among them: this config has no export directory
-    assert len(exposed) == 13
+    assert len(exposed) == 15
     assert "inventory_export" not in exposed
 
 

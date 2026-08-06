@@ -214,10 +214,15 @@ any single tool call, so it runs in the background:
 | `inventory_containers` | one page of inventoried containers |
 | `inventory_columns` | one page of a container's columns |
 | `inventory_search` | containers and columns matching a keyword |
+| `inventory_relationships` | every foreign key, as edges to draw an ER diagram from |
+| `inventory_changes` | what the upstream schema did between scans |
 | `inventory_annotate` | describe a table or its columns |
 
 A scan resumes from its cursor if it dies, and skips containers whose schema
-fingerprint has not changed.
+fingerprint has not changed. What it does notice — a table appearing or
+disappearing, a column added, removed or retyped — is kept append-only and read
+back with `inventory_changes`. A run that resumed from a cursor never reports
+anything removed: it did not look at what came before it.
 
 One more appears when `--export-dir` is set: `inventory_export`.
 
@@ -250,6 +255,65 @@ is an agent relaying a path someone gave it.
 
 The budgets are measured, not hoped for: `tests/test_context_budget.py` builds a
 500-table catalog and asserts what each tool costs.
+
+## Personal data
+
+`get_sample` puts real rows into an agent's context, and from there into every
+log, transcript and history that context touches. So **rows are masked by
+default**:
+
+```
+{"id": 1, "email": "a***@***.com", "note": "hello", "api_key": "***"}
+```
+
+The shape survives where it is useful — an agent reasoning about the table can
+still see that the column holds email addresses — and a secret keeps nothing,
+because there is no shape worth showing.
+
+Which columns count is decided by the scan, from the column name first and then
+from a small sample of values for the names that give nothing away. Only the
+verdict is stored, never the values it was reached from. It is a guess, and
+`inventory_annotate` overrides it:
+
+```json
+{"column": "internal_ref", "sensitivity": "pii"}
+```
+
+A verdict written that way is never overruled by a later scan — somebody looked
+at the thing, and a pattern match did not.
+
+`mask=False` returns the rows as they are. Over stdio that is allowed, because
+whoever spawned the process already holds the database credential. Over an
+authenticated transport the key has to have been granted it, and the audit trail
+records that it happened.
+
+## What a key may see
+
+Beyond the list of tools, a token can carry:
+
+```bash
+uv run mcp-connector token issue --key ./pm.pem --kid pm-explorer \
+    --scope list_containers --scope get_schema --scope get_sample \
+    --database analytics \
+    --allow-container 'dim_*' --allow-container 'fct_*' \
+    --deny-container '*_pii'
+```
+
+| flag | claim | absent means |
+|---|---|---|
+| `--database` | `databases` | every database |
+| `--allow-container` / `--deny-container` | `containers` | everything not denied |
+| `--allow-raw-sample` | `allow_raw_sample` | **no** — masked rows only |
+| `--annotate-as-human` | `annotate_as_human` | descriptions are recorded as an agent's |
+
+Deny beats allow. A container a key may not read is refused **by name** when
+asked for directly — an agent told a table is not there goes looking for it,
+one told it may not look asks for access — and left out of listings, searches
+and exports, so the catalog's shape does not leak to someone who cannot read it.
+
+These are claims *added* to the token, so one issued before any of them existed
+still means exactly what it meant: all tools it was scoped for, every database,
+every container, and no raw rows.
 
 ## Descriptions
 

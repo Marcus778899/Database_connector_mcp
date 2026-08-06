@@ -12,7 +12,7 @@ from __future__ import annotations
 import csv
 import io
 import json
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
@@ -78,8 +78,15 @@ def export_inventory(
     format: ExportFormat = "markdown",
     database: str | None = None,
     path: str | None = None,
+    permits: Callable[[str], bool] | None = None,
 ) -> ExportResult:
-    """Write the inventory out, and report only where it went."""
+    """
+    Write the inventory out, and report only where it went.
+
+    `permits` decides which containers belong in it — a key restricted to part
+    of the catalog gets a file covering that part, which is more use to it than
+    a refusal and is the same rule the listings apply.
+    """
     target = resolve_target(export_dir, path, format)
     target.parent.mkdir(parents=True, exist_ok=True)
 
@@ -87,7 +94,7 @@ def export_inventory(
     containers = columns = 0
     written = 0
     with target.open("w", encoding="utf-8", newline="") as handle:
-        for chunk, more_containers, more_columns in writer(store, database):
+        for chunk, more_containers, more_columns in writer(store, database, permits):
             handle.write(chunk)
             written += len(chunk.encode("utf-8"))
             containers += more_containers
@@ -106,13 +113,17 @@ def export_inventory(
 
 
 def _walk(
-    store: StagingStore, database: str | None
+    store: StagingStore,
+    database: str | None,
+    permits: Callable[[str], bool] | None = None,
 ) -> Iterator[tuple[StoredContainer, list[StoredColumn]]]:
-    """Every container with its columns, a page of each at a time."""
+    """Every container the caller may see, with its columns, a page at a time."""
     cursor: str | None = None
     while True:
         page = store.containers(database, limit=_PAGE, cursor=cursor)
         for container in page.containers:
+            if permits is not None and not permits(container.container_name):
+                continue
             yield container, _all_columns(store, container)
         if page.next_cursor is None:
             return
@@ -146,7 +157,9 @@ def _described(item: StoredContainer | StoredColumn) -> str:
 
 
 def _markdown(
-    store: StagingStore, database: str | None
+    store: StagingStore,
+    database: str | None,
+    permits: Callable[[str], bool] | None = None,
 ) -> Iterator[tuple[str, int, int]]:
     """A data dictionary for a person to read."""
     scope = database or "every database"
@@ -159,7 +172,7 @@ def _markdown(
         0,
     )
 
-    for container, columns in _walk(store, database):
+    for container, columns in _walk(store, database, permits):
         heading = f"\n## {container.container_name}\n\n"
         facts = [container.container_type]
         if container.estimated_count is not None:
@@ -198,7 +211,11 @@ def _cell(text: str) -> str:
     return text.replace("|", "\\|").replace("\n", " ").strip()
 
 
-def _csv(store: StagingStore, database: str | None) -> Iterator[tuple[str, int, int]]:
+def _csv(
+    store: StagingStore,
+    database: str | None,
+    permits: Callable[[str], bool] | None = None,
+) -> Iterator[tuple[str, int, int]]:
     """One row per column, for a spreadsheet or another tool to read."""
     header = [
         "database",
@@ -220,7 +237,7 @@ def _csv(store: StagingStore, database: str | None) -> Iterator[tuple[str, int, 
     writer.writerow(header)
     yield buffer.getvalue(), 0, 0
 
-    for container, columns in _walk(store, database):
+    for container, columns in _walk(store, database, permits):
         buffer = io.StringIO()
         writer = csv.writer(buffer, lineterminator="\n")
         for column in columns:
@@ -250,12 +267,14 @@ def _csv(store: StagingStore, database: str | None) -> Iterator[tuple[str, int, 
 
 
 def _dbt_yaml(
-    store: StagingStore, database: str | None
+    store: StagingStore,
+    database: str | None,
+    permits: Callable[[str], bool] | None = None,
 ) -> Iterator[tuple[str, int, int]]:
     """A `schema.yml` that can be dropped into a dbt project."""
     yield "version: 2\n\nmodels:\n", 0, 0
 
-    for container, columns in _walk(store, database):
+    for container, columns in _walk(store, database, permits):
         if not columns:
             continue  # a model with no columns is not one dbt can use
         body = f"  - name: {_yaml(container.container_name)}\n"

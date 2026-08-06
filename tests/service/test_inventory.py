@@ -12,6 +12,7 @@ from src.core.contracts import (
     ContainerType,
     ProfileMode,
     ProfileResult,
+    Sensitivity,
 )
 from src.service.inventory import (
     InventoryService,
@@ -40,6 +41,10 @@ class FakeAdapter:
         # what this engine would pick for a column when the caller names nothing
         self.chosen_modes: tuple[ProfileMode, ...] = (ProfileMode.NULL_RATIO,)
         self.distinct_count = 1
+        self.column_type = "TEXT"
+        self.rows: list[dict] = []
+        self.fail_sample = False
+        self.sample_calls: list[str] = []
 
     def list_databases(self) -> list[str]:
         return [self.database]
@@ -77,7 +82,7 @@ class FakeAdapter:
             ColumnInfo(
                 name=name,
                 ordinal=index,
-                native_type="TEXT",
+                native_type=self.column_type,
                 nullable=True,
                 is_pk=False,
                 is_fk=False,
@@ -86,7 +91,10 @@ class FakeAdapter:
         ]
 
     def get_sample(self, container: str, limit: int = 3) -> list[dict]:
-        return []
+        self.sample_calls.append(container)
+        if self.fail_sample:
+            raise PermissionError("no rows for you")
+        return self.rows[:limit]
 
     def profile_column(
         self, container: str, column: str, mode: ProfileMode
@@ -592,3 +600,146 @@ def test_close_stops_everything(adapter: FakeAdapter, store: StagingStore):
     service.close(timeout=10)
 
     assert service.status(job_id).state in {"done", "cancelled"}
+
+
+# ---- change history ----
+
+
+def test_a_first_scan_records_every_container_as_added(
+    adapter: FakeAdapter, store: StagingStore
+):
+    service = _service(adapter, store)
+    service.wait(service.start("main"), timeout=10)
+
+    changes = store.changes()
+    assert {c.container_name for c in changes} == {"orders", "users"}
+    assert {c.change_type for c in changes} == {"container_added"}
+
+
+def test_a_changed_container_records_what_changed(
+    adapter: FakeAdapter, store: StagingStore
+):
+    """`schema_hash` only ever kept the latest state; this is the question a
+    data engineer actually asks."""
+    service = _service(adapter, store)
+    service.wait(service.start("main"), timeout=10)
+    adapter.catalog["users"] = ["id", "created_at"]
+
+    service.wait(service.start("main", resume=False), timeout=10)
+
+    change = store.changes()[0]
+    assert change.change_type == "schema_changed"
+    assert change.container_name == "users"
+    assert change.detail == {"added": ["created_at"], "removed": ["email"]}
+    assert change.old_hash != change.new_hash
+
+
+def test_a_retyped_column_is_recorded_as_one(store: StagingStore):
+    adapter = FakeAdapter({"users": ["id"]})
+    service = _service(adapter, store)
+    service.wait(service.start("main"), timeout=10)
+
+    adapter.column_type = "INTEGER"
+    service.wait(service.start("main", resume=False), timeout=10)
+
+    change = store.changes()[0]
+    assert change.detail == {"retyped": ["id: TEXT → INTEGER"]}
+
+
+def test_an_unchanged_container_records_nothing(
+    adapter: FakeAdapter, store: StagingStore
+):
+    service = _service(adapter, store)
+    service.wait(service.start("main"), timeout=10)
+
+    service.wait(service.start("main", resume=False), timeout=10)
+
+    assert len(store.changes()) == 2  # the two additions, and nothing since
+
+
+def test_a_forced_rescan_of_something_unchanged_invents_no_history(
+    adapter: FakeAdapter, store: StagingStore
+):
+    """`force` is about re-reading the source, not about writing history."""
+    service = _service(adapter, store)
+    service.wait(service.start("main"), timeout=10)
+
+    service.wait(service.start("main", resume=False, force=True), timeout=10)
+
+    assert len(store.changes()) == 2
+
+
+def test_a_container_that_disappeared_is_recorded_and_dropped(
+    adapter: FakeAdapter, store: StagingStore
+):
+    service = _service(adapter, store)
+    service.wait(service.start("main"), timeout=10)
+
+    del adapter.catalog["orders"]
+    service.wait(service.start("main", resume=False), timeout=10)
+
+    removed = [c for c in store.changes() if c.change_type == "container_removed"]
+    assert [c.container_name for c in removed] == ["orders"]
+    assert [c.container_name for c in store.containers("main").containers] == ["users"]
+
+
+def test_a_resumed_scan_does_not_call_what_it_never_looked_at_removed(
+    adapter: FakeAdapter, store: StagingStore
+):
+    """The one kind of error an append-only history cannot take back: a run
+    that started from a cursor never saw what came before it."""
+    service = _service(adapter, store)
+    service.wait(service.start("main"), timeout=10)
+    store.create_scan("crashed", "main")
+    store.advance_scan("crashed", cursor="orders", done=1, failed=0, skipped=0)
+    store.finish_scan("crashed", "failed", error="connection lost")
+
+    service.wait(service.start("main"), timeout=10)
+
+    assert [c.change_type for c in store.changes()] == ["container_added"] * 2
+    assert len(store.containers("main").containers) == 2
+
+
+# ---- sensitivity ----
+
+
+def test_a_scan_marks_the_columns_whose_names_give_them_away(store: StagingStore):
+    adapter = FakeAdapter({"users": ["id", "email", "note"]})
+    service = _service(adapter, store)
+
+    service.wait(service.start("main"), timeout=10)
+
+    assert store.sensitivity_of("main", "users") == {"email": Sensitivity.PII}
+
+
+def test_a_scan_judges_by_the_values_when_the_name_says_nothing(store: StagingStore):
+    adapter = FakeAdapter({"users": ["id", "contact"]})
+    adapter.rows = [{"id": n, "contact": f"user{n}@x.com"} for n in range(5)]
+    service = _service(adapter, store)
+
+    service.wait(service.start("main"), timeout=10)
+
+    assert store.sensitivity_of("main", "users") == {"contact": Sensitivity.PII}
+
+
+def test_a_source_that_will_not_be_sampled_does_not_fail_the_scan(
+    store: StagingStore,
+):
+    adapter = FakeAdapter({"users": ["id", "contact"]})
+    adapter.fail_sample = True
+    service = _service(adapter, store)
+
+    status = service.wait(service.start("main"), timeout=10)
+
+    assert status.state == "done"
+    assert store.sensitivity_of("main", "users") == {}
+
+
+def test_nothing_is_sampled_when_the_names_already_settle_it(store: StagingStore):
+    """The read costs something and buys nothing once every column is decided."""
+    adapter = FakeAdapter({"users": ["email", "phone"]})
+    service = _service(adapter, store)
+
+    service.wait(service.start("main"), timeout=10)
+
+    assert adapter.sample_calls == []
