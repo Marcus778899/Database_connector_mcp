@@ -33,14 +33,16 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      - name: Run Bandit
-        uses: mdegis/bandit-action@v1.0
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          path: src
-          level: high
-          confidence: high
-          exit_zero: true
+          python-version: "3.12"
+      # bandit version pinned to .pre-commit-config.yaml so local and CI agree.
+      # -lll/-iii = high severity, high confidence.
+      - name: Run Bandit
+        run: |
+          pip install bandit==1.7.8
+          bandit -r src -lll -iii --exit-zero
 
   py-unit-test:
     name: Unit Test
