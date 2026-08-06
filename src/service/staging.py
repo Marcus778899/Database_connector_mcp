@@ -11,14 +11,25 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from src.core.contracts import ColumnInfo, ContainerInfo, ProfileMode, ProfileResult
+from src.core.contracts import (
+    ColumnInfo,
+    ContainerInfo,
+    ProfileMode,
+    ProfileResult,
+    Sensitivity,
+)
 from src.core.log import log
 
 # NULL in a primary key lets duplicates in (SQLite treats NULLs as distinct).
 NO_SCHEMA = ""
 
 MARKER = "database-mcp-connector/staging"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+# Who wrote a description. The server decides this, never the caller.
+SOURCE_NATIVE = "native"
+SOURCE_AI = "ai"
+SOURCE_HUMAN = "human"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS staging_meta (
@@ -40,6 +51,9 @@ CREATE TABLE IF NOT EXISTS scans (
     finished_at      TEXT
 );
 
+-- Two kinds of description, deliberately in separate columns:
+-- `native_description` is read from the source and overwritten by every scan,
+-- `description` is written by an agent or a person and a scan never touches it.
 CREATE TABLE IF NOT EXISTS containers (
     database        TEXT NOT NULL,
     schema_name     TEXT NOT NULL,
@@ -47,6 +61,11 @@ CREATE TABLE IF NOT EXISTS containers (
     container_type  TEXT NOT NULL,
     estimated_count INTEGER,
     schema_hash     TEXT NOT NULL,
+    native_description     TEXT,
+    description            TEXT,
+    description_source     TEXT,   -- native | ai | human
+    description_updated_at TEXT,
+    last_modified_at       TEXT,
     error           TEXT,
     scanned_at      TEXT NOT NULL,
     PRIMARY KEY (database, schema_name, container_name)
@@ -62,6 +81,14 @@ CREATE TABLE IF NOT EXISTS columns (
     nullable       INTEGER NOT NULL,
     is_pk          INTEGER NOT NULL,
     is_fk          INTEGER NOT NULL,
+    native_description     TEXT,
+    description            TEXT,
+    description_source     TEXT,
+    description_updated_at TEXT,
+    references_container   TEXT,
+    references_column      TEXT,
+    sensitivity            TEXT,   -- none | pii | secret
+    sensitivity_source     TEXT,
     profile        TEXT,
     scanned_at     TEXT NOT NULL,
     PRIMARY KEY (database, schema_name, container_name, column_name)
@@ -69,11 +96,19 @@ CREATE TABLE IF NOT EXISTS columns (
 
 CREATE INDEX IF NOT EXISTS columns_by_container
     ON columns (database, schema_name, container_name);
+
+-- For searching by column name across the whole catalog.
+CREATE INDEX IF NOT EXISTS columns_by_name ON columns (column_name);
 """
 
 
 def _now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
+
+
+def _blank_to_none(text: str) -> str | None:
+    """A description of whitespace is a description no one wants back."""
+    return text.strip() or None
 
 
 def _reject_source_overlap(staging: Path, source: str | Path | None) -> None:
@@ -90,18 +125,41 @@ def _reject_source_overlap(staging: Path, source: str | Path | None) -> None:
         )
 
 
-def schema_hash(columns: Sequence[ColumnInfo]) -> str:
-    """Fingerprint of a container's shape, for deciding what a rescan can skip."""
-    payload = [
-        [c.name, c.ordinal, c.native_type, c.nullable, c.is_pk, c.is_fk]
-        for c in columns
-    ]
+def schema_hash(
+    columns: Sequence[ColumnInfo], *, native_description: str | None = None
+) -> str:
+    """
+    Fingerprint of a container's shape, for deciding what a rescan can skip.
+
+    Everything a scan overwrites goes in, the source's own comments included:
+    a comment edited upstream is exactly the sort of change the inventory is for,
+    and a hash blind to it would skip the container. What an agent or a person
+    writes stays out — a scan never overwrites that, and a hash sensitive to it
+    would make annotating a container trigger its own rescan.
+    """
+    payload = {
+        "container": native_description,
+        "columns": [
+            [
+                c.name,
+                c.ordinal,
+                c.native_type,
+                c.nullable,
+                c.is_pk,
+                c.is_fk,
+                c.native_description,
+                c.references_container,
+                c.references_column,
+            ]
+            for c in columns
+        ],
+    }
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 class StoredContainer(BaseModel):
-    """A container as the last scan recorded it."""
+    """A container as the last scan recorded it, plus anything written about it."""
 
     database: str
     schema_name: str
@@ -109,6 +167,11 @@ class StoredContainer(BaseModel):
     container_type: str
     estimated_count: int | None = None
     schema_hash: str
+    native_description: str | None = None
+    description: str | None = None
+    description_source: str | None = None
+    description_updated_at: str | None = None
+    last_modified_at: str | None = None
     error: str | None = None
     scanned_at: str
 
@@ -125,8 +188,33 @@ class StoredColumn(BaseModel):
     nullable: bool
     is_pk: bool
     is_fk: bool
+    native_description: str | None = None
+    description: str | None = None
+    description_source: str | None = None
+    description_updated_at: str | None = None
+    references_container: str | None = None
+    references_column: str | None = None
+    sensitivity: Sensitivity | None = None
+    sensitivity_source: str | None = None
     profile: dict[str, Any] | None = None
     scanned_at: str
+
+
+class ColumnAnnotation(BaseModel):
+    """One column's written description. A field left None is left alone."""
+
+    column: str
+    description: str | None = None
+    sensitivity: Sensitivity | None = None
+
+
+class AnnotateResult(BaseModel):
+    """`unknown_columns` is reported rather than ignored: a name that is not
+    there usually means the agent is annotating the wrong container."""
+
+    containers_updated: int = 0
+    columns_updated: int = 0
+    unknown_columns: list[str] = []
 
 
 class StoredContainerPage(BaseModel):
@@ -153,6 +241,14 @@ class NotAStagingStoreError(StagingError):
 
 class StagingPathConflictError(StagingError):
     """The staging path is the source database being inventoried."""
+
+
+class OutdatedStagingSchemaError(StagingError):
+    """The file was written by an older layout of this store."""
+
+
+class UnknownStagedContainerError(Exception):
+    """Nothing has been inventoried under that name."""
 
 
 class StagingStore:
@@ -218,6 +314,16 @@ class StagingStore:
             raise NotAStagingStoreError(
                 f"{self.path} was written by a newer version ({row['version']} > "
                 f"{SCHEMA_VERSION})"
+            )
+        if row["version"] < SCHEMA_VERSION:
+            # No migration chain on purpose: an inventory is derived data that a
+            # rescan reproduces, so the honest instruction is cheaper to maintain
+            # — and to trust — than a chain of ALTERs.
+            raise OutdatedStagingSchemaError(
+                f"{self.path} uses staging schema v{row['version']}, this build "
+                f"writes v{SCHEMA_VERSION}. An inventory is rebuilt by rescanning: "
+                f"delete {self.path} and run inventory_start again. Anything "
+                "written with inventory_annotate is in that file and will be lost."
             )
 
     def close(self) -> None:
@@ -302,15 +408,20 @@ class StagingStore:
     def upsert_container(
         self, info: ContainerInfo, *, hash_: str, error: str | None = None
     ) -> None:
+        """What the scan saw. `description` and its provenance are absent from
+        the update list on purpose — they belong to `annotate`."""
         self._write(
             """
             INSERT INTO containers (database, schema_name, container_name,
-                container_type, estimated_count, schema_hash, error, scanned_at)
-            VALUES (?,?,?,?,?,?,?,?)
+                container_type, estimated_count, schema_hash, native_description,
+                last_modified_at, error, scanned_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT (database, schema_name, container_name) DO UPDATE SET
                 container_type=excluded.container_type,
                 estimated_count=excluded.estimated_count,
                 schema_hash=excluded.schema_hash,
+                native_description=excluded.native_description,
+                last_modified_at=excluded.last_modified_at,
                 error=excluded.error,
                 scanned_at=excluded.scanned_at
             """,
@@ -321,6 +432,8 @@ class StagingStore:
                 str(info.container_type),
                 info.estimated_count,
                 hash_,
+                info.native_description,
+                info.last_modified_at,
                 error,
                 _now(),
             ),
@@ -333,22 +446,38 @@ class StagingStore:
         container: str,
         columns: Iterable[ColumnInfo],
     ) -> None:
-        """Rewrite a container's columns: old rows go first so a dropped column
-        disappears, in one transaction."""
+        """
+        Bring a container's columns up to date with what the scan saw, in one
+        transaction: upsert what is there, then delete what is not.
+
+        Upsert rather than delete-then-insert because a column row holds two
+        things a scan did not produce and must not destroy — the written
+        description and the profile. Rewriting the table wholesale would erase
+        every description on the next rescan, which is the whole point of
+        keeping them here.
+        """
         schema_key = schema or NO_SCHEMA
         scanned_at = _now()
+        current = list(columns)
         with self._lock:
-            self._conn.execute(
-                "DELETE FROM columns WHERE database=? AND schema_name=? "
-                "AND container_name=?",
-                (database, schema_key, container),
-            )
             self._conn.executemany(
                 """
                 INSERT INTO columns (database, schema_name, container_name,
                     column_name, ordinal, native_type, nullable, is_pk, is_fk,
+                    native_description, references_container, references_column,
                     scanned_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT (database, schema_name, container_name, column_name)
+                DO UPDATE SET
+                    ordinal=excluded.ordinal,
+                    native_type=excluded.native_type,
+                    nullable=excluded.nullable,
+                    is_pk=excluded.is_pk,
+                    is_fk=excluded.is_fk,
+                    native_description=excluded.native_description,
+                    references_container=excluded.references_container,
+                    references_column=excluded.references_column,
+                    scanned_at=excluded.scanned_at
                 """,
                 [
                     (
@@ -361,10 +490,24 @@ class StagingStore:
                         int(column.nullable),
                         int(column.is_pk),
                         int(column.is_fk),
+                        column.native_description,
+                        column.references_container,
+                        column.references_column,
                         scanned_at,
                     )
-                    for column in columns
+                    for column in current
                 ],
+            )
+            # A column that really did disappear still has to go. With nothing
+            # left to keep, the unrestricted DELETE is the right statement: the
+            # container has no columns any more.
+            names = [column.name for column in current]
+            placeholders = ",".join("?" * len(names))
+            self._conn.execute(
+                "DELETE FROM columns WHERE database=? AND schema_name=? "
+                "AND container_name=?"
+                + (f" AND column_name NOT IN ({placeholders})" if names else ""),
+                (database, schema_key, container, *names),
             )
             self._conn.commit()
 
@@ -401,6 +544,102 @@ class StagingStore:
                 ),
             )
             self._conn.commit()
+
+    # ---- annotations ----
+
+    def annotate(
+        self,
+        database: str,
+        container: str,
+        schema: str | None = None,
+        *,
+        container_description: str | None = None,
+        columns: Sequence[ColumnAnnotation] = (),
+        source: str = SOURCE_AI,
+    ) -> AnnotateResult:
+        """
+        Write descriptions onto what was inventoried. Never onto the source: this
+        store is the only thing a description ever reaches.
+
+        A field left None is left as it was; a blank string clears it. `source`
+        is decided by the caller's identity, not by the annotation.
+
+        One transaction on purpose: an agent describing a table and its columns
+        is making one statement about it, so a crash must not leave the table
+        described and its columns not.
+        """
+        schema_key = schema or NO_SCHEMA
+        key = (database, schema_key, container)
+        written_at = _now()
+        result = AnnotateResult()
+
+        with self._lock:
+            if (
+                self._conn.execute(
+                    "SELECT 1 FROM containers WHERE database=? AND schema_name=? "
+                    "AND container_name=?",
+                    key,
+                ).fetchone()
+                is None
+            ):
+                raise UnknownStagedContainerError(
+                    f"{container!r} is not in the inventory of {database!r}; "
+                    "run inventory_start first"
+                )
+
+            if container_description is not None:
+                self._conn.execute(
+                    "UPDATE containers SET description=?, description_source=?, "
+                    "description_updated_at=? WHERE database=? AND schema_name=? "
+                    "AND container_name=?",
+                    (_blank_to_none(container_description), source, written_at, *key),
+                )
+                result.containers_updated = 1
+
+            known = {
+                row["column_name"]
+                for row in self._conn.execute(
+                    "SELECT column_name FROM columns WHERE database=? AND "
+                    "schema_name=? AND container_name=?",
+                    key,
+                )
+            }
+            for annotation in columns:
+                if annotation.column not in known:
+                    result.unknown_columns.append(annotation.column)
+                    continue
+                assignments, params = [], []
+                if annotation.description is not None:
+                    assignments += [
+                        "description=?",
+                        "description_source=?",
+                        "description_updated_at=?",
+                    ]
+                    params += [
+                        _blank_to_none(annotation.description),
+                        source,
+                        written_at,
+                    ]
+                if annotation.sensitivity is not None:
+                    assignments += ["sensitivity=?", "sensitivity_source=?"]
+                    params += [str(annotation.sensitivity), source]
+                if not assignments:
+                    continue
+                self._conn.execute(
+                    f"UPDATE columns SET {', '.join(assignments)} "  # noqa: S608
+                    "WHERE database=? AND schema_name=? AND container_name=? "
+                    "AND column_name=?",
+                    (*params, *key, annotation.column),
+                )
+                result.columns_updated += 1
+
+            self._conn.commit()
+
+        log.info(
+            f"annotated {database}.{container} by {source}: "
+            f"{result.columns_updated} columns"
+        )
+        return result
 
     # ---- reading ----
 

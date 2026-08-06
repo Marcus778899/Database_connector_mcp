@@ -68,7 +68,8 @@ class ServerConfig(BaseModel):
     staging_db_path: Path | None = None
     # An export may only be written under here. Unset means no export tool.
     export_dir: Path | None = None
-    # Which statistics a scan gathers when the caller names none.
+    # Which statistics a scan gathers when the caller names none. Unset leaves
+    # the choice to the engine, per column; empty means gather none.
     profile_modes: list[ProfileMode] | None = None
 
     transport: Transport = "stdio"

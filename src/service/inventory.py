@@ -3,11 +3,17 @@ from __future__ import annotations
 import threading
 import uuid
 from collections.abc import Sequence
-from typing import Any, ClassVar
+from typing import ClassVar
 
 from pydantic import BaseModel
 
-from src.core.contracts import ProfileMode
+from src.core.contracts import (
+    ColumnInfo,
+    ContainerInfo,
+    ProfileMode,
+    ProfileResult,
+    SourceAdaptor,
+)
 from src.core.log import log
 from src.service.pool import AdapterProvider
 from src.service.staging import StagingStore, schema_hash
@@ -42,6 +48,11 @@ class InventoryService:
 
     DEFAULT_PAGE_SIZE: ClassVar[int] = 100
 
+    # Above this many distinct values, the twenty commonest are noise rather
+    # than a description of the column, so the round trip is skipped. Only when
+    # the modes were chosen per column; a caller who names `top_values` gets it.
+    TOP_VALUES_MAX_DISTINCT: ClassVar[int] = 200
+
     def __init__(
         self,
         provider: AdapterProvider,
@@ -53,7 +64,11 @@ class InventoryService:
         self._provider = provider
         self._store = store
         self._page_size = page_size or self.DEFAULT_PAGE_SIZE
-        self._default_profile_modes = tuple(default_profile_modes or ())
+        # None and () differ: nothing configured means the adapter picks per
+        # column, an empty sequence means gather nothing.
+        self._default_profile_modes = (
+            None if default_profile_modes is None else tuple(default_profile_modes)
+        )
         self._lock = threading.Lock()
         self._workers: dict[str, threading.Thread] = {}
         self._cancels: dict[str, threading.Event] = {}
@@ -80,8 +95,9 @@ class InventoryService:
         `resume` continues an unfinished run from its cursor; `force` rescans
         containers whose schema has not changed.
 
-        `profile_modes` falls back to the server's default; an empty sequence is
-        respected as "gather no statistics".
+        `profile_modes` falls back to the server's default, and if that is unset
+        too each column gets the statistics its type warrants. An empty sequence
+        is respected as "gather no statistics".
         """
         modes = (
             self._default_profile_modes
@@ -157,7 +173,7 @@ class InventoryService:
         job_id: str,
         database: str | None,
         cursor: str | None,
-        profile_modes: tuple[ProfileMode, ...],
+        profile_modes: tuple[ProfileMode, ...] | None,
         force: bool,
     ) -> None:
         cancel = self._cancels[job_id]
@@ -214,10 +230,10 @@ class InventoryService:
 
     def _scan_container(
         self,
-        adapter: Any,
-        info: Any,
+        adapter: SourceAdaptor,
+        info: ContainerInfo,
         *,
-        profile_modes: tuple[ProfileMode, ...],
+        profile_modes: tuple[ProfileMode, ...] | None,
         force: bool,
     ) -> str:
         """
@@ -234,7 +250,7 @@ class InventoryService:
             )
             return "failed"
 
-        current = schema_hash(columns)
+        current = schema_hash(columns, native_description=info.native_description)
         if not force:
             stored = self._store.stored_schema_hash(
                 info.database, info.schema_name, info.container_name
@@ -248,20 +264,54 @@ class InventoryService:
         )
 
         for column in columns:
-            for mode in profile_modes:
-                self._profile_one(adapter, info, column.name, mode)
+            self._profile_column(adapter, info, column, profile_modes)
         return "done"
 
-    def _profile_one(
-        self, adapter: Any, info: Any, column: str, mode: ProfileMode
+    def _profile_column(
+        self,
+        adapter: SourceAdaptor,
+        info: ContainerInfo,
+        column: ColumnInfo,
+        profile_modes: tuple[ProfileMode, ...] | None,
     ) -> None:
+        """Gather the statistics for one column, in order.
+
+        Chosen per column when the caller named none, and `top_values` is then
+        dropped once `distinct_count` says the column has too many to be worth
+        listing — which is why the modes run in sequence rather than as a set."""
+        chosen = (
+            adapter.default_profile_modes(column)
+            if profile_modes is None
+            else profile_modes
+        )
+        distinct: int | None = None
+        for mode in chosen:
+            if (
+                profile_modes is None
+                and mode == ProfileMode.TOP_VALUES
+                and distinct is not None
+                and distinct > self.TOP_VALUES_MAX_DISTINCT
+            ):
+                continue
+            result = self._profile_one(adapter, info, column.name, mode)
+            if result is not None and mode == ProfileMode.DISTINCT_COUNT:
+                distinct = result.distinct_count
+
+    def _profile_one(
+        self,
+        adapter: SourceAdaptor,
+        info: ContainerInfo,
+        column: str,
+        mode: ProfileMode,
+    ) -> ProfileResult | None:
         try:
             result = adapter.profile_column(info.container_name, column, mode)
         except Exception as exc:  # noqa: BLE001 - one bad column is not fatal
             log.warning(
                 f"cannot profile {info.container_name}.{column} ({mode}): {exc}"
             )
-            return
+            return None
         self._store.record_profile(
             info.database, info.schema_name, info.container_name, column, mode, result
         )
+        return result
