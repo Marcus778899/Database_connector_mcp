@@ -1,6 +1,7 @@
 import asyncio
 from collections.abc import Iterator
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pyarrow as pa
@@ -261,11 +262,62 @@ def test_the_reaper_runs_while_the_server_is_up(config, lake: Path):
     assert after is False, "shutdown must stop the reaper and close the pool"
 
 
-def test_require_auth_refuses_to_build_until_auth_exists(tmp_path: Path, adapter):
+# ---- authentication ----
+
+
+def test_a_server_that_requires_auth_is_built_with_a_verifier(tmp_path: Path, adapter):
+    from src.auth.verifier import SignedTokenVerifier
+
+    keys = tmp_path / "keys"
+    keys.mkdir()
+    config = ServerConfig(
+        transport="http", host="0.0.0.0", require_auth=True, authorized_keys_dir=keys
+    )
+
+    mcp = build_server(config, adapter)
+
+    assert isinstance(mcp.auth, SignedTokenVerifier)
+
+
+def test_a_server_that_does_not_require_auth_has_none(config, adapter):
+    """stdio: whoever spawned us already has the credential we would protect."""
+    assert build_server(config, adapter).auth is None
+
+
+def test_require_auth_without_a_key_directory_is_refused(tmp_path: Path, adapter):
+    """Better than starting and turning every caller away — the mistake is in
+    the configuration and the message says which flag fixes it."""
+    from src.auth import AuthConfigurationError
+
     config = ServerConfig(transport="http", host="0.0.0.0", require_auth=True)
 
-    with pytest.raises(NotImplementedError, match="docs/authentication.md"):
+    with pytest.raises(AuthConfigurationError, match="--authorized-keys-dir"):
         build_server(config, adapter)
+
+
+def test_an_unauthenticated_call_is_refused_when_auth_is_required(monkeypatch):
+    """Defence in depth: the transport should have turned this away already, so
+    if one ever arrives here it is the bug that matters."""
+    from src import server as server_module
+
+    monkeypatch.setattr(server_module, "get_access_token", lambda: None)
+
+    assert server_module._identity("get_schema", require_auth=False) == LOCAL_KEY_ID
+    with pytest.raises(ToolError, match="requires an authenticated caller"):
+        server_module._identity("get_schema", require_auth=True)
+
+
+def test_a_tool_outside_the_scopes_is_refused(monkeypatch):
+    from src import server as server_module
+
+    token = SimpleNamespace(
+        scopes=["get_schema"], subject="pm-alice", client_id="pm-alice"
+    )
+    monkeypatch.setattr(server_module, "get_access_token", lambda: token)
+
+    assert server_module._identity("get_schema", require_auth=True) == "pm-alice"
+    with pytest.raises(ToolError, match="may not call get_sample"):
+        server_module._identity("get_sample", require_auth=True)
 
 
 # ---- federation loop ----
@@ -560,6 +612,28 @@ def test_no_token_means_the_description_is_not_a_persons(config, adapter, invent
     from src.server import _annotation_source
 
     assert _annotation_source() == "ai"
+
+
+def test_only_a_key_granted_the_scope_writes_as_a_person(monkeypatch):
+    """The half of `annotate:human` that had nothing to read it until tokens
+    existed: the scope is granted when the key is issued, and claiming it in
+    the call is not an option the caller has."""
+    from src import server as server_module
+
+    def carrying(*scopes: str):
+        monkeypatch.setattr(
+            server_module,
+            "get_access_token",
+            lambda: SimpleNamespace(
+                scopes=list(scopes), subject="pm-alice", client_id="pm-alice"
+            ),
+        )
+
+    carrying("inventory_annotate")
+    assert server_module._annotation_source() == "ai"
+
+    carrying("inventory_annotate", server_module.HUMAN_ANNOTATION_SCOPE)
+    assert server_module._annotation_source() == "human"
 
 
 def test_shutdown_stops_the_inventory_workers(config, adapter, inventory):

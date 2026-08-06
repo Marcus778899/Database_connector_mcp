@@ -55,6 +55,15 @@ def test_the_default_config_is_stdio_without_auth():
     assert config.require_auth is False
 
 
+def test_the_audit_trail_is_kept_in_generations_by_default():
+    """It becomes the record of who read what, so unbounded growth is not an
+    option and neither is silently discarding it."""
+    config = ServerConfig()
+
+    assert config.audit_max_mb == 10
+    assert config.audit_backups == 5
+
+
 def test_the_staging_and_export_paths_are_off_by_default():
     """Both gate a set of tools, so their absence must be the quiet case."""
     config = ServerConfig()

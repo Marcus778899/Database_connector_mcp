@@ -82,6 +82,10 @@ class ServerConfig(BaseModel):
     authorized_keys_dir: Path | None = None
     audience: str = DEFAULT_AUDIENCE
     audit_log_path: Path | None = None
+    # The trail is the record of who read what, so it is kept by size and in
+    # generations rather than allowed to grow without limit. Zero disables.
+    audit_max_mb: int = 10
+    audit_backups: int = 5
     # Escape hatch for serving a network transport without auth on purpose.
     allow_insecure_http: bool = False
 

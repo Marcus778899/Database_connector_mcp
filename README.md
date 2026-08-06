@@ -15,9 +15,9 @@ Where this is going, and why: [docs/inventory-roadmap.md](docs/inventory-roadmap
 ## Status
 
 sqlite and datalake (parquet/csv/json) work today. postgres, mysql, mssql and
-mongodb are registered but not written yet — asking for one says so. There is no
-authentication provider yet, so a network transport must stay on loopback (see
-[docs/authentication.md](docs/authentication.md)).
+mongodb are registered but not written yet — asking for one says so. A network
+transport can now be authenticated with a signed token (see
+[Authentication](#authentication)); without one it must stay on loopback.
 
 ## Install
 
@@ -65,6 +65,8 @@ Every other setting has a flag and an `MCP_*` variable, and the flag wins:
 | `--staging-db` | `MCP_STAGING_DB` | unset — **no inventory tools** |
 | `--export-dir` | `MCP_EXPORT_DIR` | unset |
 | `--audit-log` | `MCP_AUDIT_LOG` | unset — log only |
+| `--audit-max-mb` | `MCP_AUDIT_MAX_MB` | `10` — `0` never rotates |
+| `--audit-backups` | `MCP_AUDIT_BACKUPS` | `5` |
 | `--profile-mode` | `MCP_PROFILE_MODES` | unset — chosen per column |
 | `--no-profile` | `MCP_PROFILE=false` | off — statistics are gathered |
 | `--server-name` | `MCP_SERVER_NAME` | `etl-agent-mcp` |
@@ -104,6 +106,89 @@ type that means nothing to us. `--no-profile` turns it off entirely.
 Over stdio the client spawns the process and already holds its environment, so
 there is nothing for authentication to add — `--require-auth` is refused there on
 purpose.
+
+## Authentication
+
+Only for the http transports. The threat is "whoever learns the URL can read the
+database"; over stdio there is nothing to defend, because spawning the process
+already hands over the credential.
+
+`mcp.json` can carry a static header but cannot compute a signature, so the
+signing happens outside the serving process. Same command, one word apart:
+
+```bash
+uv run mcp-connector token keygen --kid pm-explorer --keys-dir ./keys --out ./pm-explorer.pem
+```
+
+That writes `./keys/pm-explorer.pub`, which the server reads, and the signing key,
+which the server never reads. Then per token:
+
+```bash
+uv run mcp-connector token issue --key ./pm-explorer.pem --kid pm-explorer --scope list_containers --scope get_schema --lifetime 30d
+```
+
+The result goes in the agent's `Authorization: Bearer …` header. Serve with:
+
+```bash
+uv run mcp-connector --engine sqlite --connection-ref shop --transport http --host 0.0.0.0 --require-auth --authorized-keys-dir ./keys
+```
+
+| claim | what it does |
+|---|---|
+| `kid` (header) | names the public key in `--authorized-keys-dir` that verifies it |
+| `sub` | who the caller is, and what the audit trail records |
+| `aud` | must equal `--audience`, so a token signed for elsewhere is refused here |
+| `exp` | required; expiry is the main way a token stops working |
+| `scopes` | the tools it may call, by name. No scopes, no tools. |
+
+**Revoking** is `rm ./keys/<kid>.pub` — no restart, effective within 30 seconds.
+Keys are re-read that often rather than cached for the life of the process, which
+is the whole reason revocation works without one.
+
+`exp` is checked with 60 seconds of leeway, so a token is accepted for up to a
+minute past its expiry — a token that has just run out was almost certainly
+issued against a clock a shade different from this one. It matters only if you
+issue very short lifetimes: a `--lifetime 5m` token is good for six.
+
+Signatures are asymmetric only (EdDSA, ES256, RS256). An HMAC algorithm is never
+accepted: the keys here are public, so a token signed with one of them as a
+shared secret would be a forgery anyone could produce.
+
+Authentication is not authorisation. A valid token still gets a tool error for a
+tool outside its scopes, and the refusal is recorded in the audit trail like any
+other call.
+
+### In a container
+
+`token keygen --if-missing` succeeds quietly when the signing key is already
+there, which is what an entrypoint that runs on every start needs — generating a
+fresh pair would invalidate every token already handed out. It also puts the
+public half back if only that is gone, since the two can sit on different
+volumes.
+
+```bash
+#!/bin/sh
+set -e
+mcp-connector token keygen --kid pm-explorer \
+    --keys-dir /keys --out /secrets/pm-explorer.pem --if-missing
+mcp-connector token issue --key /secrets/pm-explorer.pem --kid pm-explorer \
+    --scope list_containers --scope get_schema --scope get_sample \
+    --lifetime 30d --out /tokens/pm-explorer.jwt
+exec mcp-connector --engine sqlite --connection-ref shop \
+    --transport http --host 0.0.0.0 --require-auth --authorized-keys-dir /keys
+```
+
+Hand `/tokens/pm-explorer.jwt` to the agent that needs it — that is the thing
+that goes in `mcp.json`, not the public key, which never leaves the server.
+
+One thing to be deliberate about: this puts the signing key on the server's
+host, which is the arrangement the split was meant to avoid — whoever takes the
+container can then mint tokens for any subject, and the audit trail's account of
+who did what stops being evidence. It is a defensible trade for a single-tenant
+deployment, where that container already holds the database credential. Keep
+`/secrets` a mounted volume rather than a baked-in layer, and if the audit trail
+ever has to stand up to scrutiny, move `keygen` out to wherever you run it by
+hand and let the container do nothing but `issue` — or nothing at all.
 
 ## Tools
 
