@@ -15,6 +15,7 @@ _ADAPTER_REGISTRY: dict[SourceEngine, tuple[str, str]] = {
     SourceEngine.MSSQL: ("src.adapter.mssql", "MssqlAdapter"),
     SourceEngine.MONGODB: ("src.adapter.mongodb", "MongoAdapter"),
     SourceEngine.DATALAKE: ("src.adapter.datalake", "DatalakeAdapter"),
+    SourceEngine.MCP: ("src.adapter.remote_mcp", "RemoteMcpAdapter"),
 }
 
 # Engine -> the `uv sync --extra <name>` that installs its driver.
@@ -25,6 +26,7 @@ _ENGINE_EXTRA: dict[SourceEngine, str] = {
     SourceEngine.MSSQL: "mssql",
     SourceEngine.MONGODB: "mongo",
     SourceEngine.DATALAKE: "datalake",
+    SourceEngine.MCP: "mcp",
 }
 
 

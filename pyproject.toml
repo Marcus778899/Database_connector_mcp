@@ -23,6 +23,7 @@ mysql = ["pymysql>=1.1"]
 mssql = ["pyodbc>=5.1"]
 mongo = ["pymongo>=4.6"]
 datalake = ["pyarrow>=17"]
+mcp = ["fastmcp>=3.0"]
 
 [dependency-groups]
 dev = [
@@ -46,6 +47,8 @@ only-include = ["src", "main.py"]
 venvPath = "."
 venv = ".venv"
 include = ["src", "tests", "main.py"]
+# Pylance surfaces these in the editor; make the CLI agree so CI catches them too.
+reportDeprecated = "error"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

@@ -9,6 +9,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from pydantic import BaseModel
+
 from src.core.contracts import ColumnInfo, ContainerInfo, ProfileMode, ProfileResult
 from src.core.log import log
 
@@ -96,6 +98,49 @@ def schema_hash(columns: Sequence[ColumnInfo]) -> str:
     ]
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+class StoredContainer(BaseModel):
+    """A container as the last scan recorded it."""
+
+    database: str
+    schema_name: str
+    container_name: str
+    container_type: str
+    estimated_count: int | None = None
+    schema_hash: str
+    error: str | None = None
+    scanned_at: str
+
+
+class StoredColumn(BaseModel):
+    """A column as the last scan recorded it, with any profile gathered."""
+
+    database: str
+    schema_name: str
+    container_name: str
+    column_name: str
+    ordinal: int
+    native_type: str
+    nullable: bool
+    is_pk: bool
+    is_fk: bool
+    profile: dict[str, Any] | None = None
+    scanned_at: str
+
+
+class StoredContainerPage(BaseModel):
+    containers: list[StoredContainer]
+    next_cursor: str | None = None
+
+
+class InventorySummary(BaseModel):
+    database: str | None = None
+    containers: int = 0
+    containers_failed: int = 0
+    estimated_rows: int | None = None
+    columns: int = 0
+    columns_profiled: int = 0
 
 
 class StagingError(Exception):
@@ -359,7 +404,7 @@ class StagingStore:
 
     # ---- reading ----
 
-    def summary(self, database: str | None = None) -> dict[str, Any]:
+    def summary(self, database: str | None = None) -> InventorySummary:
         """Counts rather than rows, so looking at a 10k-table catalog costs a few
         hundred tokens."""
         where, params = ("WHERE database=?", (database,)) if database else ("", ())
@@ -374,14 +419,14 @@ class StagingStore:
             params,
         )
         assert containers is not None and columns is not None  # noqa: S101
-        return {
-            "database": database,
-            "containers": containers["n"],
-            "containers_failed": containers["failed"] or 0,
-            "estimated_rows": containers["rows_total"],
-            "columns": columns["n"],
-            "columns_profiled": columns["profiled"] or 0,
-        }
+        return InventorySummary(
+            database=database,
+            containers=containers["n"],
+            containers_failed=containers["failed"] or 0,
+            estimated_rows=containers["rows_total"],
+            columns=columns["n"],
+            columns_profiled=columns["profiled"] or 0,
+        )
 
     def containers(
         self,
@@ -389,7 +434,7 @@ class StagingStore:
         *,
         limit: int = 100,
         cursor: str | None = None,
-    ) -> list[dict[str, Any]]:
+    ) -> StoredContainerPage:
         """Keyset on the name, same as the live catalog."""
         clauses, params = [], []
         if database:
@@ -399,19 +444,21 @@ class StagingStore:
             clauses.append("container_name>?")
             params.append(cursor)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        params.append(limit)
-        return [
-            dict(row)
-            for row in self._rows(
-                f"SELECT * FROM containers {where} "  # noqa: S608
-                "ORDER BY container_name LIMIT ?",
-                params,
-            )
-        ]
+        params.append(limit + 1)  # one extra row tells us whether more remain
+        rows = self._rows(
+            f"SELECT * FROM containers {where} "  # noqa: S608
+            "ORDER BY container_name LIMIT ?",
+            params,
+        )
+        page = [StoredContainer(**dict(row)) for row in rows[:limit]]
+        return StoredContainerPage(
+            containers=page,
+            next_cursor=page[-1].container_name if len(rows) > limit else None,
+        )
 
     def columns(
         self, database: str, container: str, schema: str | None = None
-    ) -> list[dict[str, Any]]:
+    ) -> list[StoredColumn]:
         rows = self._rows(
             "SELECT * FROM columns WHERE database=? AND schema_name=? "
             "AND container_name=? ORDER BY ordinal",
@@ -420,9 +467,6 @@ class StagingStore:
         result = []
         for row in rows:
             item = dict(row)
-            item["nullable"] = bool(item["nullable"])
-            item["is_pk"] = bool(item["is_pk"])
-            item["is_fk"] = bool(item["is_fk"])
             item["profile"] = json.loads(item["profile"]) if item["profile"] else None
-            result.append(item)
+            result.append(StoredColumn(**item))
         return result

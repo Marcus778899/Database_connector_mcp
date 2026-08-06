@@ -96,6 +96,9 @@ class FakeAdapter:
     def close(self) -> None:
         pass
 
+    def pop_rendered_sql(self) -> str | None:
+        return None
+
     def ping(self) -> bool:
         return True
 
@@ -162,9 +165,9 @@ def test_the_scan_writes_the_inventory_to_staging(
     service.wait(service.start("main"), timeout=10)
 
     summary = store.summary("main")
-    assert summary["containers"] == 2
-    assert summary["columns"] == 4
-    assert [c["column_name"] for c in store.columns("main", "users")] == ["id", "email"]
+    assert summary.containers == 2
+    assert summary.columns == 4
+    assert [c.column_name for c in store.columns("main", "users")] == ["id", "email"]
 
 
 def test_status_tracks_the_last_container_processed(
@@ -193,7 +196,7 @@ def test_pages_are_followed_to_the_end(store: StagingStore):
 
     assert status.state == "done"
     assert status.containers_done == 10
-    assert store.summary("main")["containers"] == 10
+    assert store.summary("main").containers == 10
 
 
 def test_the_configured_page_size_reaches_the_adapter(store: StagingStore):
@@ -297,9 +300,9 @@ def test_one_unreadable_container_does_not_abandon_the_rest(
 
     assert status.state == "done"
     assert (status.containers_done, status.containers_failed) == (1, 1)
-    rows = {r["container_name"]: r for r in store.containers("main")}
-    assert "PermissionError" in rows["orders"]["error"]
-    assert rows["users"]["error"] is None
+    rows = {r.container_name: r for r in store.containers("main").containers}
+    assert "PermissionError" in (rows["orders"].error or "")
+    assert rows["users"].error is None
 
 
 def test_a_failed_container_is_retried_on_the_next_scan(
@@ -313,7 +316,7 @@ def test_a_failed_container_is_retried_on_the_next_scan(
     status = service.wait(service.start("main", resume=False), timeout=10)
 
     assert status.containers_done == 1  # orders, now readable
-    assert store.containers("main")[0]["error"] is None
+    assert store.containers("main").containers[0].error is None
 
 
 def test_a_failure_in_the_catalog_itself_marks_the_scan_failed(
@@ -339,7 +342,7 @@ def test_profiling_is_off_unless_asked_for(adapter: FakeAdapter, store: StagingS
     service.wait(service.start("main"), timeout=10)
 
     assert adapter.profile_calls == []
-    assert store.summary("main")["columns_profiled"] == 0
+    assert store.summary("main").columns_profiled == 0
 
 
 def test_requested_modes_are_profiled_and_stored(
@@ -352,8 +355,9 @@ def test_requested_modes_are_profiled_and_stored(
     )
 
     assert len(adapter.profile_calls) == 4  # 2 containers x 2 columns
-    assert store.summary("main")["columns_profiled"] == 4
-    profile = store.columns("main", "users")[0]["profile"]
+    assert store.summary("main").columns_profiled == 4
+    profile = store.columns("main", "users")[0].profile
+    assert profile is not None
     assert profile["null_ratio"]["null_ratio"] == 0.5
 
 
@@ -369,8 +373,8 @@ def test_a_column_that_cannot_be_profiled_does_not_fail_the_scan(
 
     assert status.state == "done"
     assert status.containers_done == 2
-    assert store.columns("main", "orders")[0]["profile"] is None
-    assert store.columns("main", "users")[0]["profile"] is not None
+    assert store.columns("main", "orders")[0].profile is None
+    assert store.columns("main", "users")[0].profile is not None
 
 
 # ---- concurrency ----
@@ -424,7 +428,7 @@ def test_cancelling_stops_the_scan_but_keeps_the_progress(
     assert status.containers_done == 1
     assert status.cursor == "orders"
     assert adapter.schema_calls == ["orders"], "users was never started"
-    assert store.summary("main")["containers"] == 1
+    assert store.summary("main").containers == 1
 
 
 def test_a_cancelled_scan_resumes_where_it_stopped(
