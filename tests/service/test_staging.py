@@ -12,15 +12,21 @@ from src.core.contracts import (
     ContainerType,
     ProfileMode,
     ProfileResult,
+    Sensitivity,
     TopValue,
 )
 from src.service.staging import (
     MARKER,
     NO_SCHEMA,
     SCHEMA_VERSION,
+    SOURCE_AI,
+    SOURCE_HUMAN,
+    ColumnAnnotation,
     NotAStagingStoreError,
+    OutdatedStagingSchemaError,
     StagingPathConflictError,
     StagingStore,
+    UnknownStagedContainerError,
     schema_hash,
 )
 
@@ -35,6 +41,9 @@ def _column(
         nullable=kwargs.get("nullable", True),
         is_pk=kwargs.get("is_pk", False),
         is_fk=kwargs.get("is_fk", False),
+        native_description=kwargs.get("native_description"),
+        references_container=kwargs.get("references_container"),
+        references_column=kwargs.get("references_column"),
     )
 
 
@@ -45,7 +54,15 @@ def _container(name: str = "users", database: str = "main", **kwargs) -> Contain
         container_name=name,
         container_type=kwargs.get("container_type", ContainerType.TABLE),
         estimated_count=kwargs.get("estimated_count"),
+        native_description=kwargs.get("native_description"),
+        last_modified_at=kwargs.get("last_modified_at"),
     )
+
+
+def _inventoried(store: StagingStore, name: str = "users") -> None:
+    """A container and its columns, as a scan would have left them."""
+    store.upsert_container(_container(name), hash_="h")
+    store.replace_columns("main", None, name, [_column("id"), _column("email", 2)])
 
 
 def _scan(store: StagingStore, job_id: str) -> dict:
@@ -88,6 +105,25 @@ def test_hash_changes_when_anything_about_the_schema_changes(changed):
 
 def test_hash_of_no_columns_is_defined():
     assert schema_hash([]) == schema_hash([])
+
+
+def test_hash_changes_when_the_source_edits_a_column_comment():
+    """Otherwise the rescan skips the container and the new comment never lands."""
+    baseline = schema_hash([_column("id")])
+
+    assert schema_hash([_column("id", native_description="the key")]) != baseline
+
+
+def test_hash_changes_when_a_foreign_key_is_retargeted():
+    baseline = schema_hash([_column("user_id", references_container="users")])
+
+    assert schema_hash([_column("user_id", references_container="people")]) != baseline
+
+
+def test_hash_changes_when_the_source_edits_a_table_comment():
+    columns = [_column("id")]
+
+    assert schema_hash(columns, native_description="orders") != schema_hash(columns)
 
 
 # ---- setup ----
@@ -289,6 +325,232 @@ def test_columns_of_one_container_do_not_affect_another(store: StagingStore):
 
     assert len(store.columns("main", "orders")) == 1
     assert len(store.columns("main", "users")) == 2
+
+
+def test_the_source_comment_and_fk_target_are_stored(store: StagingStore):
+    store.replace_columns(
+        "main",
+        None,
+        "orders",
+        [
+            _column(
+                "user_id",
+                is_fk=True,
+                native_description="who placed it",
+                references_container="users",
+                references_column="id",
+            )
+        ],
+    )
+
+    (column,) = store.columns("main", "orders")
+    assert column.native_description == "who placed it"
+    assert (column.references_container, column.references_column) == ("users", "id")
+
+
+def test_a_rescan_keeps_what_was_written_about_a_column(store: StagingStore):
+    """The trap this store was rewritten for: replacing columns wholesale erased
+    every description on the next scan."""
+    _inventoried(store)
+    store.annotate(
+        "main",
+        "users",
+        columns=[ColumnAnnotation(column="email", description="login address")],
+    )
+
+    store.replace_columns(
+        "main", None, "users", [_column("id"), _column("email", 2, "VARCHAR(320)")]
+    )
+
+    email = store.columns("main", "users")[1]
+    assert email.description == "login address"
+    assert email.description_source == SOURCE_AI
+    assert email.native_type == "VARCHAR(320)", "what the scan saw still wins"
+
+
+def test_a_rescan_keeps_what_was_written_about_a_container(store: StagingStore):
+    _inventoried(store)
+    store.annotate("main", "users", container_description="everyone who signed up")
+
+    store.upsert_container(
+        _container("users", native_description="app.users"), hash_="h2"
+    )
+
+    (container,) = store.containers("main").containers
+    assert container.description == "everyone who signed up"
+    assert container.native_description == "app.users"
+    assert container.schema_hash == "h2"
+
+
+def test_a_rescan_keeps_the_profile_of_a_column_that_is_still_there(
+    store: StagingStore,
+):
+    _inventoried(store)
+    store.record_profile(
+        "main", None, "users", "id", ProfileMode.NULL_RATIO, ProfileResult(null_ratio=0)
+    )
+
+    store.replace_columns("main", None, "users", [_column("id"), _column("email", 2)])
+
+    assert store.columns("main", "users")[0].profile is not None
+
+
+def test_a_description_written_for_a_dropped_column_goes_with_it(store: StagingStore):
+    """Keeping it would resurrect a stale description if the name came back."""
+    _inventoried(store)
+    store.annotate(
+        "main", "users", columns=[ColumnAnnotation(column="email", description="gone")]
+    )
+
+    store.replace_columns("main", None, "users", [_column("id")])
+    store.replace_columns("main", None, "users", [_column("id"), _column("email", 2)])
+
+    assert store.columns("main", "users")[1].description is None
+
+
+def test_replacing_every_column_with_none_empties_the_container(store: StagingStore):
+    _inventoried(store)
+
+    store.replace_columns("main", None, "users", [])
+
+    assert store.columns("main", "users") == []
+
+
+# ---- annotations ----
+
+
+def test_annotate_writes_a_description_for_a_container_and_its_columns(
+    store: StagingStore,
+):
+    _inventoried(store)
+
+    result = store.annotate(
+        "main",
+        "users",
+        container_description="everyone who signed up",
+        columns=[
+            ColumnAnnotation(column="id", description="surrogate key"),
+            ColumnAnnotation(column="email", description="login address"),
+        ],
+    )
+
+    assert (result.containers_updated, result.columns_updated) == (1, 2)
+    assert result.unknown_columns == []
+    assert (
+        store.containers("main").containers[0].description == "everyone who signed up"
+    )
+    assert [c.description for c in store.columns("main", "users")] == [
+        "surrogate key",
+        "login address",
+    ]
+
+
+def test_annotate_records_who_the_description_came_from(store: StagingStore):
+    _inventoried(store)
+
+    store.annotate(
+        "main",
+        "users",
+        container_description="signups",
+        columns=[ColumnAnnotation(column="id", description="key")],
+        source=SOURCE_HUMAN,
+    )
+
+    container = store.containers("main").containers[0]
+    column = store.columns("main", "users")[0]
+    assert container.description_source == SOURCE_HUMAN
+    assert column.description_source == SOURCE_HUMAN
+    assert column.description_updated_at is not None
+
+
+def test_an_unknown_column_is_reported_not_ignored(store: StagingStore):
+    """A misremembered table name would otherwise look like a successful write."""
+    _inventoried(store)
+
+    result = store.annotate(
+        "main",
+        "users",
+        columns=[
+            ColumnAnnotation(column="email", description="login address"),
+            ColumnAnnotation(column="emial", description="typo"),
+        ],
+    )
+
+    assert result.unknown_columns == ["emial"]
+    assert result.columns_updated == 1
+
+
+def test_annotating_a_container_no_one_inventoried_is_an_error(store: StagingStore):
+    with pytest.raises(UnknownStagedContainerError, match="run inventory_start"):
+        store.annotate("main", "ghost", container_description="nothing here")
+
+
+def test_a_field_left_out_is_left_alone(store: StagingStore):
+    _inventoried(store)
+    store.annotate(
+        "main",
+        "users",
+        container_description="signups",
+        columns=[ColumnAnnotation(column="id", description="key")],
+    )
+
+    store.annotate(
+        "main",
+        "users",
+        columns=[ColumnAnnotation(column="id", sensitivity=Sensitivity.NONE)],
+    )
+
+    assert store.containers("main").containers[0].description == "signups"
+    column = store.columns("main", "users")[0]
+    assert column.description == "key"
+    assert column.sensitivity == Sensitivity.NONE
+
+
+def test_a_blank_description_clears_it(store: StagingStore):
+    _inventoried(store)
+    store.annotate(
+        "main", "users", columns=[ColumnAnnotation(column="id", description="key")]
+    )
+
+    store.annotate(
+        "main", "users", columns=[ColumnAnnotation(column="id", description="   ")]
+    )
+
+    assert store.columns("main", "users")[0].description is None
+
+
+def test_sensitivity_round_trips_as_the_enum(store: StagingStore):
+    _inventoried(store)
+
+    store.annotate(
+        "main",
+        "users",
+        columns=[ColumnAnnotation(column="email", sensitivity=Sensitivity.PII)],
+    )
+
+    column = store.columns("main", "users")[1]
+    assert column.sensitivity is Sensitivity.PII
+    assert column.sensitivity_source == SOURCE_AI
+
+
+def test_annotating_nothing_writes_nothing(store: StagingStore):
+    _inventoried(store)
+
+    result = store.annotate("main", "users", columns=[ColumnAnnotation(column="id")])
+
+    assert (result.containers_updated, result.columns_updated) == (0, 0)
+    assert store.columns("main", "users")[0].description is None
+
+
+def test_annotations_of_one_container_do_not_reach_another(store: StagingStore):
+    _inventoried(store, "users")
+    _inventoried(store, "orders")
+
+    store.annotate(
+        "main", "users", columns=[ColumnAnnotation(column="id", description="user key")]
+    )
+
+    assert store.columns("main", "orders")[0].description is None
 
 
 # ---- profiles ----
@@ -520,6 +782,35 @@ def test_a_newer_schema_version_is_refused(tmp_path: Path):
 
     with pytest.raises(NotAStagingStoreError, match="newer version"):
         StagingStore(path)
+
+
+def test_an_older_schema_version_is_refused_with_what_to_do_about_it(tmp_path: Path):
+    """No migration chain: the file is derived data, so the instruction is to
+    delete it — but it has to say so, and say what is lost."""
+    path = tmp_path / "staging.db"
+    with StagingStore(path):
+        pass
+    conn = sqlite3.connect(path)
+    conn.execute("UPDATE staging_meta SET version=?", (SCHEMA_VERSION - 1,))
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(OutdatedStagingSchemaError) as raised:
+        StagingStore(path)
+
+    message = str(raised.value)
+    assert "delete" in message and str(path) in message
+    assert "inventory_annotate" in message, "the loss has to be spelled out"
+
+
+def test_columns_are_indexed_by_name_for_searching(tmp_path: Path):
+    with StagingStore(tmp_path / "staging.db") as store:
+        indexes = {
+            row["name"]
+            for row in store._rows("SELECT name FROM sqlite_master WHERE type='index'")
+        }
+
+    assert "columns_by_name" in indexes
 
 
 def test_staging_cannot_be_the_source_database(tmp_path: Path):

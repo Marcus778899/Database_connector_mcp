@@ -341,6 +341,57 @@ def test_sql_templates():
     assert params == ()
 
 
+# ---- which statistics suit which column ----
+
+
+def _modes_for(native_type: str) -> tuple[ProfileMode, ...]:
+    return DummyAdapter().default_profile_modes(
+        ColumnInfo(
+            name="c",
+            ordinal=1,
+            native_type=native_type,
+            nullable=True,
+            is_pk=False,
+            is_fk=False,
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    "native_type",
+    ["INTEGER", "int64", "bigint", "numeric(10,2)", "double", "REAL", "money"],
+)
+def test_a_number_gets_a_range_not_a_list_of_its_values(native_type: str):
+    assert _modes_for(native_type) == (ProfileMode.NULL_RATIO, ProfileMode.MIN_MAX)
+
+
+@pytest.mark.parametrize(
+    "native_type", ["DATE", "timestamp[us]", "timestamptz", "interval", "YEAR"]
+)
+def test_a_time_gets_a_range(native_type: str):
+    """`interval` is why temporal is tested before numeric: it contains "int"."""
+    assert _modes_for(native_type) == (ProfileMode.NULL_RATIO, ProfileMode.MIN_MAX)
+
+
+@pytest.mark.parametrize(
+    "native_type", ["TEXT", "varchar(50)", "string", "boolean", "uuid"]
+)
+def test_a_categorical_column_gets_counted_before_it_is_listed(native_type: str):
+    """The order is load-bearing: the scan uses the count to decide whether the
+    top values are worth asking for."""
+    assert _modes_for(native_type) == (
+        ProfileMode.NULL_RATIO,
+        ProfileMode.DISTINCT_COUNT,
+        ProfileMode.TOP_VALUES,
+    )
+
+
+@pytest.mark.parametrize("native_type", ["BLOB", "geometry", ""])
+def test_an_unreadable_type_gets_only_what_is_true_of_anything(native_type: str):
+    """sqlite allows a column with no declared type at all."""
+    assert _modes_for(native_type) == (ProfileMode.NULL_RATIO,)
+
+
 def test_profile_mode_enum_is_fully_covered_by_templates():
     adapter = DummySqlAdapter()
     builders = {

@@ -73,8 +73,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--profile-mode",
         action="append",
         choices=[mode.value for mode in ProfileMode],
-        help="statistics a scan gathers by default; repeatable. "
-        "env MCP_PROFILE_MODES (comma separated)",
+        help="statistics a scan gathers for every column; repeatable. Unset, "
+        "each column gets what its type warrants. env MCP_PROFILE_MODES "
+        "(comma separated)",
+    )
+    # Declared the positive way round: BooleanOptionalAction reads a leading
+    # "--no-" as the negation, so a flag actually named --no-profile would set
+    # itself to False.
+    parser.add_argument(
+        "--profile",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="--no-profile gathers no statistics at all, whatever the column. "
+        "env MCP_PROFILE",
     )
     parser.add_argument("--authorized-keys-dir", help="env MCP_AUTHORIZED_KEYS_DIR")
     parser.add_argument("--audience", help="env MCP_AUDIENCE")
@@ -147,8 +158,14 @@ def config_from_args(
     pick("authorized_keys_dir", args.authorized_keys_dir, "MCP_AUTHORIZED_KEYS_DIR")
     pick("audience", args.audience, "MCP_AUDIENCE")
 
+    # [] and None differ downstream: nothing gathered versus per-column choice.
+    profile = (
+        args.profile if args.profile is not None else _flag(env.get("MCP_PROFILE"))
+    )
     modes = args.profile_mode or _modes(env.get("MCP_PROFILE_MODES"))
-    if modes:
+    if profile is False:
+        values["profile_modes"] = []
+    elif modes:
         values["profile_modes"] = modes
 
     for field, flag, env_key in (

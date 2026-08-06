@@ -218,6 +218,11 @@ class SqliteAdapter(SqlAdapterBase):
                 nullable=not row["notnull"],
                 is_pk=bool(row["pk"]),
                 is_fk=row["name"] in foreign_keys,
+                # sqlite has no column comments at all, so `native_description`
+                # stays None here and a written description is the only one
+                # this engine will ever have
+                references_container=foreign_keys.get(row["name"], (None, None))[0],
+                references_column=foreign_keys.get(row["name"], (None, None))[1],
             )
             for row in rows
         ]
@@ -301,8 +306,7 @@ class SqliteAdapter(SqlAdapterBase):
         return int(rows[0]["n"])
 
     def _foreign_keys(self, quoted: str) -> dict[str, tuple[str, str | None]]:
-        """Source column -> (target container, target column). Only the flag
-        reaches `ColumnInfo` today; the target lands there with the relationship
-        work."""
+        """Source column -> (target container, target column). `to` is NULL when
+        the reference names no column, meaning the target's primary key."""
         rows = self._rows(f"PRAGMA foreign_key_list({quoted})")
         return {row["from"]: (row["table"], row["to"]) for row in rows}

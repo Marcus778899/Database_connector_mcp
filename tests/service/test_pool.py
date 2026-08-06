@@ -68,6 +68,9 @@ class FakeAdapter:
     ) -> ProfileResult:
         return ProfileResult()
 
+    def default_profile_modes(self, column: ColumnInfo) -> tuple[ProfileMode, ...]:
+        return ()
+
     def close(self) -> None:
         self.close_calls += 1
 
