@@ -106,10 +106,11 @@ class AuditLogger:
         """
         Move the trail aside once it is big enough, keeping `backups` of them.
 
-        Called with the lock held and before the write, so a record is never
-        split across two files. `max_bytes` of zero means never rotate.
+        Called from `_emit` and nowhere else: with the lock held and before the
+        write, so a record is never split across two files. `max_bytes` of zero
+        means never rotate.
         """
-        assert self.path is not None  # noqa: S101 - callers check
+        assert self.path is not None  # noqa: S101 - `_emit` returns early first
         if self.max_bytes <= 0 or self.backups <= 0:
             return
         try:

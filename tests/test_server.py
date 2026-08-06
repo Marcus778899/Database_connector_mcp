@@ -302,7 +302,7 @@ def test_an_unauthenticated_call_is_refused_when_auth_is_required(monkeypatch):
 
     monkeypatch.setattr(server_module, "get_access_token", lambda: None)
 
-    assert server_module._identity("get_schema") == LOCAL_KEY_ID
+    assert server_module._identity("get_schema", require_auth=False) == LOCAL_KEY_ID
     with pytest.raises(ToolError, match="requires an authenticated caller"):
         server_module._identity("get_schema", require_auth=True)
 

@@ -89,7 +89,7 @@ def build_server(
     return mcp
 
 
-def _identity(tool: str, *, require_auth: bool = False) -> str:
+def _identity(tool: str, *, require_auth: bool) -> str:
     """
     Caller's id, once its scopes are known to cover this tool.
 
@@ -98,6 +98,10 @@ def _identity(tool: str, *, require_auth: bool = False) -> str:
     left for a check to protect. A server that requires authentication refuses
     instead: the transport should have turned that call away long before here,
     and if it did not, answering it would be the one bug that matters.
+
+    `require_auth` has no default on purpose. It is always bound in `partial`
+    at registration, and a security check that can be skipped by forgetting a
+    keyword is one that eventually will be.
     """
     token = get_access_token()
     if token is None:

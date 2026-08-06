@@ -19,6 +19,10 @@ ALGORITHMS: tuple[str, ...] = ("EdDSA", "ES256", "RS256")
 # trail records as the caller.
 REQUIRED_CLAIMS: tuple[str, ...] = ("exp", "aud", "sub")
 
+# How much of a rejection's text reaches the log. pyjwt's own messages are
+# short and fixed; this bounds whatever a future one, or another library, does.
+_REASON_LIMIT = 200
+
 
 class SignedTokenVerifier(TokenVerifier):
     """
@@ -53,7 +57,7 @@ class SignedTokenVerifier(TokenVerifier):
         try:
             kid = jwt.get_unverified_header(token).get("kid")
         except jwt.PyJWTError as exc:
-            log.warning(f"auth: unreadable token header ({type(exc).__name__}: {exc})")
+            log.warning(f"auth: unreadable token header ({_reason(exc)})")
             return None
         if not kid:
             log.warning("auth: token carries no kid, so no key can be chosen for it")
@@ -75,10 +79,7 @@ class SignedTokenVerifier(TokenVerifier):
                 options={"require": list(REQUIRED_CLAIMS)},
             )
         except jwt.PyJWTError as exc:
-            log.warning(
-                f"auth: rejected token from kid {kid!r} "
-                f"({type(exc).__name__}: {exc})"
-            )
+            log.warning(f"auth: rejected token from kid {kid!r} ({_reason(exc)})")
             return None
 
         subject = str(claims["sub"])
@@ -91,6 +92,20 @@ class SignedTokenVerifier(TokenVerifier):
             expires_at=int(claims["exp"]),
             claims=claims,
         )
+
+
+def _reason(exc: Exception) -> str:
+    """
+    Why a token was refused, in a form fit for one log line.
+
+    Bounded and quoted rather than interpolated raw: the text is derived from
+    something an unauthenticated caller sent, and a message carrying newlines
+    would let it write log lines of its own.
+    """
+    message = str(exc)
+    if len(message) > _REASON_LIMIT:
+        message = message[:_REASON_LIMIT] + "…"
+    return f"{type(exc).__name__}: {message!r}"
 
 
 def _scopes(claims: dict[str, Any]) -> list[str]:
@@ -107,4 +122,12 @@ def _scopes(claims: dict[str, Any]) -> list[str]:
         return raw.split()
     if isinstance(raw, list):
         return [str(item) for item in raw]
+    if raw is not None:
+        # Failing closed is right, but silently is not: a token that
+        # authenticates and can call nothing looks like a scope bug at the
+        # server rather than a malformed claim at the issuer.
+        log.warning(
+            f"auth: ignoring a scopes claim of type {type(raw).__name__}; "
+            "this token may call nothing"
+        )
     return []

@@ -145,6 +145,11 @@ uv run mcp-connector --engine sqlite --connection-ref shop --transport http --ho
 Keys are re-read that often rather than cached for the life of the process, which
 is the whole reason revocation works without one.
 
+`exp` is checked with 60 seconds of leeway, so a token is accepted for up to a
+minute past its expiry — a token that has just run out was almost certainly
+issued against a clock a shade different from this one. It matters only if you
+issue very short lifetimes: a `--lifetime 5m` token is good for six.
+
 Signatures are asymmetric only (EdDSA, ES256, RS256). An HMAC algorithm is never
 accepted: the keys here are public, so a token signed with one of them as a
 shared secret would be a forgery anyone could produce.

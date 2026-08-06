@@ -12,6 +12,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from src.auth.keys import KEY_SUFFIX, MalformedKeyIdError, valid_kid
+from src.core.log import log
 
 # Ed25519: one curve, no parameters to choose badly, and a public key short
 # enough to paste. The verifier accepts RS256 and ES256 too, for keys issued
@@ -131,8 +132,14 @@ def save_private_key(pair: KeyPair, path: str | Path, *, keys_dir: Path | None) 
     target.write_text(pair.private_pem, encoding="utf-8")
     try:
         os.chmod(target, 0o600)
-    except OSError:  # noqa: S110 - best effort; Windows ACLs are not this model
-        pass
+    except OSError as exc:
+        # Windows ACLs are not this model, so this is expected there rather than
+        # wrong. Said out loud all the same: whoever just wrote a signing key
+        # should know the filesystem is not the thing protecting it.
+        log.warning(
+            f"could not restrict permissions on {target} ({exc}); protect the "
+            "signing key by other means"
+        )
     return target
 
 

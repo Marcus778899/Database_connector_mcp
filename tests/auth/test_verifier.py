@@ -3,6 +3,7 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -252,3 +253,35 @@ def test_a_token_with_no_scopes_may_call_nothing(verifier, keys):
     accepted = _verify(verifier, _token(keys[0], scopes=[]))
 
     assert accepted is not None and accepted.scopes == []
+
+
+def test_a_scopes_claim_of_the_wrong_type_is_ignored_out_loud(verifier, keys, caplog):
+    """Failing closed is right; failing closed silently looks like a bug in the
+    server rather than a malformed claim at the issuer."""
+    token = jwt.encode(
+        {
+            "sub": "agent",
+            "aud": AUDIENCE,
+            "exp": int((datetime.now(UTC) + timedelta(hours=1)).timestamp()),
+            "scopes": 42,
+        },
+        keys[0].private_pem,
+        algorithm="EdDSA",
+        headers={"kid": "agent"},
+    )
+
+    with caplog.at_level(logging.WARNING):
+        accepted = _verify(verifier, token)
+
+    assert accepted is not None and accepted.scopes == []
+    assert "scopes claim of type int" in caplog.text
+
+
+def test_the_reason_a_token_was_refused_cannot_write_its_own_log_line(verifier):
+    """The text comes from something an unauthenticated caller sent."""
+    from src.auth.verifier import _reason
+
+    rendered = _reason(ValueError("boom\nauth: pm-alice accepted (kid agent)"))
+
+    assert "\n" not in rendered
+    assert len(_reason(ValueError("x" * 5000))) < 300
