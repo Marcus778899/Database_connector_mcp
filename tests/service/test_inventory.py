@@ -361,6 +361,35 @@ def test_requested_modes_are_profiled_and_stored(
     assert profile["null_ratio"]["null_ratio"] == 0.5
 
 
+def test_the_default_modes_apply_when_the_caller_names_none(
+    adapter: FakeAdapter, store: StagingStore
+):
+    service = _service(adapter, store, default_profile_modes=[ProfileMode.NULL_RATIO])
+
+    service.wait(service.start("main"), timeout=10)
+
+    assert len(adapter.profile_calls) == 4  # 2 containers x 2 columns
+
+
+def test_the_caller_overrides_the_default_modes(
+    adapter: FakeAdapter, store: StagingStore
+):
+    service = _service(adapter, store, default_profile_modes=[ProfileMode.NULL_RATIO])
+
+    service.wait(service.start("main", profile_modes=[ProfileMode.MIN_MAX]), timeout=10)
+
+    assert {call[2] for call in adapter.profile_calls} == {"min_max"}
+
+
+def test_an_empty_list_means_gather_nothing(adapter: FakeAdapter, store: StagingStore):
+    """Distinct from None, which falls back to the default."""
+    service = _service(adapter, store, default_profile_modes=[ProfileMode.NULL_RATIO])
+
+    service.wait(service.start("main", profile_modes=[]), timeout=10)
+
+    assert adapter.profile_calls == []
+
+
 def test_a_column_that_cannot_be_profiled_does_not_fail_the_scan(
     adapter: FakeAdapter, store: StagingStore
 ):
