@@ -27,6 +27,14 @@ class ContainerInfo(BaseModel):
     estimated_count: int | None = None
 
 
+class ContainerPage(BaseModel):
+    """One page of `list_containers`. `next_cursor` is None on the last page and
+    opaque — callers pass it back untouched."""
+
+    containers: list[ContainerInfo]
+    next_cursor: str | None = None
+
+
 class ColumnInfo(BaseModel):
     name: str
     ordinal: int
@@ -47,8 +55,7 @@ class ProfileResult(BaseModel):
     top_values: list[TopValue] | None = None
     min_value: str | None = None
     max_value: str | None = None
-    # True when the adapter stopped short of a full scan, so the figures above
-    # describe a prefix of the data rather than all of it.
+    # True when the figures describe only a prefix of the data.
     approximate: bool = False
 
 
@@ -59,8 +66,12 @@ class SourceAdaptor(Protocol):
     def list_databases(self) -> list[str]: ...
 
     def list_containers(
-        self, database: str | None = None, schema: str | None = None
-    ) -> list[ContainerInfo]: ...
+        self,
+        database: str | None = None,
+        schema: str | None = None,
+        limit: int | None = None,
+        cursor: str | None = None,
+    ) -> ContainerPage: ...
 
     def get_schema(self, container: str) -> list[ColumnInfo]: ...
 
@@ -69,3 +80,12 @@ class SourceAdaptor(Protocol):
     def profile_column(
         self, container: str, column: str, mode: ProfileMode
     ) -> ProfileResult: ...
+
+    def close(self) -> None: ...
+
+    # False when unusable, e.g. the server dropped an idle connection. Pools
+    # check this before handing a cached adapter out.
+    def ping(self) -> bool: ...
+
+    # What the last call actually ran, for the audit layer.
+    def pop_rendered_sql(self) -> str | None: ...

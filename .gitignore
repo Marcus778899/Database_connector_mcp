@@ -12,3 +12,6 @@ wheels/
 # secret
 .env
 *.rsa.*
+
+# loggerhelper 在專案根目錄建立 log/<date>/
+log/

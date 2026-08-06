@@ -1,11 +1,13 @@
-import pytest
-from pydantic import ValidationError
 from typing import Any
 
-from src.core.tool import (
+import pytest
+from pydantic import ValidationError
+
+from src.core.contracts import (
     ContainerType,
     ProfileMode,
     ContainerInfo,
+    ContainerPage,
     ColumnInfo,
     TopValue,
     ProfileResult,
@@ -53,10 +55,9 @@ def test_container_info_defaults():
 
 def test_container_info_invalid():
     with pytest.raises(ValidationError):
-        ContainerInfo(
+        ContainerInfo(  # type: ignore[call-arg] - the missing field is the point
             database="mydb",
             container_name="users",
-            # Missing required container_type
         )
 
 
@@ -102,7 +103,7 @@ def test_profile_result_valid():
     )
     assert result.distinct_count == 10
     assert result.null_ratio == 0.5
-    assert len(result.top_values) == 1
+    assert result.top_values is not None and len(result.top_values) == 1
     assert result.top_values[0].value == "a"
     assert result.min_value == "a"
     assert result.max_value == "z"
@@ -114,9 +115,13 @@ def test_source_adaptor_protocol():
             return []
 
         def list_containers(
-            self, database: str | None = None, schema: str | None = None
-        ) -> list[ContainerInfo]:
-            return []
+            self,
+            database: str | None = None,
+            schema: str | None = None,
+            limit: int | None = None,
+            cursor: str | None = None,
+        ) -> ContainerPage:
+            return ContainerPage(containers=[])
 
         def get_schema(self, container: str) -> list[ColumnInfo]:
             return []
@@ -128,6 +133,15 @@ def test_source_adaptor_protocol():
             self, container: str, column: str, mode: ProfileMode
         ) -> ProfileResult:
             return ProfileResult()
+
+        def close(self) -> None:
+            pass
+
+        def ping(self) -> bool:
+            return True
+
+        def pop_rendered_sql(self) -> str | None:
+            return None
 
     adaptor = DummyAdaptor()
     assert isinstance(adaptor, SourceAdaptor)

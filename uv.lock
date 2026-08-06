@@ -336,10 +336,10 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "cryptography", marker = "extra == 'server'", specifier = ">=42" },
-    { name = "fastmcp", marker = "extra == 'server'", specifier = ">=2.3" },
+    { name = "fastmcp", marker = "extra == 'server'", specifier = ">=3.0" },
     { name = "loggerhelper", path = "lib/loggerhelper-1.0.0-py3-none-any.whl" },
     { name = "psycopg", extras = ["binary"], marker = "extra == 'postgres'", specifier = ">=3.1" },
-    { name = "pyarrow", marker = "extra == 'datalake'", specifier = ">=15" },
+    { name = "pyarrow", marker = "extra == 'datalake'", specifier = ">=17" },
     { name = "pydantic", specifier = ">=2.7" },
     { name = "pyjwt", marker = "extra == 'server'", specifier = ">=2.8" },
     { name = "pymongo", marker = "extra == 'mongo'", specifier = ">=4.6" },
@@ -351,8 +351,8 @@ provides-extras = ["server", "postgres", "mysql", "mssql", "mongo", "datalake"]
 [package.metadata.requires-dev]
 dev = [
     { name = "cryptography", specifier = ">=42" },
-    { name = "fastmcp", specifier = ">=2.3" },
-    { name = "pyarrow", specifier = ">=15" },
+    { name = "fastmcp", specifier = ">=3.0" },
+    { name = "pyarrow", specifier = ">=17" },
     { name = "pyjwt", specifier = ">=2.8" },
     { name = "pytest", specifier = ">=8.2" },
     { name = "pytest-asyncio", specifier = ">=0.23" },
