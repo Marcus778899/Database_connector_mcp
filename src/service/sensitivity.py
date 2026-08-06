@@ -111,12 +111,14 @@ def mask_value(value: Any, level: Sensitivity) -> Any:
     text = str(value)
     if "@" in text:
         local, _, domain = text.partition("@")
-        suffix = domain.rpartition(".")[2]
-        return (
-            f"{local[:1]}{_MASK}@{_MASK}.{suffix}"
-            if suffix
-            else f"{local[:1]}{_MASK}@{_MASK}"
-        )
+        # Only what follows the last dot, and only when there is one. A domain
+        # with no dot is not a public suffix — `internal-payroll` names the
+        # system it belongs to — so keeping it would be showing the thing this
+        # is here to hide, and inventing a dot to put it after would be a lie
+        # about the value on top of that.
+        head, dot, suffix = domain.rpartition(".")
+        keep = f".{suffix}" if dot and head else ""
+        return f"{local[:1]}{_MASK}@{_MASK}{keep}"
     if len(text) <= 4:
         return _MASK
     return f"{text[:2]}{_MASK}{text[-2:]}"

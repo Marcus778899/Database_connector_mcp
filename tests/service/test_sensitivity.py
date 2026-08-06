@@ -183,3 +183,26 @@ def test_a_recorded_level_covers_a_column_no_pattern_would_catch():
 
 def test_an_empty_sample_decides_nothing():
     assert sensitive_columns([]) == {}
+
+
+@pytest.mark.parametrize(
+    "address",
+    ["user@localhost", "ops@internal-payroll", "a@b", "weird@.com"],
+)
+def test_a_domain_with_no_public_suffix_is_hidden_entirely(address: str):
+    """
+    `internal-payroll` names the system an address belongs to, so keeping it
+    would show the thing this is here to hide — and appending it after a dot
+    that is not in the value would misdescribe it as well.
+    """
+    masked = mask_value(address, Sensitivity.PII)
+
+    assert masked.endswith("@***")
+    domain = address.partition("@")[2]
+    assert domain.strip(".") not in masked
+
+
+def test_a_real_suffix_is_still_kept():
+    """It is what tells an agent these are addresses at one organisation."""
+    assert mask_value("x@sub.example.co.uk", Sensitivity.PII) == "x***@***.uk"
+    assert mask_value("alice@example.com", Sensitivity.PII) == "a***@***.com"
