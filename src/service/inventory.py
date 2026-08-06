@@ -57,6 +57,11 @@ class InventoryService:
         self._cancels: dict[str, threading.Event] = {}
         self._running_databases: set[str | None] = set()
 
+    @property
+    def store(self) -> StagingStore:
+        """The staging store this service writes to, for readers."""
+        return self._store
+
     # ---- control ----
 
     def start(

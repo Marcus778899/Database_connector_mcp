@@ -37,11 +37,20 @@ class SingleAdapter:
         self._database = database
 
     def get(self, database: str | None = None) -> SourceAdaptor:
-        if database is not None and database != self._database:
+        if database is None or database == self._database:
+            return self._adapter
+        if self._database is not None:
             raise UnknownDatabaseError(
                 f"this provider only serves {self._database!r}, got {database!r}"
             )
-        return self._adapter
+        # Undeclared: accept whatever the adapter itself reports, or a caller
+        # could not pass back a name it just read from list_databases.
+        served = self._adapter.list_databases()
+        if database in served:
+            return self._adapter
+        raise UnknownDatabaseError(
+            f"this provider only serves {served}, got {database!r}"
+        )
 
     def list_databases(self) -> list[str]:
         return self._adapter.list_databases()

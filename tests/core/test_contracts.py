@@ -140,6 +140,9 @@ def test_source_adaptor_protocol():
         def ping(self) -> bool:
             return True
 
+        def pop_rendered_sql(self) -> str | None:
+            return None
+
     adaptor = DummyAdaptor()
     assert isinstance(adaptor, SourceAdaptor)
 

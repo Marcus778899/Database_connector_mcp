@@ -71,6 +71,9 @@ class FakeAdapter:
     def close(self) -> None:
         self.close_calls += 1
 
+    def pop_rendered_sql(self) -> str | None:
+        return None
+
     def ping(self) -> bool:
         self.ping_calls += 1
         if self.ping_error is not None:
@@ -389,12 +392,15 @@ def test_single_adapter_delegates():
     assert adapter.close_calls == 1
 
 
-def test_single_adapter_without_a_declared_database_accepts_only_none():
-    adapter = FakeAdapter()
+def test_single_adapter_accepts_the_name_its_adapter_reports():
+    """A caller must be able to pass back a name it just read from
+    list_databases; the server advertises those names."""
+    adapter = FakeAdapter("main")
     provider = SingleAdapter(adapter)
 
     assert provider.get() is adapter
-    with pytest.raises(UnknownDatabaseError):
+    assert provider.get("main") is adapter
+    with pytest.raises(UnknownDatabaseError, match="anything"):
         provider.get("anything")
 
 

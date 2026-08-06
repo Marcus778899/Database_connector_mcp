@@ -195,34 +195,34 @@ def test_upsert_is_idempotent(store: StagingStore):
     store.upsert_container(_container(estimated_count=10), hash_="h1")
     store.upsert_container(_container(estimated_count=20), hash_="h2")
 
-    rows = store.containers("main")
+    rows = store.containers("main").containers
     assert len(rows) == 1
-    assert rows[0]["estimated_count"] == 20
-    assert rows[0]["schema_hash"] == "h2"
+    assert rows[0].estimated_count == 20
+    assert rows[0].schema_hash == "h2"
 
 
 def test_a_missing_schema_name_is_stored_as_the_empty_string(store: StagingStore):
     store.upsert_container(_container(schema_name=None), hash_="h")
     store.upsert_container(_container(schema_name=None), hash_="h")
 
-    rows = store.containers("main")
+    rows = store.containers("main").containers
     assert len(rows) == 1
-    assert rows[0]["schema_name"] == NO_SCHEMA
+    assert rows[0].schema_name == NO_SCHEMA
 
 
 def test_the_same_name_in_two_databases_stays_separate(store: StagingStore):
     store.upsert_container(_container(database="a"), hash_="h")
     store.upsert_container(_container(database="b"), hash_="h")
 
-    assert len(store.containers()) == 2
-    assert len(store.containers("a")) == 1
+    assert len(store.containers().containers) == 2
+    assert len(store.containers("a").containers) == 1
 
 
 def test_the_same_name_in_two_schemas_stays_separate(store: StagingStore):
     store.upsert_container(_container(schema_name="public"), hash_="h")
     store.upsert_container(_container(schema_name="staging"), hash_="h")
 
-    assert len(store.containers("main")) == 2
+    assert len(store.containers("main").containers) == 2
 
 
 def test_stored_hash_is_none_for_an_unknown_container(store: StagingStore):
@@ -233,7 +233,7 @@ def test_a_failed_container_reports_no_hash_so_it_is_retried(store: StagingStore
     store.upsert_container(_container(), hash_="", error="PermissionDenied")
 
     assert store.stored_schema_hash("main", None, "users") is None
-    assert store.containers("main")[0]["error"] == "PermissionDenied"
+    assert store.containers("main").containers[0].error == "PermissionDenied"
 
 
 def test_a_container_can_recover_from_a_failure(store: StagingStore):
@@ -241,7 +241,7 @@ def test_a_container_can_recover_from_a_failure(store: StagingStore):
     store.upsert_container(_container(), hash_="h")
 
     assert store.stored_schema_hash("main", None, "users") == "h"
-    assert store.containers("main")[0]["error"] is None
+    assert store.containers("main").containers[0].error is None
 
 
 # ---- columns ----
@@ -258,11 +258,11 @@ def test_columns_round_trip(store: StagingStore):
 
     columns = store.columns("main", "users")
 
-    assert [c["column_name"] for c in columns] == ["id", "name"]
-    assert columns[0]["nullable"] is False
-    assert columns[0]["is_pk"] is True
-    assert columns[1]["is_pk"] is False
-    assert columns[0]["profile"] is None
+    assert [c.column_name for c in columns] == ["id", "name"]
+    assert columns[0].nullable is False
+    assert columns[0].is_pk is True
+    assert columns[1].is_pk is False
+    assert columns[0].profile is None
 
 
 def test_columns_come_back_in_ordinal_order(store: StagingStore):
@@ -270,7 +270,7 @@ def test_columns_come_back_in_ordinal_order(store: StagingStore):
         "main", None, "users", [_column("z", 1), _column("a", 2), _column("m", 3)]
     )
 
-    assert [c["column_name"] for c in store.columns("main", "users")] == ["z", "a", "m"]
+    assert [c.column_name for c in store.columns("main", "users")] == ["z", "a", "m"]
 
 
 def test_replacing_columns_drops_the_ones_that_disappeared(store: StagingStore):
@@ -278,7 +278,7 @@ def test_replacing_columns_drops_the_ones_that_disappeared(store: StagingStore):
 
     store.replace_columns("main", None, "users", [_column("id")])
 
-    assert [c["column_name"] for c in store.columns("main", "users")] == ["id"]
+    assert [c.column_name for c in store.columns("main", "users")] == ["id"]
 
 
 def test_columns_of_one_container_do_not_affect_another(store: StagingStore):
@@ -314,7 +314,8 @@ def test_profiles_from_several_modes_are_merged(store: StagingStore):
         ProfileResult(top_values=[TopValue(value="a", count=2)]),
     )
 
-    profile = store.columns("main", "users")[0]["profile"]
+    profile = store.columns("main", "users")[0].profile
+    assert profile is not None
     assert profile["null_ratio"]["null_ratio"] == 0.25
     assert profile["top_values"]["top_values"][0]["value"] == "a"
 
@@ -332,7 +333,8 @@ def test_reprofiling_the_same_mode_overwrites(store: StagingStore):
             ProfileResult(null_ratio=ratio),
         )
 
-    profile = store.columns("main", "users")[0]["profile"]
+    profile = store.columns("main", "users")[0].profile
+    assert profile is not None
     assert profile["null_ratio"]["null_ratio"] == 0.9
 
 
@@ -356,8 +358,9 @@ def test_the_approximate_flag_survives_the_round_trip(store: StagingStore):
         ProfileResult(distinct_count=5, approximate=True),
     )
 
-    stored = store.columns("main", "users")[0]["profile"]["distinct_count"]
-    assert stored["approximate"] is True
+    profile = store.columns("main", "users")[0].profile
+    assert profile is not None
+    assert profile["distinct_count"]["approximate"] is True
 
 
 # ---- reading ----
@@ -376,26 +379,26 @@ def test_summary_counts_instead_of_returning_rows(store: StagingStore):
 
     summary = store.summary("main")
 
-    assert summary["containers"] == 4
-    assert summary["containers_failed"] == 1
-    assert summary["estimated_rows"] == 300
-    assert summary["columns"] == 6
-    assert summary["columns_profiled"] == 1
+    assert summary.containers == 4
+    assert summary.containers_failed == 1
+    assert summary.estimated_rows == 300
+    assert summary.columns == 6
+    assert summary.columns_profiled == 1
 
 
 def test_summary_of_an_empty_store(store: StagingStore):
     summary = store.summary()
 
-    assert summary["containers"] == 0
-    assert summary["columns_profiled"] == 0
+    assert summary.containers == 0
+    assert summary.columns_profiled == 0
 
 
 def test_summary_can_be_scoped_to_one_database(store: StagingStore):
     store.upsert_container(_container("a", database="one"), hash_="h")
     store.upsert_container(_container("b", database="two"), hash_="h")
 
-    assert store.summary("one")["containers"] == 1
-    assert store.summary()["containers"] == 2
+    assert store.summary("one").containers == 1
+    assert store.summary().containers == 2
 
 
 def test_containers_are_paged_by_keyset(store: StagingStore):
@@ -403,12 +406,14 @@ def test_containers_are_paged_by_keyset(store: StagingStore):
         store.upsert_container(_container(name), hash_="h")
 
     first = store.containers("main", limit=2)
-    assert [row["container_name"] for row in first] == ["a", "b"]
+    assert [row.container_name for row in first.containers] == ["a", "b"]
+    assert first.next_cursor == "b"
 
     second = store.containers("main", limit=2, cursor="b")
-    assert [row["container_name"] for row in second] == ["c", "d"]
+    assert [row.container_name for row in second.containers] == ["c", "d"]
+    assert second.next_cursor is None
 
-    assert store.containers("main", limit=2, cursor="d") == []
+    assert store.containers("main", limit=2, cursor="d").containers == []
 
 
 # ---- concurrency ----
@@ -428,8 +433,8 @@ def test_writes_from_several_threads_are_serialised(store: StagingStore):
     for thread in threads:
         thread.join()
 
-    assert store.summary("main")["containers"] == 8
-    assert store.summary("main")["columns"] == 8
+    assert store.summary("main").containers == 8
+    assert store.summary("main").columns == 8
 
 
 def test_a_reader_sees_what_a_writer_committed(store: StagingStore):
@@ -442,7 +447,8 @@ def test_a_reader_sees_what_a_writer_committed(store: StagingStore):
     threading.Thread(target=writer).start()
     assert done.wait(5)
 
-    assert [row["container_name"] for row in store.containers("main")] == ["written"]
+    stored = store.containers("main").containers
+    assert [row.container_name for row in stored] == ["written"]
 
 
 def test_stored_json_is_valid(store: StagingStore):
@@ -534,7 +540,7 @@ def test_the_overlap_check_resolves_the_paths(tmp_path: Path):
 
 def test_a_different_source_path_is_allowed(tmp_path: Path):
     with StagingStore(tmp_path / "staging.db", source_path=tmp_path / "source.db") as s:
-        assert s.summary()["containers"] == 0
+        assert s.summary().containers == 0
 
 
 def test_no_source_path_means_no_overlap_check(tmp_path: Path):

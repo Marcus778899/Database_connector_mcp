@@ -13,7 +13,8 @@ import pytest
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 
-# package -> the src packages it may import (itself is always allowed)
+# unit -> the src packages it may import (itself is always allowed). A unit is a
+# package directory or a top-level module such as src/server.py.
 ALLOWED: dict[str, set[str]] = {
     "core": set(),
     "utils": set(),
@@ -21,13 +22,22 @@ ALLOWED: dict[str, set[str]] = {
     "auth": {"core", "utils"},
     # service composes everything, including importing adapters by module path
     "service": {"core", "utils", "adapter", "auth"},
+    # server.py is the outward-facing protocol surface, so it may use any of them
+    "server": {"core", "utils", "adapter", "auth", "service"},
 }
 
 
-def _packages() -> list[str]:
-    return sorted(
-        p.name for p in SRC.iterdir() if p.is_dir() and not p.name.startswith("_")
-    )
+def _units() -> dict[str, list[Path]]:
+    """Each unit and the files it is made of."""
+    units: dict[str, list[Path]] = {}
+    for entry in SRC.iterdir():
+        if entry.name.startswith("_"):
+            continue
+        if entry.is_dir():
+            units[entry.name] = sorted(entry.rglob("*.py"))
+        elif entry.suffix == ".py":
+            units[entry.stem] = [entry]
+    return units
 
 
 def _src_imports(path: Path) -> set[str]:
@@ -50,16 +60,16 @@ def _src_imports(path: Path) -> set[str]:
     return found
 
 
-def test_every_package_has_a_rule():
-    assert set(_packages()) == set(ALLOWED)
+def test_every_unit_has_a_rule():
+    assert set(_units()) == set(ALLOWED)
 
 
-@pytest.mark.parametrize("package", sorted(ALLOWED))
-def test_package_only_imports_what_its_layer_allows(package: str):
-    allowed = ALLOWED[package] | {package}
+@pytest.mark.parametrize("unit", sorted(ALLOWED))
+def test_a_unit_only_imports_what_its_layer_allows(unit: str):
+    allowed = ALLOWED[unit] | {unit}
     violations: list[str] = []
 
-    for path in sorted((SRC / package).rglob("*.py")):
+    for path in _units()[unit]:
         for imported in sorted(_src_imports(path) - allowed):
             violations.append(f"{path.relative_to(SRC.parent)} imports src.{imported}")
 

@@ -86,3 +86,6 @@ class SourceAdaptor(Protocol):
     # False when unusable, e.g. the server dropped an idle connection. Pools
     # check this before handing a cached adapter out.
     def ping(self) -> bool: ...
+
+    # What the last call actually ran, for the audit layer.
+    def pop_rendered_sql(self) -> str | None: ...
