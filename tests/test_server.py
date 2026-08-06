@@ -1,6 +1,7 @@
 import asyncio
 from collections.abc import Iterator
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pyarrow as pa
@@ -261,11 +262,62 @@ def test_the_reaper_runs_while_the_server_is_up(config, lake: Path):
     assert after is False, "shutdown must stop the reaper and close the pool"
 
 
-def test_require_auth_refuses_to_build_until_auth_exists(tmp_path: Path, adapter):
+# ---- authentication ----
+
+
+def test_a_server_that_requires_auth_is_built_with_a_verifier(tmp_path: Path, adapter):
+    from src.auth.verifier import SignedTokenVerifier
+
+    keys = tmp_path / "keys"
+    keys.mkdir()
+    config = ServerConfig(
+        transport="http", host="0.0.0.0", require_auth=True, authorized_keys_dir=keys
+    )
+
+    mcp = build_server(config, adapter)
+
+    assert isinstance(mcp.auth, SignedTokenVerifier)
+
+
+def test_a_server_that_does_not_require_auth_has_none(config, adapter):
+    """stdio: whoever spawned us already has the credential we would protect."""
+    assert build_server(config, adapter).auth is None
+
+
+def test_require_auth_without_a_key_directory_is_refused(tmp_path: Path, adapter):
+    """Better than starting and turning every caller away — the mistake is in
+    the configuration and the message says which flag fixes it."""
+    from src.auth import AuthConfigurationError
+
     config = ServerConfig(transport="http", host="0.0.0.0", require_auth=True)
 
-    with pytest.raises(NotImplementedError, match="docs/authentication.md"):
+    with pytest.raises(AuthConfigurationError, match="--authorized-keys-dir"):
         build_server(config, adapter)
+
+
+def test_an_unauthenticated_call_is_refused_when_auth_is_required(monkeypatch):
+    """Defence in depth: the transport should have turned this away already, so
+    if one ever arrives here it is the bug that matters."""
+    from src import server as server_module
+
+    monkeypatch.setattr(server_module, "get_access_token", lambda: None)
+
+    assert server_module._identity("get_schema", require_auth=False) == LOCAL_KEY_ID
+    with pytest.raises(ToolError, match="requires an authenticated caller"):
+        server_module._identity("get_schema", require_auth=True)
+
+
+def test_a_tool_outside_the_scopes_is_refused(monkeypatch):
+    from src import server as server_module
+
+    token = SimpleNamespace(
+        scopes=["get_schema"], subject="pm-alice", client_id="pm-alice"
+    )
+    monkeypatch.setattr(server_module, "get_access_token", lambda: token)
+
+    assert server_module._identity("get_schema", require_auth=True) == "pm-alice"
+    with pytest.raises(ToolError, match="may not call get_sample"):
+        server_module._identity("get_sample", require_auth=True)
 
 
 # ---- federation loop ----
@@ -317,9 +369,13 @@ def inventory(config, adapter, tmp_path: Path) -> Iterator[Any]:
 
 
 INVENTORY_TOOLS = [
+    "inventory_annotate",
     "inventory_cancel",
+    "inventory_changes",
     "inventory_columns",
     "inventory_containers",
+    "inventory_relationships",
+    "inventory_search",
     "inventory_start",
     "inventory_status",
     "inventory_summary",
@@ -334,7 +390,9 @@ def test_the_inventory_tools_appear_when_a_service_is_given(config, adapter, inv
     exposed = _tools(build_server(config, adapter, inventory=inventory))
 
     assert set(INVENTORY_TOOLS) <= set(exposed)
-    assert len(exposed) == 11
+    # inventory_export is not among them: this config has no export directory
+    assert len(exposed) == 15
+    assert "inventory_export" not in exposed
 
 
 def test_a_scan_can_be_started_and_polled(config, adapter, inventory):
@@ -390,11 +448,12 @@ def test_recorded_columns_include_the_profile(config, adapter, inventory):
             "inventory_columns", {"container": "users", "database": "datalake"}
         )
 
-    columns = _session(build_server(config, adapter, inventory=inventory), body)
+    page = _session(build_server(config, adapter, inventory=inventory), body)
 
-    assert [c.column_name for c in columns] == ["id", "tag"]
-    assert columns[0].profile is not None
-    assert columns[0].profile["null_ratio"]["null_ratio"] == 0.2
+    assert [c.column_name for c in page.columns] == ["id", "tag"]
+    assert page.next_cursor is None
+    assert page.columns[0].profile is not None
+    assert page.columns[0].profile["null_ratio"]["null_ratio"] == 0.2
 
 
 def test_an_unknown_job_is_a_tool_error(config, adapter, inventory):
@@ -452,6 +511,137 @@ def test_starting_a_scan_is_audited_with_its_job_id(config, adapter, inventory):
     assert record["job_id"] == job_id
 
 
+# ---- annotation ----
+
+
+def test_a_description_written_through_the_tool_survives_a_forced_rescan(
+    config, adapter, inventory
+):
+    """The regression the write path exists for: rescanning used to wipe every
+    description it had just been given."""
+    mcp = build_server(config, adapter, inventory=inventory)
+
+    async def body(call):
+        inventory.wait(await call("inventory_start", {}), timeout=20)
+        written = await call(
+            "inventory_annotate",
+            {
+                "database": "datalake",
+                "container": "users",
+                "container_description": "everyone who signed up",
+                "columns": [
+                    {"column": "id", "description": "surrogate key"},
+                    {"column": "tag", "description": "cohort", "sensitivity": "pii"},
+                ],
+            },
+        )
+        inventory.wait(await call("inventory_start", {"force": True}), timeout=20)
+        return written, await call(
+            "inventory_columns", {"container": "users", "database": "datalake"}
+        )
+
+    written, page = _session(mcp, body)
+
+    assert (written.containers_updated, written.columns_updated) == (1, 2)
+    assert written.unknown_columns == []
+    assert [c.description for c in page.columns] == ["surrogate key", "cohort"]
+    assert page.columns[0].description_source == "ai"
+    assert page.columns[1].sensitivity == "pii"
+
+
+def test_an_unknown_column_comes_back_rather_than_failing_the_write(
+    config, adapter, inventory
+):
+    mcp = build_server(config, adapter, inventory=inventory)
+
+    async def body(call):
+        inventory.wait(await call("inventory_start", {}), timeout=20)
+        return await call(
+            "inventory_annotate",
+            {
+                "database": "datalake",
+                "container": "users",
+                "columns": [
+                    {"column": "id", "description": "surrogate key"},
+                    {"column": "nope", "description": "not a column"},
+                ],
+            },
+        )
+
+    result = _session(mcp, body)
+
+    assert result.unknown_columns == ["nope"]
+    assert result.columns_updated == 1
+
+
+def test_annotating_something_never_inventoried_is_a_tool_error(
+    config, adapter, inventory
+):
+    with pytest.raises(ToolError, match="inventory_start"):
+        _call(
+            build_server(config, adapter, inventory=inventory),
+            "inventory_annotate",
+            {
+                "database": "datalake",
+                "container": "ghost",
+                "container_description": "nothing here",
+            },
+        )
+
+
+def test_a_write_is_audited_by_how_much_it_wrote(config, adapter, inventory):
+    """rows_returned accounts for reads; a write needs its own counterpart."""
+    trail = AuditLogger(config.audit_log_path)
+    mcp = build_server(config, adapter, audit=trail, inventory=inventory)
+
+    async def body(call):
+        inventory.wait(await call("inventory_start", {}), timeout=20)
+        await call(
+            "inventory_annotate",
+            {
+                "database": "datalake",
+                "container": "users",
+                "columns": [{"column": "id", "description": "surrogate key"}],
+            },
+        )
+
+    _session(mcp, body)
+
+    record = trail.records()[-1]
+    assert record["tool"] == "inventory_annotate"
+    assert record["columns_written"] == 1
+    assert record["params"]["source"] == "ai"
+
+
+def test_no_token_means_the_description_is_not_a_persons(config, adapter, inventory):
+    """An agent must not be able to label its own guesses as a person's work."""
+    from src.server import _annotation_source
+
+    assert _annotation_source() == "ai"
+
+
+def test_only_a_key_granted_the_scope_writes_as_a_person(monkeypatch):
+    """The half of `annotate:human` that had nothing to read it until tokens
+    existed: the scope is granted when the key is issued, and claiming it in
+    the call is not an option the caller has."""
+    from src import server as server_module
+
+    def carrying(*scopes: str):
+        monkeypatch.setattr(
+            server_module,
+            "get_access_token",
+            lambda: SimpleNamespace(
+                scopes=list(scopes), subject="pm-alice", client_id="pm-alice"
+            ),
+        )
+
+    carrying("inventory_annotate")
+    assert server_module._annotation_source() == "ai"
+
+    carrying("inventory_annotate", server_module.HUMAN_ANNOTATION_SCOPE)
+    assert server_module._annotation_source() == "human"
+
+
 def test_shutdown_stops_the_inventory_workers(config, adapter, inventory):
     mcp = build_server(config, adapter, inventory=inventory)
 
@@ -462,3 +652,158 @@ def test_shutdown_stops_the_inventory_workers(config, adapter, inventory):
     asyncio.run(run())
 
     assert all(not worker.is_alive() for worker in inventory._workers.values())
+
+
+# ---- search and export ----
+
+
+def test_search_finds_a_column_through_the_tool(config, adapter, inventory):
+    mcp = build_server(config, adapter, inventory=inventory)
+
+    async def body(call):
+        inventory.wait(await call("inventory_start", {}), timeout=20)
+        return await call("inventory_search", {"keyword": "tag"})
+
+    hits = _session(mcp, body)
+
+    assert [(h.container_name, h.column_name) for h in hits] == [
+        ("orders", "tag"),
+        ("users", "tag"),
+    ]
+    assert all(h.match_in == "name" for h in hits)
+
+
+def test_search_is_audited_by_how_much_came_back(config, adapter, inventory):
+    trail = AuditLogger(config.audit_log_path)
+    mcp = build_server(config, adapter, audit=trail, inventory=inventory)
+
+    async def body(call):
+        inventory.wait(await call("inventory_start", {}), timeout=20)
+        await call("inventory_search", {"keyword": "id"})
+
+    _session(mcp, body)
+
+    record = trail.records()[-1]
+    assert record["tool"] == "inventory_search"
+    assert record["rows_returned"] == 2
+    assert record["params"]["keyword"] == "id"
+
+
+def test_columns_are_paged_through_the_tool(config, adapter, inventory):
+    mcp = build_server(config, adapter, inventory=inventory)
+
+    async def body(call):
+        inventory.wait(await call("inventory_start", {}), timeout=20)
+        first = await call(
+            "inventory_columns",
+            {"container": "users", "database": "datalake", "limit": 1},
+        )
+        rest = await call(
+            "inventory_columns",
+            {
+                "container": "users",
+                "database": "datalake",
+                "limit": 1,
+                "cursor": first.next_cursor,
+            },
+        )
+        return first, rest
+
+    first, rest = _session(mcp, body)
+
+    assert [c.column_name for c in first.columns] == ["id"]
+    assert first.next_cursor == "1"
+    assert [c.column_name for c in rest.columns] == ["tag"]
+    assert rest.next_cursor is None
+
+
+def test_export_is_not_served_without_somewhere_to_write(config, adapter, inventory):
+    """Better than a tool that is present and fails on every call."""
+    assert "inventory_export" not in _tools(
+        build_server(config, adapter, inventory=inventory)
+    )
+
+
+def test_export_appears_when_an_export_directory_is_set(
+    config, adapter, inventory, tmp_path: Path
+):
+    config = config.model_copy(update={"export_dir": tmp_path / "exports"})
+
+    assert "inventory_export" in _tools(
+        build_server(config, adapter, inventory=inventory)
+    )
+
+
+def test_an_export_returns_a_path_and_not_the_catalog(
+    config, adapter, inventory, tmp_path: Path
+):
+    exports = tmp_path / "exports"
+    exports.mkdir()
+    config = config.model_copy(update={"export_dir": exports})
+    mcp = build_server(config, adapter, inventory=inventory)
+
+    async def body(call):
+        inventory.wait(await call("inventory_start", {}), timeout=20)
+        return await call("inventory_export", {"format": "markdown"})
+
+    result = _session(mcp, body)
+
+    assert Path(result.path).is_relative_to(exports)
+    assert result.containers == 2
+    assert result.bytes_written > 0
+    # where and how much, and nothing that could carry the catalog itself
+    assert set(vars(result)) == {"path", "bytes_written", "containers", "columns"}
+    assert Path(result.path).read_text(encoding="utf-8"), "the content is in the file"
+
+
+def test_an_export_path_outside_the_directory_is_refused(
+    config, adapter, inventory, tmp_path: Path
+):
+    """The check that makes the tool safe to expose: the caller is an agent
+    relaying a path it was given."""
+    exports = tmp_path / "exports"
+    exports.mkdir()
+    config = config.model_copy(update={"export_dir": exports})
+    mcp = build_server(config, adapter, inventory=inventory)
+
+    with pytest.raises(ToolError, match="outside the export directory"):
+        _call(mcp, "inventory_export", {"path": "../escaped.md"})
+
+    assert not (tmp_path / "escaped.md").exists()
+
+
+def test_an_export_is_audited_by_what_it_wrote(
+    config, adapter, inventory, tmp_path: Path
+):
+    exports = tmp_path / "exports"
+    exports.mkdir()
+    config = config.model_copy(update={"export_dir": exports})
+    trail = AuditLogger(config.audit_log_path)
+    mcp = build_server(config, adapter, audit=trail, inventory=inventory)
+
+    async def body(call):
+        inventory.wait(await call("inventory_start", {}), timeout=20)
+        await call("inventory_export", {"format": "csv"})
+
+    _session(mcp, body)
+
+    record = trail.records()[-1]
+    assert record["tool"] == "inventory_export"
+    assert record["bytes_written"] > 0
+    assert record["rows_returned"] == 4
+
+
+def test_a_bad_cursor_is_a_tool_error_not_a_silent_restart(config, adapter, inventory):
+    """An agent handed page one in answer to "the page after X" has no way to
+    tell it is going in circles."""
+    mcp = build_server(config, adapter, inventory=inventory)
+
+    async def body(call):
+        inventory.wait(await call("inventory_start", {}), timeout=20)
+        return await call(
+            "inventory_columns",
+            {"container": "users", "database": "datalake", "cursor": "nonsense"},
+        )
+
+    with pytest.raises(ToolError, match="next_cursor"):
+        _session(mcp, body)

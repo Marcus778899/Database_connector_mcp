@@ -11,6 +11,7 @@ from src.core.contracts import (
     ColumnInfo,
     TopValue,
     ProfileResult,
+    Sensitivity,
     SourceAdaptor,
 )
 
@@ -26,6 +27,12 @@ def test_profile_mode_enum():
     assert ProfileMode.TOP_VALUES == "top_values"
     assert ProfileMode.NULL_RATIO == "null_ratio"
     assert ProfileMode.MIN_MAX == "min_max"
+
+
+def test_sensitivity_enum():
+    assert Sensitivity.NONE == "none"
+    assert Sensitivity.PII == "pii"
+    assert Sensitivity.SECRET == "secret"
 
 
 def test_container_info_valid():
@@ -76,6 +83,41 @@ def test_column_info_valid():
     assert info.nullable is False
     assert info.is_pk is True
     assert info.is_fk is False
+
+
+def test_column_info_describes_itself_and_what_it_points_at():
+    info = ColumnInfo(
+        name="user_id",
+        ordinal=2,
+        native_type="INTEGER",
+        nullable=False,
+        is_pk=False,
+        is_fk=True,
+        native_description="who placed the order",
+        references_container="users",
+        references_column="id",
+    )
+    assert info.native_description == "who placed the order"
+    assert (info.references_container, info.references_column) == ("users", "id")
+
+
+def test_the_description_fields_default_to_none():
+    """Every adapter written before they existed still compiles."""
+    info = ColumnInfo(
+        name="id",
+        ordinal=1,
+        native_type="INTEGER",
+        nullable=False,
+        is_pk=True,
+        is_fk=False,
+    )
+    container = ContainerInfo(
+        database="mydb", container_name="users", container_type=ContainerType.TABLE
+    )
+    assert info.native_description is None
+    assert info.references_container is None
+    assert container.native_description is None
+    assert container.last_modified_at is None
 
 
 def test_top_value_valid():
@@ -133,6 +175,9 @@ def test_source_adaptor_protocol():
             self, container: str, column: str, mode: ProfileMode
         ) -> ProfileResult:
             return ProfileResult()
+
+        def default_profile_modes(self, column: ColumnInfo) -> tuple[ProfileMode, ...]:
+            return ()
 
         def close(self) -> None:
             pass

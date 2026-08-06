@@ -125,6 +125,104 @@ def test_require_container_accepts_a_name_on_a_later_page():
     assert OnePerPage()._require_container("users") == '"users"'
 
 
+def test_known_containers_is_immutable():
+    """The cache hands the same object to every caller."""
+    assert isinstance(DummyAdapter()._known_containers(), frozenset)
+
+
+# ---- catalog cache ----
+
+
+class CountingAdapter(DummySqlAdapter):
+    """Counts what actually reaches the source."""
+
+    def __init__(self, **kwargs):
+        self.walks = 0
+        self.schema_reads = 0
+        super().__init__(**kwargs)
+
+    def _walk_containers(self):
+        self.walks += 1
+        return super()._walk_containers()
+
+    def get_schema(self, container):
+        self.schema_reads += 1
+        return super().get_schema(container)
+
+
+def test_the_catalog_is_walked_once_per_ttl():
+    adapter = CountingAdapter()
+
+    assert adapter._known_containers() == adapter._known_containers()
+    assert adapter.walks == 1
+
+
+def test_validation_shares_one_walk_and_one_schema_read():
+    """Both checks run per column of every scan; each used to hit the source."""
+    adapter = CountingAdapter()
+
+    adapter._require_container("users")
+    adapter._require_column("users", "id")
+    adapter._require_column("users", "name")
+
+    assert adapter.walks == 1
+    assert adapter.schema_reads == 1
+
+
+def test_a_zero_ttl_disables_the_cache():
+    adapter = CountingAdapter(catalog_ttl=0)
+
+    adapter._known_containers()
+    adapter._known_containers()
+
+    assert adapter.walks == 2
+
+
+def test_an_expired_entry_is_read_again():
+    adapter = CountingAdapter(catalog_ttl=30)
+    adapter._known_containers()
+
+    assert adapter._catalog_cache is not None
+    stamp, names = adapter._catalog_cache
+    # age the entry rather than sleeping through the ttl
+    adapter._catalog_cache = (stamp - 60, names)
+
+    assert adapter._known_containers() == names
+    assert adapter.walks == 2
+
+
+def test_invalidating_the_cache_forces_a_reread():
+    """The way to see a container created since the last walk."""
+    adapter = CountingAdapter()
+    adapter._require_container("users")
+    adapter._require_column("users", "id")
+
+    adapter.invalidate_catalog_cache()
+    adapter._require_container("users")
+    adapter._require_column("users", "id")
+
+    assert adapter.walks == 2
+    assert adapter.schema_reads == 2
+
+
+def test_the_cache_does_not_leak_between_adapters():
+    first, second = CountingAdapter(), CountingAdapter()
+
+    first._known_containers()
+
+    assert second.walks == 0
+
+
+def test_get_schema_as_a_tool_still_reads_through():
+    """Only validation caches: a schema tool call must see the source."""
+    adapter = CountingAdapter()
+
+    adapter.get_schema("users")
+    adapter.get_schema("users")
+
+    assert adapter.schema_reads == 2
+
+
 def test_cap_page_size():
     adapter = DummyAdapter()
 
@@ -241,6 +339,64 @@ def test_sql_templates():
     sql, params = adapter._sql_min_max(quoted_table, quoted_col)
     assert sql == 'SELECT MIN("id") AS lo, MAX("id") AS hi FROM "users"'
     assert params == ()
+
+
+# ---- which statistics suit which column ----
+
+
+def _modes_for(native_type: str) -> tuple[ProfileMode, ...]:
+    return DummyAdapter().default_profile_modes(
+        ColumnInfo(
+            name="c",
+            ordinal=1,
+            native_type=native_type,
+            nullable=True,
+            is_pk=False,
+            is_fk=False,
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    "native_type",
+    ["INTEGER", "int64", "bigint", "numeric(10,2)", "double", "REAL", "money"],
+)
+def test_a_number_gets_a_range_not_a_list_of_its_values(native_type: str):
+    assert _modes_for(native_type) == (ProfileMode.NULL_RATIO, ProfileMode.MIN_MAX)
+
+
+@pytest.mark.parametrize(
+    "native_type", ["DATE", "timestamp[us]", "timestamptz", "interval", "YEAR"]
+)
+def test_a_time_gets_a_range(native_type: str):
+    """`interval` is why temporal is tested before numeric: it contains "int"."""
+    assert _modes_for(native_type) == (ProfileMode.NULL_RATIO, ProfileMode.MIN_MAX)
+
+
+@pytest.mark.parametrize(
+    "native_type", ["TEXT", "varchar(50)", "string", "boolean", "uuid"]
+)
+def test_a_categorical_column_gets_counted_before_it_is_listed(native_type: str):
+    """The order is load-bearing: the scan uses the count to decide whether the
+    top values are worth asking for."""
+    assert _modes_for(native_type) == (
+        ProfileMode.NULL_RATIO,
+        ProfileMode.DISTINCT_COUNT,
+        ProfileMode.TOP_VALUES,
+    )
+
+
+@pytest.mark.parametrize("native_type", ["BLOB", "geometry", "bytea", ""])
+def test_an_unreadable_type_gets_only_what_is_true_of_anything(native_type: str):
+    """sqlite allows a column with no declared type at all."""
+    assert _modes_for(native_type) == (ProfileMode.NULL_RATIO,)
+
+
+@pytest.mark.parametrize("native_type", ["POINT", "multipolygon", "varbinary(16)"])
+def test_a_type_that_merely_contains_a_hint_is_not_taken_for_one(native_type: str):
+    """ "point" contains "int". Asking a geometry column for its range is not
+    wrong so much as meaningless, and it costs a query per column to find out."""
+    assert _modes_for(native_type) == (ProfileMode.NULL_RATIO,)
 
 
 def test_profile_mode_enum_is_fully_covered_by_templates():

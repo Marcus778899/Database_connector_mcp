@@ -19,12 +19,25 @@ class ProfileMode(StrEnum):
     MIN_MAX = "min_max"
 
 
+class Sensitivity(StrEnum):
+    """How freely a column's values may be shown."""
+
+    NONE = "none"
+    PII = "pii"
+    SECRET = "secret"
+
+
 class ContainerInfo(BaseModel):
     database: str
     schema_name: str | None = None
     container_name: str
     container_type: ContainerType
     estimated_count: int | None = None
+    # The source's own comment on the table. None where the engine has no such
+    # thing (sqlite) — which is the reason written descriptions exist.
+    native_description: str | None = None
+    # Freshness, only where the source reports it.
+    last_modified_at: str | None = None
 
 
 class ContainerPage(BaseModel):
@@ -42,6 +55,11 @@ class ColumnInfo(BaseModel):
     nullable: bool
     is_pk: bool
     is_fk: bool
+    # The source's own comment on the column.
+    native_description: str | None = None
+    # What `is_fk` points at, where the engine can say.
+    references_container: str | None = None
+    references_column: str | None = None
 
 
 class TopValue(BaseModel):
@@ -80,6 +98,10 @@ class SourceAdaptor(Protocol):
     def profile_column(
         self, container: str, column: str, mode: ProfileMode
     ) -> ProfileResult: ...
+
+    # Which statistics are worth gathering for this column. Engine-specific
+    # because only the engine knows what its type names mean.
+    def default_profile_modes(self, column: ColumnInfo) -> tuple[ProfileMode, ...]: ...
 
     def close(self) -> None: ...
 

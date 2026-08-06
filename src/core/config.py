@@ -8,6 +8,7 @@ from typing import Literal, Mapping, Any
 
 from pydantic import BaseModel, model_validator
 
+from src.core.contracts import ProfileMode
 from src.core.log import log
 
 DEFAULT_AUDIENCE = "etl-agent-mcp"
@@ -62,6 +63,15 @@ class ServerConfig(BaseModel):
     database: str | None = None
     max_sample_limit: int = 100
 
+    # Where a scan accumulates. Unset means the inventory tools are not served
+    # at all: there would be nowhere to put what they gather.
+    staging_db_path: Path | None = None
+    # An export may only be written under here. Unset means no export tool.
+    export_dir: Path | None = None
+    # Which statistics a scan gathers when the caller names none. Unset leaves
+    # the choice to the engine, per column; empty means gather none.
+    profile_modes: list[ProfileMode] | None = None
+
     transport: Transport = "stdio"
     host: str = "127.0.0.1"
     port: int = 8000
@@ -72,6 +82,10 @@ class ServerConfig(BaseModel):
     authorized_keys_dir: Path | None = None
     audience: str = DEFAULT_AUDIENCE
     audit_log_path: Path | None = None
+    # The trail is the record of who read what, so it is kept by size and in
+    # generations rather than allowed to grow without limit. Zero disables.
+    audit_max_mb: int = 10
+    audit_backups: int = 5
     # Escape hatch for serving a network transport without auth on purpose.
     allow_insecure_http: bool = False
 

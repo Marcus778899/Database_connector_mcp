@@ -8,7 +8,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 from src.core.log import log
 
@@ -31,8 +31,23 @@ class AuditLogger:
     copy of the data it exists to account for.
     """
 
-    def __init__(self, path: Path | None = None) -> None:
+    # Once authentication is on, this file is the record of who read what, so it
+    # has to survive being written to indefinitely. Size rather than age: a
+    # server nobody calls should not churn through its history, and a busy one
+    # should not fill the disk.
+    DEFAULT_MAX_BYTES: ClassVar[int] = 10 * 1024 * 1024
+    DEFAULT_BACKUPS: ClassVar[int] = 5
+
+    def __init__(
+        self,
+        path: Path | None = None,
+        *,
+        max_bytes: int | None = None,
+        backups: int | None = None,
+    ) -> None:
         self.path = Path(path) if path else None
+        self.max_bytes = self.DEFAULT_MAX_BYTES if max_bytes is None else max_bytes
+        self.backups = self.DEFAULT_BACKUPS if backups is None else backups
         self._lock = threading.Lock()
         if self.path is not None:
             self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -83,11 +98,42 @@ class AuditLogger:
         if self.path is None:
             return
         with self._lock:
+            self._rotate_if_full()
             with self.path.open("a", encoding="utf-8") as handle:
                 handle.write(line + "\n")
 
+    def _rotate_if_full(self) -> None:
+        """
+        Move the trail aside once it is big enough, keeping `backups` of them.
+
+        Called from `_emit` and nowhere else: with the lock held and before the
+        write, so a record is never split across two files. `max_bytes` of zero
+        means never rotate.
+        """
+        assert self.path is not None  # noqa: S101 - `_emit` returns early first
+        if self.max_bytes <= 0 or self.backups <= 0:
+            return
+        try:
+            if self.path.stat().st_size < self.max_bytes:
+                return
+        except FileNotFoundError:
+            return
+
+        # Oldest first, so nothing is overwritten before it has been shifted.
+        oldest = self.path.with_suffix(self.path.suffix + f".{self.backups}")
+        oldest.unlink(missing_ok=True)
+        for index in range(self.backups - 1, 0, -1):
+            older = self.path.with_suffix(self.path.suffix + f".{index}")
+            if older.exists():
+                older.replace(self.path.with_suffix(self.path.suffix + f".{index + 1}"))
+        self.path.replace(self.path.with_suffix(self.path.suffix + ".1"))
+        log.info(f"audit trail rotated at {self.max_bytes} bytes")
+
     def records(self) -> list[dict[str, Any]]:
-        """Read the trail back. For tests and for answering "who read what"."""
+        """Read the trail back. For tests and for answering "who read what".
+
+        The current file only: a rotated one is still on disk beside it, and
+        reading the whole history is a job for whatever reads the archive."""
         if self.path is None or not self.path.exists():
             return []
         with self._lock:
