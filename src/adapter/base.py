@@ -4,7 +4,7 @@ import re
 from abc import ABC, abstractmethod
 from typing import Any, ClassVar
 
-from src.core.tool import ColumnInfo, ContainerInfo, ProfileMode, ProfileResult
+from src.core.contracts import ColumnInfo, ContainerPage, ProfileMode, ProfileResult
 
 
 class UnknownContainerError(Exception):
@@ -16,15 +16,16 @@ class UnknownColumnError(Exception):
 
 
 class AdapterBase(ABC):
-    """
-    Engine-agnostic base for every `SourceAdaptor`: the five-tool contract, the
-    sampling/profiling policy and the executed-statement log. SQL-only machinery
-    lives in `SqlAdapterBase`.
-    """
+    """Engine-agnostic base: the tool contract, sampling policy and statement log."""
 
     _DEFAULT_SAMPLE_LIMIT: ClassVar[int] = 3
     _MAX_SAMPLE_LIMIT: ClassVar[int] = 100
     _DEFAULT_TOP_N: ClassVar[int] = 20
+    _DEFAULT_PAGE_SIZE: ClassVar[int] = 100
+    _MAX_PAGE_SIZE: ClassVar[int] = 1000
+
+    # False when `database` names the whole source instead of selecting one inside it.
+    SUPPORTS_MULTIPLE_DATABASES: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -33,24 +34,25 @@ class AdapterBase(ABC):
         max_sample_limit: int | None = None,
     ) -> None:
         self._database = database
-        # per server instance (ServerConfig.max_sample_limit), so it must not be
-        # written back onto the class
+        # per instance, so it must not be written back onto the class
         self._max_sample_limit = (
             self._MAX_SAMPLE_LIMIT if max_sample_limit is None else max_sample_limit
         )
         self._statement_log: list[str] = []
 
-    # ---- contract ----
-    # Abstract, so a backend missing a tool fails on construction instead of
-    # silently dropping out of the SourceAdaptor protocol.
+    # ---- contract: abstract so a missing tool fails on construction ----
 
     def list_databases(self) -> list[str]:
         return [self._database]
 
     @abstractmethod
     def list_containers(
-        self, database: str | None = None, schema: str | None = None
-    ) -> list[ContainerInfo]:
+        self,
+        database: str | None = None,
+        schema: str | None = None,
+        limit: int | None = None,
+        cursor: str | None = None,
+    ) -> ContainerPage:
         raise NotImplementedError
 
     @abstractmethod
@@ -69,19 +71,40 @@ class AdapterBase(ABC):
     ) -> ProfileResult:
         raise NotImplementedError
 
+    def close(self) -> None:
+        """No-op unless a subclass holds a connection."""
+
+    def ping(self) -> bool:
+        """Still usable? A SQL adapter should round-trip to its server."""
+        return True
+
     # ---- policy ----
 
     def _known_containers(self) -> set[str]:
-        return {c.container_name for c in self.list_containers()}
+        """Every container name. Stopping at page one would reject the rest as
+        unknown, so the full walk is deliberate."""
+        names: set[str] = set()
+        cursor: str | None = None
+        while True:
+            page = self.list_containers(limit=self._MAX_PAGE_SIZE, cursor=cursor)
+            names.update(c.container_name for c in page.containers)
+            if page.next_cursor is None or page.next_cursor == cursor:
+                return names
+            cursor = page.next_cursor
 
     def _cap_limit(self, limit: int) -> int:
         return max(0, min(limit, self._max_sample_limit))
 
+    def _cap_page_size(self, limit: int | None) -> int:
+        """At least one, so a paging caller always makes progress."""
+        if limit is None:
+            return self._DEFAULT_PAGE_SIZE
+        return max(1, min(limit, self._MAX_PAGE_SIZE))
+
     # ---- rendered_sql ----
 
     def _record_sql(self, sql: str) -> None:
-        """Record what was executed, for the audit layer. Non-SQL backends
-        record their equivalent operation."""
+        """What was executed, for the audit layer."""
         self._statement_log.append(sql)
 
     def pop_rendered_sql(self) -> str | None:
@@ -119,9 +142,7 @@ class SqlAdapterBase(AdapterBase):
             raise UnknownColumnError(f"{container}.{column}")
         return self._quote(column)
 
-    # ---- fixed templates, returning (sql, params) ----
-    # Identifiers arrive already quoted via _require_*; nothing here
-    # concatenates an unchecked string.
+    # ---- templates -> (sql, params). Identifiers arrive quoted via _require_* ----
 
     def _sql_sample(self, quoted_table: str, limit: int) -> tuple[str, tuple[int, ...]]:
         return (f"SELECT * FROM {quoted_table} LIMIT {self._PARAM}", (limit,))

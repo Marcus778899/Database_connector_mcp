@@ -8,6 +8,8 @@ from typing import Literal, Mapping, Any
 
 from pydantic import BaseModel
 
+from src.core.log import log
+
 DEFAULT_AUDIENCE = "etl-agent-mcp"
 _REF_NORMALISE = re.compile(r"[^A-Za-z0-9]+")
 
@@ -92,8 +94,15 @@ def resolve_connection(
             values.setdefault(field, raw)
 
     if not values:
-        raise MissingConnectionEnvError(
+        message = (
             f"Could not find any environment variables for connection_ref {connection_ref!r}"
             f" (prefix {prefix}_*, e.g., {prefix}_HOST / {prefix}_URI / {prefix}_PATH)"
         )
+        log.critical(message)
+        raise MissingConnectionEnvError(message)
+
+    log.info(
+        f"resolved connection {connection_ref!r} from {prefix}_* "
+        f"({', '.join(sorted(values))})"
+    )
     return ConnectionInfo.model_validate(values)
