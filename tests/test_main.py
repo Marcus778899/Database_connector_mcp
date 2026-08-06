@@ -162,9 +162,12 @@ def test_booleans_come_from_the_environment():
     assert config.require_auth is True
 
 
+def test_a_bare_flag_is_true():
+    assert _config(["--allow-insecure-http"], {}).allow_insecure_http is True
+
+
 @pytest.mark.parametrize("raw", ["1", "yes", "ON"])
 def test_truthy_spellings(raw: str):
-    assert _config(["--allow-insecure-http"], {}).allow_insecure_http is True
     assert _config([], {"MCP_ALLOW_INSECURE_HTTP": raw}).allow_insecure_http is True
 
 
@@ -196,6 +199,20 @@ def test_a_config_the_model_rejects_becomes_a_configuration_error():
 def test_build_needs_a_connection_ref():
     with pytest.raises(entry.ConfigurationError, match="no connection"):
         entry.build(ServerConfig())
+
+
+def test_a_ref_with_no_environment_behind_it_is_a_configuration_error():
+    """The commonest setup error. Its message must not arrive in a traceback."""
+    with pytest.raises(entry.ConfigurationError, match="ABSENT_REF_URI"):
+        entry.build(ServerConfig(connection_ref="absent_ref"))
+
+
+def test_main_reports_a_mistyped_ref(capsys: pytest.CaptureFixture[str]):
+    assert entry.main(["--connection-ref", "absent_ref"]) == 2
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "ABSENT_REF_PATH" in captured.err
 
 
 def test_build_serves_the_live_tools(source_env: str, db: Path):

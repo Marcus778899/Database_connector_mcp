@@ -129,8 +129,15 @@ class AdapterBase(ABC):
             cursor = page.next_cursor
 
     def _cached_schema(self, container: str) -> list[ColumnInfo]:
-        """A container's columns, for validation only — `get_schema` as a tool
-        must keep reading through to the source."""
+        """
+        A container's columns, for validation only — `get_schema` as a tool must
+        keep reading through to the source.
+
+        Same trade as `_known_containers`, one level down: a column dropped
+        within the ttl still passes the check, and the source then raises about
+        it instead of this layer answering `UnknownColumnError`.
+        `invalidate_catalog_cache` is the way out.
+        """
         with self._catalog_lock:
             cached = self._schema_cache.get(container)
             if cached is not None and self._fresh(cached[0]):

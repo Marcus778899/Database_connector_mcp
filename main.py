@@ -19,6 +19,7 @@ from fastmcp import FastMCP
 from pydantic import ValidationError
 
 from src.core.config import (
+    MissingConnectionEnvError,
     ServerConfig,
     SourceEngine,
     Transport,
@@ -178,7 +179,14 @@ def build(config: ServerConfig) -> FastMCP:
             "that hold the connection details"
         )
 
-    conn_info = resolve_connection(config.connection_ref)
+    try:
+        conn_info = resolve_connection(config.connection_ref)
+    except MissingConnectionEnvError as exc:
+        # A mistyped ref is the commonest setup error, and the message already
+        # names the variables it looked for. It should not arrive wrapped in a
+        # traceback.
+        raise ConfigurationError(str(exc)) from exc
+
     provider = AdapterPool(
         config.engine,
         conn_info,

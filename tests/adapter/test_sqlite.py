@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from src.adapter.base import UnknownColumnError, UnknownContainerError
-from src.adapter.sqlite import SqliteAdapter
+from src.adapter.sqlite import SqliteAdapter, _render
 from src.core.config import ConnectionInfo
 from src.core.contracts import ContainerType, ProfileMode
 
@@ -365,6 +365,44 @@ def test_a_parameter_is_inlined_for_the_audit(adapter: SqliteAdapter):
     adapter.list_containers(limit=1, cursor="orders")
 
     assert "'orders'" in (adapter.pop_rendered_sql() or "")
+
+
+def test_a_value_holding_a_placeholder_does_not_shift_the_rest():
+    """
+    The bug this guards: repeated `replace('?', ...)` would find the `?` inside
+    the value it had just inlined and substitute there, so the audit line came
+    out wrong about what ran while still reading as authoritative.
+    """
+    rendered = _render("SELECT * FROM t WHERE name > ? LIMIT ?", ("a?b", 5))
+
+    assert rendered == "SELECT * FROM t WHERE name > 'a?b' LIMIT 5"
+
+
+def test_a_cursor_holding_a_placeholder_is_audited_intact(adapter: SqliteAdapter):
+    """`cursor` comes from the caller, so this path is reachable."""
+    adapter.pop_rendered_sql()
+    adapter.list_containers(limit=1, cursor="a?b")
+
+    rendered = adapter.pop_rendered_sql() or ""
+
+    assert "'a?b'" in rendered
+    assert "LIMIT 2" in rendered
+
+
+@pytest.mark.parametrize(
+    ("sql", "params", "expected"),
+    [
+        ("SELECT 1", (), "SELECT 1"),
+        # an unfilled placeholder stays one rather than vanishing
+        ("SELECT ?, ?", (1,), "SELECT 1, ?"),
+        ("SELECT ?", (1, 2), "SELECT 1"),
+        ("SELECT ?", (None,), "SELECT None"),
+    ],
+)
+def test_render_handles_a_mismatch_between_placeholders_and_parameters(
+    sql: str, params: tuple, expected: str
+):
+    assert _render(sql, params) == expected
 
 
 def test_ping(adapter: SqliteAdapter):

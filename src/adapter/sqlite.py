@@ -29,16 +29,25 @@ _CONTAINER_TYPES = {"table": ContainerType.TABLE, "view": ContainerType.VIEW}
 
 # sqlite's own bookkeeping, never part of a user's catalog. The backslash escape
 # matters: unescaped, `_` is a single-character wildcard.
-_CATALOG_WHERE = "type IN ('table','view') AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'"
+_CATALOG_WHERE = r"type IN ('table','view') AND name NOT LIKE 'sqlite\_%' ESCAPE '\'"
 
 
 def _render(sql: str, params: Sequence[Any] = ()) -> str:
-    """The statement with its parameters inlined, for the audit trail. Our
-    templates never contain a literal `?`, so positional replacement is safe."""
-    rendered = sql
-    for value in params:
-        rendered = rendered.replace("?", repr(value), 1)
-    return rendered
+    """
+    The statement with its parameters inlined, for the audit trail.
+
+    Split once rather than replacing `?` repeatedly: a value that itself contains
+    a `?` would become the next placeholder, and the audit line would then be
+    quietly wrong about what ran — worse than having no line at all, because it
+    reads as authoritative.
+    """
+    head, *tails = sql.split("?")
+    rendered = [head]
+    for index, tail in enumerate(tails):
+        # more placeholders than parameters: leave the extras as placeholders
+        rendered.append(repr(params[index]) if index < len(params) else "?")
+        rendered.append(tail)
+    return "".join(rendered)
 
 
 class SqliteAdapter(SqlAdapterBase):
@@ -66,6 +75,11 @@ class SqliteAdapter(SqlAdapterBase):
         self._read_only = read_only
         # One connection guarded by a lock: FastMCP runs sync tools in a
         # threadpool and the scan worker has a thread of its own.
+        #
+        # The cost is that statements serialise. For a local file each one is
+        # microseconds, and the pool holds one adapter per database rather than
+        # one per thread, so this only bites when several long scans overlap —
+        # at which point the fix is a connection per thread, not a finer lock.
         self._lock = threading.Lock()
         self._conn = self._connect()
         log.info(
