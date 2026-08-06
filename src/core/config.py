@@ -35,12 +35,12 @@ class SourceEngine(StrEnum):
     MONGODB = "mongodb"
     DATALAKE = "datalake"
 
+
 class MissingConnectionEnvError(Exception):
     """`connection_ref` None of the corresponding environment variables exist."""
 
 
 class ConnectionInfo(BaseModel):
-
     host: str | None = None
     port: int | None = None
     user: str | None = None
@@ -51,7 +51,6 @@ class ConnectionInfo(BaseModel):
 
 
 class ServerConfig(BaseModel):
-
     server_name: str = "etl-agent-mcp"
     engine: SourceEngine = SourceEngine.SQLITE
     connection_ref: str | None = None
@@ -62,14 +61,15 @@ class ServerConfig(BaseModel):
     host: str = "127.0.0.1"
     port: int = 8000
 
-    """ 
-    Mandatory verification applies only to cross-network (HTTP-based) requests; 
+    """
+    Mandatory verification applies only to cross-network (HTTP-based) requests;
     stdio communication is trusted at the application level and does not require JWTs.
     """
     require_auth: bool = False
     authorized_keys_dir: Path | None = None
     audience: str = DEFAULT_AUDIENCE
     audit_log_path: Path | None = None
+
 
 def _ref_to_prefix(connection_ref: str) -> str:
     return _REF_NORMALISE.sub("_", connection_ref).strip("_").upper()
@@ -78,7 +78,6 @@ def _ref_to_prefix(connection_ref: str) -> str:
 def resolve_connection(
     connection_ref: str, *, env: Mapping[str, str] | None = None
 ) -> ConnectionInfo:
-
     env = os.environ if env is None else env
     prefix = _ref_to_prefix(connection_ref)
 

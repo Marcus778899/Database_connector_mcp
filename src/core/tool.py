@@ -47,6 +47,9 @@ class ProfileResult(BaseModel):
     top_values: list[TopValue] | None = None
     min_value: str | None = None
     max_value: str | None = None
+    # True when the adapter stopped short of a full scan, so the figures above
+    # describe a prefix of the data rather than all of it.
+    approximate: bool = False
 
 
 @runtime_checkable
