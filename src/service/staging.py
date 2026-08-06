@@ -150,12 +150,22 @@ def _summarise(text: str | None) -> str | None:
 
 
 def _ordinal_cursor(cursor: str) -> int:
-    """A cursor is the last ordinal returned. Anything else starts from the top,
-    rather than failing a read because a caller echoed something odd back."""
+    """
+    A cursor is the last ordinal returned, and nothing else is one.
+
+    Starting from the top instead would answer "the page after X" with page one
+    — the same rows again, with a cursor that leads back to them, and no way
+    for the caller to tell it is going in circles. A cursor is machine-made, so
+    one that will not parse means something is wrong upstream and saying so is
+    the only useful answer.
+    """
     try:
         return int(cursor)
-    except ValueError:
-        return 0
+    except ValueError as exc:
+        raise InvalidCursorError(
+            f"{cursor!r} is not a cursor from a previous page; pass back the "
+            "`next_cursor` you were given, or nothing to start from the first"
+        ) from exc
 
 
 def _reject_source_overlap(staging: Path, source: str | Path | None) -> None:
@@ -321,6 +331,10 @@ class OutdatedStagingSchemaError(StagingError):
 
 class UnknownStagedContainerError(Exception):
     """Nothing has been inventoried under that name."""
+
+
+class InvalidCursorError(Exception):
+    """The cursor did not come from a page this store handed out."""
 
 
 class StagingStore:
@@ -840,9 +854,19 @@ class StagingStore:
             hits.extend(self._container_hits(pattern, database, limit))
         if kind in ("all", "column"):
             hits.extend(self._column_hits(pattern, database, limit))
-        # Name matches first: a keyword in a name is what the caller meant more
-        # often than the same word buried in prose.
-        hits.sort(key=lambda hit: (hit.match_in != "name", hit.container_name))
+        # The order decides what survives the limit below, so it is ranking and
+        # not tidiness. A keyword in a name is what the caller meant more often
+        # than the same word buried in prose; and among equals a container is
+        # the broader answer — "orders" almost always means the table, not some
+        # `orders_count` column, and there are far fewer of them to lose.
+        hits.sort(
+            key=lambda hit: (
+                hit.match_in != "name",
+                hit.column_name is not None,
+                hit.container_name,
+                hit.column_name or "",
+            )
+        )
         return hits[:limit]
 
     def _container_hits(

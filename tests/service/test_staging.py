@@ -23,6 +23,7 @@ from src.service.staging import (
     SOURCE_AI,
     SOURCE_HUMAN,
     ColumnAnnotation,
+    InvalidCursorError,
     NotAStagingStoreError,
     OutdatedStagingSchemaError,
     StagingPathConflictError,
@@ -1033,11 +1034,20 @@ def test_the_profile_can_be_left_out(catalog: StagingStore):
     assert without.column_name == with_profile.column_name
 
 
-def test_a_nonsense_cursor_starts_from_the_top(catalog: StagingStore):
-    """A read should not fail because a caller echoed something odd back."""
-    page = catalog.columns("main", "users", cursor="not-an-ordinal")
+def test_a_cursor_that_is_not_one_is_an_error_rather_than_page_one(
+    catalog: StagingStore,
+):
+    """
+    Answering "the page after X" with page one would hand back the same rows
+    and the same cursor, and an agent following it would go round in circles
+    with nothing to tell it apart from progress.
+    """
+    with pytest.raises(InvalidCursorError, match="next_cursor"):
+        catalog.columns("main", "users", cursor="not-an-ordinal")
 
-    assert [c.column_name for c in page.columns][0] == "id"
+
+def test_no_cursor_still_means_the_first_page(catalog: StagingStore):
+    assert catalog.columns("main", "users", cursor=None).columns[0].column_name == "id"
 
 
 def test_a_long_description_is_cut_down_in_a_search_hit(store: StagingStore):
@@ -1080,3 +1090,41 @@ def test_the_whole_description_is_still_there_to_be_read(store: StagingStore):
     )
 
     assert store.columns("main", "users").columns[0].description == essay.strip()
+
+
+def test_a_container_hit_outranks_a_column_hit_of_the_same_quality(
+    store: StagingStore,
+):
+    """The order decides what survives the limit, so it is ranking, not
+    tidiness: "orders" almost always means the table, and there are far fewer
+    containers to lose."""
+    store.upsert_container(_container("orders"), hash_="h")
+    store.replace_columns("main", None, "orders", [_column("id")])
+    store.upsert_container(_container("a_earlier_table"), hash_="h")
+    store.replace_columns(
+        "main", None, "a_earlier_table", [_column("orders_count", 1, "INTEGER")]
+    )
+
+    hits = store.search("orders")
+
+    assert [(h.container_name, h.column_name) for h in hits] == [
+        ("orders", None),
+        ("a_earlier_table", "orders_count"),
+    ]
+
+
+def test_a_container_hit_does_not_outrank_a_better_column_hit(store: StagingStore):
+    """Match quality still comes first: a name beats a description."""
+    store.upsert_container(_container("users"), hash_="h")
+    store.replace_columns("main", None, "users", [_column("email")])
+    store.upsert_container(
+        _container("logs", native_description="every email we ever sent"), hash_="h"
+    )
+    store.replace_columns("main", None, "logs", [_column("id")])
+
+    hits = store.search("email")
+
+    assert [(h.container_name, h.match_in) for h in hits] == [
+        ("users", "name"),
+        ("logs", "description"),
+    ]

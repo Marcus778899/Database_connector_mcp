@@ -789,3 +789,19 @@ def test_an_export_is_audited_by_what_it_wrote(
     assert record["tool"] == "inventory_export"
     assert record["bytes_written"] > 0
     assert record["rows_returned"] == 4
+
+
+def test_a_bad_cursor_is_a_tool_error_not_a_silent_restart(config, adapter, inventory):
+    """An agent handed page one in answer to "the page after X" has no way to
+    tell it is going in circles."""
+    mcp = build_server(config, adapter, inventory=inventory)
+
+    async def body(call):
+        inventory.wait(await call("inventory_start", {}), timeout=20)
+        return await call(
+            "inventory_columns",
+            {"container": "users", "database": "datalake", "cursor": "nonsense"},
+        )
+
+    with pytest.raises(ToolError, match="next_cursor"):
+        _session(mcp, body)
