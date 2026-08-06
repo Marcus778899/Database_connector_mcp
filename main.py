@@ -18,6 +18,7 @@ from typing import Any
 from fastmcp import FastMCP
 from pydantic import ValidationError
 
+from src.auth import AuthConfigurationError
 from src.core.config import (
     MissingConnectionEnvError,
     ServerConfig,
@@ -69,6 +70,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--export-dir", help="env MCP_EXPORT_DIR")
     parser.add_argument("--audit-log", help="env MCP_AUDIT_LOG")
+    parser.add_argument(
+        "--audit-max-mb",
+        help="rotate the audit trail past this size; 0 never rotates. "
+        "env MCP_AUDIT_MAX_MB",
+    )
+    parser.add_argument(
+        "--audit-backups",
+        help="how many rotated trails to keep. env MCP_AUDIT_BACKUPS",
+    )
     parser.add_argument(
         "--profile-mode",
         action="append",
@@ -144,6 +154,8 @@ def config_from_args(
     pick("staging_db_path", args.staging_db, "MCP_STAGING_DB")
     pick("export_dir", args.export_dir, "MCP_EXPORT_DIR")
     pick("audit_log_path", args.audit_log, "MCP_AUDIT_LOG")
+    pick("audit_max_mb", args.audit_max_mb, "MCP_AUDIT_MAX_MB")
+    pick("audit_backups", args.audit_backups, "MCP_AUDIT_BACKUPS")
     pick("authorized_keys_dir", args.authorized_keys_dir, "MCP_AUTHORIZED_KEYS_DIR")
     pick("audience", args.audience, "MCP_AUDIENCE")
 
@@ -209,7 +221,12 @@ def build(config: ServerConfig) -> FastMCP:
     else:
         log.info("no staging database configured; the inventory tools stay off")
 
-    return build_server(config, provider, inventory=inventory)
+    try:
+        return build_server(config, provider, inventory=inventory)
+    except AuthConfigurationError as exc:
+        # a missing or unusable key directory is a setup mistake, and the
+        # message already says which one
+        raise ConfigurationError(str(exc)) from exc
 
 
 def _run_kwargs(config: ServerConfig) -> dict[str, Any]:
@@ -229,7 +246,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         config = config_from_args(args)
         mcp = build(config)
-    except (ConfigurationError, NotImplementedError, ValueError) as exc:
+    except (ConfigurationError, ValueError) as exc:
         # stderr, never stdout: on stdio that stream carries JSON-RPC
         print(f"error: {exc}", file=sys.stderr)
         return 2

@@ -11,6 +11,9 @@ dependencies = [
 
 [project.scripts]
 mcp-connector = "main:main"
+# Issuing is deliberately its own command: the server verifies tokens and must
+# never be able to mint one.
+mcp-connector-token = "src.auth.cli:main"
 
 [project.optional-dependencies]
 server = [

@@ -154,6 +154,13 @@ def test_an_unknown_profile_mode_is_refused():
         _config([], {"MCP_PROFILE_MODES": "median"})
 
 
+def test_the_audit_rotation_is_configurable():
+    config = _config(["--audit-max-mb", "50"], {"MCP_AUDIT_BACKUPS": "2"})
+
+    assert config.audit_max_mb == 50
+    assert config.audit_backups == 2
+
+
 def test_booleans_come_from_the_environment():
     config = _config(
         ["--transport", "http", "--host", "0.0.0.0"], {"MCP_REQUIRE_AUTH": "true"}

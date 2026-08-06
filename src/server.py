@@ -1,13 +1,15 @@
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Callable
 from contextlib import asynccontextmanager
+from functools import partial
 from typing import Any
 
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from fastmcp.server.dependencies import get_access_token
 
+from src.auth import verifier_from_config
 from src.core.config import ServerConfig
 from src.core.contracts import (
     ColumnInfo,
@@ -25,6 +27,10 @@ from src.service.staging import InventorySummary, StoredColumn, StoredContainerP
 # No token means stdio: the client spawned us and holds our environment.
 LOCAL_KEY_ID = "local"
 
+# Tool name -> the caller's id, or a refusal. `_identity` with the server's
+# authentication requirement already bound in.
+Identify = Callable[[str], str]
+
 
 def build_server(
     config: ServerConfig,
@@ -35,15 +41,18 @@ def build_server(
 ) -> FastMCP:
     """Wire the tools onto a source. Starts nothing; `main` picks the transport.
     The inventory tools appear only when a service is given."""
-    if config.require_auth:
-        raise NotImplementedError(
-            "require_auth=True but no auth provider is implemented yet; see "
-            "docs/authentication.md"
-        )
+    # Built here rather than passed in, so that a server configured to require
+    # authentication cannot be constructed without it. The config validator has
+    # already ruled out require_auth over stdio.
+    auth = verifier_from_config(config) if config.require_auth else None
 
     # a provider has `get`; a bare adapter does not
     provider = source if isinstance(source, AdapterProvider) else SingleAdapter(source)
-    trail = audit or AuditLogger(config.audit_log_path)
+    trail = audit or AuditLogger(
+        config.audit_log_path,
+        max_bytes=config.audit_max_mb * 1024 * 1024,
+        backups=config.audit_backups,
+    )
 
     @asynccontextmanager
     async def lifespan(_: FastMCP) -> AsyncGenerator[None]:
@@ -58,17 +67,31 @@ def build_server(
             provider.close()
             log.info(f"{config.server_name} stopped")
 
-    mcp: FastMCP = FastMCP(name=config.server_name, auth=None, lifespan=lifespan)
-    _register_tools(mcp, config, provider, trail)
+    # Bound once: every tool asks the same question, and whether an unauthenticated
+    # call is acceptable is a property of the server, not of the tool.
+    identify = partial(_identity, require_auth=config.require_auth)
+
+    mcp: FastMCP = FastMCP(name=config.server_name, auth=auth, lifespan=lifespan)
+    _register_tools(mcp, config, provider, trail, identify)
     if inventory is not None:
-        _register_inventory_tools(mcp, inventory, trail)
+        _register_inventory_tools(mcp, inventory, trail, identify)
     return mcp
 
 
-def _identity(tool: str) -> str:
-    """Caller's id, once its scopes are known to cover this tool."""
+def _identity(tool: str, *, require_auth: bool = False) -> str:
+    """
+    Caller's id, once its scopes are known to cover this tool.
+
+    No token means stdio, where the caller already has this process's
+    environment and so already has the database credential — there is nothing
+    left for a check to protect. A server that requires authentication refuses
+    instead: the transport should have turned that call away long before here,
+    and if it did not, answering it would be the one bug that matters.
+    """
     token = get_access_token()
     if token is None:
+        if require_auth:
+            raise ToolError(f"{tool} requires an authenticated caller")
         return LOCAL_KEY_ID
     if tool not in (token.scopes or []):
         raise ToolError(f"{token.subject or token.client_id} may not call {tool}")
@@ -80,6 +103,7 @@ def _register_tools(
     config: ServerConfig,
     provider: AdapterProvider,
     trail: AuditLogger,
+    identify: Identify,
 ) -> None:
     def _adapter(database: str | None) -> SourceAdaptor:
         try:
@@ -91,7 +115,7 @@ def _register_tools(
     def list_databases() -> list[str]:
         """Databases this connection can inventory."""
         with trail.operation(
-            key_id=_identity("list_databases"), tool="list_databases", params={}
+            key_id=identify("list_databases"), tool="list_databases", params={}
         ) as ctx:
             result = provider.list_databases()
             ctx.rows_returned = len(result)
@@ -108,7 +132,7 @@ def _register_tools(
         One page of tables / views / collections. Pass `next_cursor` back as
         `cursor` to continue; it is None on the last page.
         """
-        key_id = _identity("list_containers")
+        key_id = identify("list_containers")
         adapter = _adapter(database)
         params = {
             "database": database,
@@ -129,7 +153,7 @@ def _register_tools(
     @mcp.tool
     def get_schema(container: str, database: str | None = None) -> list[ColumnInfo]:
         """Columns of one container, with key and nullability flags."""
-        key_id = _identity("get_schema")
+        key_id = identify("get_schema")
         adapter = _adapter(database)
         with trail.operation(
             key_id=key_id,
@@ -146,7 +170,7 @@ def _register_tools(
         container: str, limit: int = 3, database: str | None = None
     ) -> list[dict[str, Any]]:
         """A few rows, capped by the server's max_sample_limit."""
-        key_id = _identity("get_sample")
+        key_id = identify("get_sample")
         adapter = _adapter(database)
         capped = max(0, min(limit, config.max_sample_limit))
         with trail.operation(
@@ -170,7 +194,7 @@ def _register_tools(
         One statistic about one column. `approximate` is True when the source
         stopped short of a full scan.
         """
-        key_id = _identity("profile_column")
+        key_id = identify("profile_column")
         adapter = _adapter(database)
         with trail.operation(
             key_id=key_id,
@@ -188,7 +212,10 @@ def _register_tools(
 
 
 def _register_inventory_tools(
-    mcp: FastMCP, inventory: InventoryService, trail: AuditLogger
+    mcp: FastMCP,
+    inventory: InventoryService,
+    trail: AuditLogger,
+    identify: Identify,
 ) -> None:
     store = inventory.store
 
@@ -204,7 +231,7 @@ def _register_inventory_tools(
         `inventory_status`. Unchanged containers are skipped unless `force`, and
         an unfinished run continues from its cursor unless `resume` is False.
         """
-        key_id = _identity("inventory_start")
+        key_id = identify("inventory_start")
         params = {"database": database, "force": force, "resume": resume}
         with trail.operation(
             key_id=key_id, tool="inventory_start", params=params
@@ -218,7 +245,7 @@ def _register_inventory_tools(
     @mcp.tool
     def inventory_status(job_id: str) -> ScanStatus:
         """How far a scan has got, and why it stopped."""
-        key_id = _identity("inventory_status")
+        key_id = identify("inventory_status")
         with trail.operation(
             key_id=key_id, tool="inventory_status", params={"job_id": job_id}
         ):
@@ -227,7 +254,7 @@ def _register_inventory_tools(
     @mcp.tool
     def inventory_cancel(job_id: str) -> bool:
         """Stop a scan after the container in flight. Progress is kept."""
-        key_id = _identity("inventory_cancel")
+        key_id = identify("inventory_cancel")
         with trail.operation(
             key_id=key_id, tool="inventory_cancel", params={"job_id": job_id}
         ):
@@ -236,7 +263,7 @@ def _register_inventory_tools(
     @mcp.tool
     def inventory_summary(database: str | None = None) -> InventorySummary:
         """Counts over what has been inventoried. Ask for this before the rows."""
-        key_id = _identity("inventory_summary")
+        key_id = identify("inventory_summary")
         with trail.operation(
             key_id=key_id, tool="inventory_summary", params={"database": database}
         ):
@@ -249,7 +276,7 @@ def _register_inventory_tools(
         cursor: str | None = None,
     ) -> StoredContainerPage:
         """One page of inventoried containers, newest scan state included."""
-        key_id = _identity("inventory_containers")
+        key_id = identify("inventory_containers")
         params = {"database": database, "limit": limit, "cursor": cursor}
         with trail.operation(
             key_id=key_id, tool="inventory_containers", params=params
@@ -263,7 +290,7 @@ def _register_inventory_tools(
         container: str, database: str, schema: str | None = None
     ) -> list[StoredColumn]:
         """Recorded columns of one container, with any profile gathered."""
-        key_id = _identity("inventory_columns")
+        key_id = identify("inventory_columns")
         params = {"container": container, "database": database, "schema": schema}
         with trail.operation(
             key_id=key_id, tool="inventory_columns", params=params
