@@ -11,6 +11,7 @@ def _find_dotenv(filename: str, start: Path) -> Path | None:
             return candidate
     return None
 
+
 def parse_dotenv(text: str) -> dict[str, str]:
     result: dict[str, str] = {}
     for raw_line in text.splitlines():
@@ -30,6 +31,7 @@ def parse_dotenv(text: str) -> dict[str, str]:
             value = value[1:-1]
         result[key] = value
     return result
+
 
 def load_repo_dotenv(
     *,

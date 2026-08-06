@@ -3,13 +3,14 @@ from src.core.config import (
     resolve_connection,
     _ref_to_prefix,
     MissingConnectionEnvError,
-    ConnectionInfo,
 )
+
 
 def test_ref_to_prefix():
     assert _ref_to_prefix("my-db") == "MY_DB"
     assert _ref_to_prefix("my.db") == "MY_DB"
     assert _ref_to_prefix("my_db_conn") == "MY_DB_CONN"
+
 
 def test_resolve_connection_valid():
     env = {
@@ -26,16 +27,16 @@ def test_resolve_connection_valid():
     assert conn.password == "password123"
     assert conn.database == "testdb"
 
+
 def test_resolve_connection_uri():
-    env = {
-        "MY_DB_URI": "sqlite:///test.db"
-    }
+    env = {"MY_DB_URI": "sqlite:///test.db"}
     conn = resolve_connection("my-db", env=env)
     assert conn.uri == "sqlite:///test.db"
 
+
 def test_resolve_connection_missing():
-    env = {
-        "OTHER_DB_HOST": "localhost"
-    }
-    with pytest.raises(MissingConnectionEnvError, match="Could not find any environment variables"):
+    env = {"OTHER_DB_HOST": "localhost"}
+    with pytest.raises(
+        MissingConnectionEnvError, match="Could not find any environment variables"
+    ):
         resolve_connection("my-db", env=env)
