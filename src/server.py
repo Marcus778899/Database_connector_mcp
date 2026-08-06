@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import AsyncGenerator, Callable
 from contextlib import asynccontextmanager
 from functools import partial
-from typing import Any
+from typing import Any, Literal
 
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
@@ -22,13 +22,17 @@ from src.core.log import log
 from src.service.audit import AuditLogger
 from src.service.inventory import InventoryService, ScanStatus
 from src.service.pool import AdapterPool, AdapterProvider, SingleAdapter
+from src.service.export import ExportFormat, ExportResult, export_inventory
 from src.service.staging import (
+    DEFAULT_COLUMN_PAGE,
+    DEFAULT_SEARCH_LIMIT,
     SOURCE_AI,
     SOURCE_HUMAN,
     AnnotateResult,
     ColumnAnnotation,
     InventorySummary,
-    StoredColumn,
+    SearchHit,
+    StoredColumnPage,
     StoredContainerPage,
 )
 
@@ -85,7 +89,7 @@ def build_server(
     mcp: FastMCP = FastMCP(name=config.server_name, auth=auth, lifespan=lifespan)
     _register_tools(mcp, config, provider, trail, identify)
     if inventory is not None:
-        _register_inventory_tools(mcp, inventory, trail, identify)
+        _register_inventory_tools(mcp, config, inventory, trail, identify)
     return mcp
 
 
@@ -242,6 +246,7 @@ def _register_tools(
 
 def _register_inventory_tools(
     mcp: FastMCP,
+    config: ServerConfig,
     inventory: InventoryService,
     trail: AuditLogger,
     identify: Identify,
@@ -316,17 +321,70 @@ def _register_inventory_tools(
 
     @mcp.tool
     def inventory_columns(
-        container: str, database: str, schema: str | None = None
-    ) -> list[StoredColumn]:
-        """Recorded columns of one container, with any profile gathered."""
+        container: str,
+        database: str,
+        schema: str | None = None,
+        limit: int = DEFAULT_COLUMN_PAGE,
+        cursor: str | None = None,
+        include_profile: bool = True,
+    ) -> StoredColumnPage:
+        """
+        One page of a container's recorded columns, in ordinal order.
+
+        Pass `next_cursor` back as `cursor` to continue. On a wide table the
+        profiles are most of the weight, so `include_profile=False` is the way
+        to read its shape without them.
+        """
         key_id = identify("inventory_columns")
-        params = {"container": container, "database": database, "schema": schema}
+        params = {
+            "container": container,
+            "database": database,
+            "schema": schema,
+            "limit": limit,
+            "cursor": cursor,
+            "include_profile": include_profile,
+        }
         with trail.operation(
             key_id=key_id, tool="inventory_columns", params=params
         ) as ctx:
-            columns = _guard(store.columns)(database, container, schema)
-            ctx.rows_returned = len(columns)
-            return columns
+            page = _guard(store.columns)(
+                database,
+                container,
+                schema,
+                limit=limit,
+                cursor=cursor,
+                include_profile=include_profile,
+            )
+            ctx.rows_returned = len(page.columns)
+            return page
+
+    @mcp.tool
+    def inventory_search(
+        keyword: str,
+        database: str | None = None,
+        kind: Literal["all", "container", "column"] = "all",
+        limit: int = DEFAULT_SEARCH_LIMIT,
+    ) -> list[SearchHit]:
+        """
+        Containers and columns whose name or description mentions `keyword`.
+
+        Where to start when the catalog is too big to read: ask this, then
+        `inventory_columns` for the one container that looked right. Hits carry
+        no statistics, so a hundred of them still cost little.
+        """
+        key_id = identify("inventory_search")
+        params = {
+            "keyword": keyword,
+            "database": database,
+            "kind": kind,
+            "limit": limit,
+        }
+        with trail.operation(
+            key_id=key_id, tool="inventory_search", params=params
+        ) as ctx:
+            hits = _guard(store.search)(keyword, database, kind=kind, limit=limit)
+            ctx.rows_returned = len(hits)
+            return hits
 
     @mcp.tool
     def inventory_annotate(
@@ -366,6 +424,43 @@ def _register_inventory_tools(
             )
             # what a write cost, the counterpart of rows_returned for a read
             ctx.extra["columns_written"] = result.columns_updated
+            return result
+
+    # Last, and only with somewhere to write: an export has nowhere to go
+    # otherwise, so the tool is not served at all rather than served and failing
+    # on every call.
+    if config.export_dir is None:
+        log.info("no export directory configured; inventory_export stays off")
+        return
+
+    @mcp.tool
+    def inventory_export(
+        format: ExportFormat = "markdown",
+        database: str | None = None,
+        path: str | None = None,
+    ) -> ExportResult:
+        """
+        Write the whole inventory to a file and return **only where it went**.
+
+        This is how a full sweep is delivered: the catalog itself never travels
+        through a tool result. `markdown` is a data dictionary to read, `csv` a
+        row per column, `dbt_yaml` a `schema.yml` for a dbt project. `path` is
+        relative to the server's export directory and cannot leave it.
+        """
+        key_id = identify("inventory_export")
+        params = {"format": format, "database": database, "path": path}
+        with trail.operation(
+            key_id=key_id, tool="inventory_export", params=params
+        ) as ctx:
+            result = _guard(export_inventory)(
+                store,
+                config.export_dir,
+                format=format,
+                database=database,
+                path=path,
+            )
+            ctx.rows_returned = result.columns
+            ctx.extra["bytes_written"] = result.bytes_written
             return result
 
 

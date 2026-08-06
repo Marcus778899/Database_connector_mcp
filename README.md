@@ -63,7 +63,7 @@ Every other setting has a flag and an `MCP_*` variable, and the flag wins:
 | `--host` / `--port` | `MCP_HOST` / `MCP_PORT` | `127.0.0.1` / `8000` |
 | `--max-sample-limit` | `MCP_MAX_SAMPLE_LIMIT` | `100` |
 | `--staging-db` | `MCP_STAGING_DB` | unset — **no inventory tools** |
-| `--export-dir` | `MCP_EXPORT_DIR` | unset |
+| `--export-dir` | `MCP_EXPORT_DIR` | unset — **no export tool** |
 | `--audit-log` | `MCP_AUDIT_LOG` | unset — log only |
 | `--audit-max-mb` | `MCP_AUDIT_MAX_MB` | `10` — `0` never rotates |
 | `--audit-backups` | `MCP_AUDIT_BACKUPS` | `5` |
@@ -212,11 +212,44 @@ any single tool call, so it runs in the background:
 | `inventory_cancel` | stop after the container in flight; progress is kept |
 | `inventory_summary` | counts over what has been inventoried — **ask for this first** |
 | `inventory_containers` | one page of inventoried containers |
-| `inventory_columns` | recorded columns of one container |
+| `inventory_columns` | one page of a container's columns |
+| `inventory_search` | containers and columns matching a keyword |
 | `inventory_annotate` | describe a table or its columns |
 
 A scan resumes from its cursor if it dies, and skips containers whose schema
 fingerprint has not changed.
+
+One more appears when `--export-dir` is set: `inventory_export`.
+
+## Reading a catalog that will not fit
+
+A catalog of any size does not belong in an agent's context, and the fix is not
+a bigger window — it is not putting it there:
+
+| you want | ask for |
+|---|---|
+| how big is this | `inventory_summary` — counts only, a few hundred bytes |
+| where is the thing I mean | `inventory_search` — narrow hits, no statistics |
+| what is in this table | `inventory_columns` — one page, `include_profile=False` on a wide one |
+| all of it | `inventory_export` — **a file**, and only its path comes back |
+
+`inventory_export` writes `markdown` (a data dictionary to read), `csv` (a row
+per column) or `dbt_yaml` (a `schema.yml` for a dbt project), and returns where
+it wrote and how much — never the contents. That is what makes "inventory the
+whole warehouse" a request this server can answer.
+
+```bash
+uv run mcp-connector --engine sqlite --connection-ref shop \
+    --staging-db ./var/staging.db --export-dir ./var/exports
+```
+
+Without `--export-dir` the tool is not served at all: there would be nowhere to
+put what it writes. A path given to it is relative to that directory and cannot
+leave it — `../` and symlinks are resolved before the check, because the caller
+is an agent relaying a path someone gave it.
+
+The budgets are measured, not hoped for: `tests/test_context_budget.py` builds a
+500-table catalog and asserts what each tool costs.
 
 ## Descriptions
 

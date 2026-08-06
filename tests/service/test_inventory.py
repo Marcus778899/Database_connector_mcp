@@ -175,7 +175,10 @@ def test_the_scan_writes_the_inventory_to_staging(
     summary = store.summary("main")
     assert summary.containers == 2
     assert summary.columns == 4
-    assert [c.column_name for c in store.columns("main", "users")] == ["id", "email"]
+    assert [c.column_name for c in store.columns("main", "users").columns] == [
+        "id",
+        "email",
+    ]
 
 
 def test_status_tracks_the_last_container_processed(
@@ -242,7 +245,7 @@ def test_a_changed_schema_is_rescanned(adapter: FakeAdapter, store: StagingStore
 
     assert status.containers_done == 1
     assert status.containers_skipped == 1
-    assert len(store.columns("main", "users")) == 3
+    assert len(store.columns("main", "users").columns) == 3
 
 
 def test_force_rescans_even_when_nothing_changed(
@@ -440,7 +443,7 @@ def test_requested_modes_are_profiled_and_stored(
 
     assert len(adapter.profile_calls) == 4  # 2 containers x 2 columns
     assert store.summary("main").columns_profiled == 4
-    profile = store.columns("main", "users")[0].profile
+    profile = store.columns("main", "users").columns[0].profile
     assert profile is not None
     assert profile["null_ratio"]["null_ratio"] == 0.5
 
@@ -498,8 +501,8 @@ def test_a_column_that_cannot_be_profiled_does_not_fail_the_scan(
 
     assert status.state == "done"
     assert status.containers_done == 2
-    assert store.columns("main", "orders")[0].profile is None
-    assert store.columns("main", "users")[0].profile is not None
+    assert store.columns("main", "orders").columns[0].profile is None
+    assert store.columns("main", "users").columns[0].profile is not None
 
 
 # ---- concurrency ----
