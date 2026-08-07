@@ -381,6 +381,47 @@ def test_a_uri_is_never_quoted_back(caplog):
     assert "SHOP_URI" in described
 
 
+def test_test_connection_reports_a_source_it_can_reach(
+    source_env: str, monkeypatch: pytest.MonkeyPatch, capsys
+):
+    monkeypatch.setenv("MCP_CONNECTION_REF", source_env)
+
+    assert entry.main(["test-connection"]) == 0
+    assert "login is accepted" in capsys.readouterr().out
+
+
+def test_test_connection_reports_one_it_cannot(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys
+):
+    """
+    The command exists for exactly this: `connection_check=require` stops the
+    server starting, and a server that is not running cannot be exec'd into to
+    find out why.
+    """
+    monkeypatch.setenv("LOCAL_PATH", str(tmp_path / "nope" / "missing.db"))
+    monkeypatch.setenv("MCP_CONNECTION_REF", "local")
+
+    assert entry.main(["test-connection"]) == 1
+    assert "cannot reach" in capsys.readouterr().err
+
+
+def test_test_connection_answers_even_when_the_check_is_off(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys
+):
+    """Someone running this has asked the question directly; `off` should not
+    turn the answer into silence."""
+    monkeypatch.setenv("LOCAL_PATH", str(tmp_path / "nope" / "missing.db"))
+    monkeypatch.setenv("MCP_CONNECTION_REF", "local")
+    monkeypatch.setenv("MCP_CONNECTION_CHECK", "off")
+
+    assert entry.main(["test-connection"]) == 1
+
+
+def test_test_connection_needs_a_ref(capsys):
+    assert entry.main(["test-connection"]) == 2
+    assert "no connection" in capsys.readouterr().err
+
+
 def test_the_check_is_required_by_default():
     assert ServerConfig().connection_check == "require"
 

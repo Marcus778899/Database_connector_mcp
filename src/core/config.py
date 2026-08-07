@@ -69,6 +69,14 @@ class ConnectionInfo(BaseModel):
     # SQL Server with a self-signed certificate is the common case, but so is
     # a certificate that stopped verifying for a reason worth knowing about.
     trust_server_certificate: bool = False
+    # The `<REF>_` these values were read from, carried so that an adapter's
+    # errors can name the variable to change rather than a `<REF>` placeholder
+    # the reader then has to translate. Empty when the info was built directly.
+    prefix: str = ""
+
+    def variable(self, suffix: str) -> str:
+        """`SHOP_TRUST_SERVER_CERTIFICATE`, for an error message to point at."""
+        return f"{self.prefix or '<REF>'}_{suffix}"
 
 
 class ServerConfig(BaseModel):
@@ -185,8 +193,12 @@ def resolve_connection(
         log.critical(message)
         raise MissingConnectionEnvError(message)
 
+    # The line an operator checks first when a variable did not take effect, so
+    # it lists what was actually found and nothing else.
     log.info(
         f"resolved connection {connection_ref!r} from {prefix}_* "
         f"({', '.join(sorted(values))})"
     )
-    return ConnectionInfo.model_validate(values)
+    # Not one of the settings: the prefix itself, carried so that an adapter's
+    # errors can name the variable to change instead of a `<REF>` placeholder.
+    return ConnectionInfo.model_validate({**values, "prefix": prefix})

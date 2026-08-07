@@ -72,6 +72,7 @@ class MssqlAdapter(DbApiAdapterBase):
         database: str = "",
         driver: str | None = None,
         trust_server_certificate: bool = False,
+        trust_variable: str = "<REF>_TRUST_SERVER_CERTIFICATE",
         login_timeout: int | None = None,
         max_sample_limit: int | None = None,
     ) -> None:
@@ -79,6 +80,10 @@ class MssqlAdapter(DbApiAdapterBase):
         self._login_timeout = (
             self.DEFAULT_LOGIN_TIMEOUT if login_timeout is None else login_timeout
         )
+        # The variable an operator would actually type, so the certificate error
+        # can name `SHOP_TRUST_SERVER_CERTIFICATE` rather than a placeholder the
+        # reader has to translate — and would otherwise paste verbatim.
+        self._trust_var = trust_variable
         self._connection_string = connection_string or _build_connection_string(
             driver=driver or self.DEFAULT_DRIVER,
             host=host or "127.0.0.1",
@@ -121,7 +126,7 @@ class MssqlAdapter(DbApiAdapterBase):
             )
         except pyodbc.Error as exc:
             raise _connection_error(
-                exc, self._connection_string, self._login_timeout
+                exc, self._connection_string, self._login_timeout, self._trust_var
             ) from exc
 
     def _after_connect(self) -> None:
@@ -142,8 +147,9 @@ class MssqlAdapter(DbApiAdapterBase):
     ) -> MssqlAdapter:
         if not conn_info.uri and not conn_info.host:
             raise ValueError(
-                "The mssql connection requires a <REF>_HOST, or a <REF>_URI "
-                "holding a full odbc connection string (DRIVER={…};SERVER=…)."
+                f"The mssql connection requires a {conn_info.variable('HOST')}, or a "
+                f"{conn_info.variable('URI')} holding a full odbc connection "
+                f"string (DRIVER={{…}};SERVER=…)."
             )
         return cls(
             connection_string=conn_info.uri,
@@ -153,6 +159,7 @@ class MssqlAdapter(DbApiAdapterBase):
             password=conn_info.password,
             database=database or conn_info.database or "",
             trust_server_certificate=conn_info.trust_server_certificate,
+            trust_variable=conn_info.variable("TRUST_SERVER_CERTIFICATE"),
             max_sample_limit=max_sample_limit,
         )
 
@@ -449,9 +456,11 @@ _CONNECTION_HINTS: tuple[tuple[str, str, str], ...] = (
         "08001",
         "certificate verify failed",
         "{server} presented a certificate this host does not trust, which is what "
-        "a self-signed certificate looks like. Set <REF>_TRUST_SERVER_CERTIFICATE=1 "
-        "to keep the encryption and skip the check, or install the issuing CA "
-        "where the container can see it.",
+        "a self-signed certificate looks like — and what a client with 'trust "
+        "server certificate' ticked, such as DBeaver, connects through without "
+        "saying so. Put `{trust}=1` in the environment (the .env the server "
+        "reads) to keep the encryption and skip the check, or install the "
+        "issuing CA where the container can see it.",
     ),
     (
         "08001",
@@ -489,7 +498,7 @@ def _server_of(connection_string: str) -> str:
 
 
 def _connection_error(
-    exc: Exception, connection_string: str, timeout: int
+    exc: Exception, connection_string: str, timeout: int, trust_var: str
 ) -> MssqlConnectionError:
     """
     Turn pyodbc's tuple into one sentence naming the thing to change.
@@ -509,7 +518,11 @@ def _connection_error(
         if phrase and phrase not in lowered:
             continue
         return MssqlConnectionError(
-            hint.format(server=_server_of(connection_string), timeout=timeout)
+            hint.format(
+                server=_server_of(connection_string),
+                timeout=timeout,
+                trust=trust_var,
+            )
             + f" (odbc {sqlstate}: {detail})"
         )
     return MssqlConnectionError(f"mssql connection failed (odbc {sqlstate}: {detail})")

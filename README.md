@@ -130,6 +130,15 @@ SHOP_TRUST_SERVER_CERTIFICATE=1
 **加密仍然開著**，關掉的只是「對方是不是它宣稱的那個人」這項驗證——也就是說這條連線
 可以被中間人攔截，只適合你控制的網段。打開時 server 會在 log 裡講一次。
 
+DBeaver、SSMS 這類客戶端預設就勾著「信任伺服器憑證」，所以它們連得過而且不會提這件
+事。**用 GUI 連得上不代表這裡連得上**，兩邊的預設剛好相反。
+
+先確認再改設定：
+
+```bash
+docker compose run --rm server test-connection
+```
+
 ---
 
 ## 角色與身分
@@ -269,22 +278,29 @@ client 會展開變數，而且啟動它的 shell 就是你 `export` 的那個 s
 `.env` 的 `MCP_ENGINE` 和 image 對不上。`docker compose up -d --build`。
 
 **`cannot reach …` 而且 server 起不來**
-啟動時的連線檢查擋下來了，後面接著的就是真正的原因（見下面幾條）。要先讓 server 起
-來再慢慢查，設 `MCP_CONNECTION_CHECK=warn`。
+啟動時的連線檢查擋下來了，後面接著的就是真正的原因（見下面幾條）。
+
+server 沒起來就 `exec` 不進去，所以排查用這個——它在一個用完就丟的容器裡跑，設定跟
+server 完全一樣，但不服務任何東西：
+
+```bash
+docker compose run --rm server test-connection
+```
+
+它回報的是**登入**成功與否，不是只有 ping 到 IP。要先讓 server 起來再慢慢查，設
+`MCP_CONNECTION_CHECK=warn`。
 
 **`Login timeout expired (HYT00)`**
 連不到。容器裡的 `localhost` 是容器自己——資料庫跑在 docker host 上的話要用
-`SHOP_HOST=host.docker.internal`。確認路由：
-
-```bash
-docker compose exec server python -c "import socket;socket.create_connection(('192.168.0.142',1433),5);print('ok')"
-```
+`SHOP_HOST=host.docker.internal`。
 
 **`Login failed for user (28000)`**
 連得到，但帳密或預設資料庫不對。網路沒問題。
 
 **`certificate verify failed`**
-自簽憑證，見 [mssql 的自簽憑證](#mssql-的自簽憑證)。
+自簽憑證。`SHOP_TRUST_SERVER_CERTIFICATE=1`，見
+[mssql 的自簽憑證](#mssql-的自簽憑證)。**DBeaver 連得過不代表這裡連得過**——它預設
+就勾著 "Trust server certificate"，而且不會告訴你。
 
 **`InvalidSignatureError`**
 `docker compose down -v` 會帶走金鑰的 volume，但留下 bind mount 的 `./out`——手上那

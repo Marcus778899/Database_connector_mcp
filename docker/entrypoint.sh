@@ -347,10 +347,11 @@ case "$1" in
     -*)
         cmd_serve "$@"
         ;;
-    # The CLI's own subcommands, passed straight through. `role list` is the
-    # one worth knowing about: it answers "what can I put in
-    # PROVISION_IDENTITIES" without starting anything.
-    token | role)
+    # The CLI's own subcommands, passed straight through. Two are worth knowing
+    # about: `role list` answers "what can I put in PROVISION_IDENTITIES", and
+    # `test-connection` answers "why will the server not start" — which cannot
+    # be asked of the server itself, because it is not running.
+    token | role | test-connection)
         exec mcp-connector "$@"
         ;;
     *)

@@ -45,6 +45,8 @@ from src.service.staging import StagingError, StagingStore
 
 _TRANSPORTS: tuple[str, ...] = ("stdio", "http", "streamable-http", "sse")
 _CONNECTION_CHECKS: tuple[str, ...] = ("require", "warn", "off")
+
+TEST_CONNECTION_COMMAND = "test-connection"
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 _FALSY = frozenset({"0", "false", "no", "off"})
 
@@ -136,6 +138,19 @@ def build_parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command")
     add_token_command(commands)
     add_role_command(commands)
+    commands.add_parser(
+        TEST_CONNECTION_COMMAND,
+        help="open one connection to the configured source and report, without "
+        "serving anything",
+        description=(
+            "The same check `serve` runs before it binds a port, on its own. It "
+            "exists because that check refuses to start the server, and a server "
+            "that will not start cannot be exec'd into to work out why: this runs "
+            "in a throwaway container with the same configuration. Reports the "
+            "login as well as the address — reaching the port proves neither the "
+            "credentials nor the database."
+        ),
+    )
     return parser
 
 
@@ -277,6 +292,39 @@ def verify_connection(
     log.info(f"connected to {target}: the address answers and the login is accepted")
 
 
+def run_test_connection(config: ServerConfig) -> int:
+    """
+    Connect once, say what happened, exit. Nothing is served.
+
+    Deliberately ignores `connection_check`: someone running this has asked the
+    question directly, and `off` should not turn the answer into silence.
+    """
+    if not config.connection_ref:
+        print(
+            "error: no connection: pass --connection-ref (or MCP_CONNECTION_REF)",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        conn_info = resolve_connection(config.connection_ref)
+        load_adapter_class(config.engine)
+    except (MissingConnectionEnvError, AdapterNotAvailableError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    target = describe_source(config, conn_info)
+    pool = AdapterPool(config.engine, conn_info, default_database=config.database)
+    try:
+        pool.get()
+    except Exception as exc:  # noqa: BLE001 - every driver has its own errors
+        print(f"cannot reach {target}\n\n{exc}", file=sys.stderr)
+        return 1
+    finally:
+        pool.close()
+    print(f"connected to {target}: the address answers and the login is accepted")
+    return 0
+
+
 def build(config: ServerConfig, *, check_connection: bool = False) -> FastMCP:
     """
     Wire the tools onto the configured source.
@@ -365,6 +413,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         return run_token_command(args)
     if command == ROLE_COMMAND:
         return run_role_command(args)
+    if command == TEST_CONNECTION_COMMAND:
+        try:
+            return run_test_connection(config_from_args(args))
+        except (ConfigurationError, ValueError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
 
     try:
         config = config_from_args(args)

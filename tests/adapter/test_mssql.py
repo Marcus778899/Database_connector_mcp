@@ -72,6 +72,33 @@ def test_from_connection_without_a_host_or_uri_is_refused():
         MssqlAdapter.from_connection(ConnectionInfo(user="reader"))
 
 
+def test_the_missing_variable_is_named_as_it_would_be_typed():
+    """`<REF>` is a placeholder to a reader and a literal to anyone pasting."""
+    with pytest.raises(ValueError, match="SHOP_HOST"):
+        MssqlAdapter.from_connection(ConnectionInfo(user="reader", prefix="SHOP"))
+
+
+def test_the_certificate_hint_names_the_real_variable(connected, monkeypatch):
+    """
+    The bug this guards: the hint said `<REF>_TRUST_SERVER_CERTIFICATE=1`, so
+    the one thing it existed to tell you was the one thing it did not say.
+    """
+    conn = ConnectionInfo(host="db.internal", prefix="SHOP")
+    adapter = MssqlAdapter.from_connection(conn)
+
+    def refuse(*_args: object, **_kwargs: object):
+        raise mssql.pyodbc.Error(
+            "08001", "SSL Provider: certificate verify failed:self-signed certificate"
+        )
+
+    monkeypatch.setattr(mssql.pyodbc, "connect", refuse)
+
+    with pytest.raises(
+        mssql.MssqlConnectionError, match="SHOP_TRUST_SERVER_CERTIFICATE=1"
+    ):
+        adapter._connect()
+
+
 def test_the_connection_string_is_built_from_the_parts(connected):
     MssqlAdapter.from_connection(
         ConnectionInfo(
@@ -144,7 +171,9 @@ def test_the_login_timeout_is_longer_than_the_drivers_own():
             "08001",
             "SSL Provider: [error:0A000086:SSL routines::certificate verify failed:"
             "self-signed certificate]",
-            "TRUST_SERVER_CERTIFICATE",
+            # The variable as it would actually be typed, not a `<REF>`
+            # placeholder someone then pastes verbatim into their .env.
+            "SHOP_TRUST_SERVER_CERTIFICATE=1",
         ),
         ("28000", "Login failed for user 'reader'", "refused the login"),
         ("IM002", "Data source name not found", "MCP_ENGINE=mssql"),
@@ -161,6 +190,7 @@ def test_a_failed_login_says_what_to_change(sqlstate: str, detail: str, expected
         Exception(sqlstate, detail),
         "DRIVER={x};SERVER=192.168.0.142,1433;PWD=s3cret",
         30,
+        "SHOP_TRUST_SERVER_CERTIFICATE",
     )
 
     assert expected in str(error)
@@ -173,6 +203,7 @@ def test_a_failed_login_does_not_repeat_the_password():
         Exception("28000", "Login failed"),
         "DRIVER={x};SERVER=db.internal,1433;UID=reader;PWD=s3cret",
         30,
+        "SHOP_TRUST_SERVER_CERTIFICATE",
     )
 
     assert "s3cret" not in str(error)
