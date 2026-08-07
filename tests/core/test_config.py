@@ -48,6 +48,47 @@ def test_resolve_connection_missing():
         resolve_connection("my-db", env=env)
 
 
+def test_the_certificate_is_checked_unless_told_otherwise():
+    """The default is the strict one. An on-premises server with a self-signed
+    certificate is common, but so is a certificate that stopped verifying for a
+    reason somebody should hear about."""
+    conn = resolve_connection("my-db", env={"MY_DB_HOST": "localhost"})
+
+    assert conn.trust_server_certificate is False
+
+
+@pytest.mark.parametrize("raw", ["1", "true", "TRUE", "yes", "on"])
+def test_trusting_the_certificate_is_opt_in(raw: str):
+    env = {"MY_DB_HOST": "localhost", "MY_DB_TRUST_SERVER_CERTIFICATE": raw}
+
+    assert resolve_connection("my-db", env=env).trust_server_certificate is True
+
+
+@pytest.mark.parametrize("raw", ["0", "false", "no", "off"])
+def test_the_flag_can_be_turned_off_explicitly(raw: str):
+    env = {"MY_DB_HOST": "localhost", "MY_DB_TRUST_SERVER_CERTIFICATE": raw}
+
+    assert resolve_connection("my-db", env=env).trust_server_certificate is False
+
+
+def test_a_flag_that_is_neither_is_refused():
+    """Read as False it fails later as a certificate error; read as True it
+    turns off a check the operator thought was on. Neither is worth guessing."""
+    env = {"MY_DB_HOST": "localhost", "MY_DB_TRUST_SERVER_CERTIFICATE": "maybe"}
+
+    with pytest.raises(ValueError, match="expects a boolean"):
+        resolve_connection("my-db", env=env)
+
+
+def test_a_flag_on_its_own_is_not_a_connection():
+    """Half a configuration should read as the missing host, not as a
+    connection with nothing in it."""
+    env = {"MY_DB_TRUST_SERVER_CERTIFICATE": "1"}
+
+    with pytest.raises(MissingConnectionEnvError):
+        resolve_connection("my-db", env=env)
+
+
 def test_the_default_config_is_stdio_without_auth():
     config = ServerConfig()
 

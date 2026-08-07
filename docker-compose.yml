@@ -1,0 +1,119 @@
+# The split that matters is in the volumes, not in the images: `provision`
+# holds the signing key and never listens, `server` listens and never sees a
+# signing key. Losing the server therefore does not get you the ability to
+# issue yourself a token.
+#
+# MCP_ENGINE is named once, in .env, and reaches both the build (which drivers
+# to install) and the runtime (which adapter to use). The tag carries it too,
+# because `docker compose up` without --build reuses whatever image already has
+# the name: a tag that stayed the same while the engine changed would hand you
+# a container configured for one engine and carrying another's drivers.
+
+name: database-mcp-connector
+
+# Both services run this one image. Only `provision` declares how to build it:
+# two services sharing an image name and each carrying a `build:` become two
+# bake targets that build concurrently and then race to export the same tag,
+# which fails with `image "…": already exists` — and the second `up` then
+# succeeds, because by that point the loser's work is on disk. `provision` is
+# the one that builds because `server` waits for it anyway, so the image is
+# always there before anything needs to start.
+x-image: &image
+  image: database-mcp-connector:${MCP_ENGINE:-sqlite}
+
+# What the server is, shared by both services. `provision` needs it not to
+# serve anything but to describe it: which tools exist depends on whether a
+# staging database and an export directory were configured, and a SKILL.md
+# naming tools that are not registered costs the agent turns to find out.
+x-shape: &shape
+  MCP_SERVER_NAME: ${MCP_SERVER_NAME:-etl-agent-mcp}
+  MCP_AUDIENCE: ${MCP_AUDIENCE:-etl-agent-mcp}
+  MCP_TRANSPORT: streamable-http
+  MCP_ENGINE: ${MCP_ENGINE:-sqlite}
+  # Names the prefix of the <REF>_HOST / <REF>_URI / <REF>_PATH … variables.
+  # The connection itself is never a build argument: that would put it in
+  # `docker history`.
+  MCP_CONNECTION_REF: ${MCP_CONNECTION_REF:-shop}
+  # State, all of it on the volume rather than in the image.
+  MCP_STAGING_DB: /data/staging.db
+  MCP_EXPORT_DIR: /data/export
+
+services:
+  # One-shot. `server` waits for this to exit 0, so a failed provision keeps
+  # the server down rather than serving an allowlist nobody is in.
+  provision:
+    <<: *image
+    build:
+      context: .
+      args:
+        MCP_ENGINES: ${MCP_ENGINE:-sqlite}
+    command: provision
+    restart: "no"
+    environment:
+      <<: *shape
+      # `<kid>=<role>` pairs: the agent's name, and what it may do. Each gets
+      # its own key pair, its own token and its own bundle under ./out, with a
+      # SKILL.md describing that role and no other. Roles are defined in
+      # docker/roles.toml — `docker compose run --rm provision role list`.
+      PROVISION_IDENTITIES: ${PROVISION_IDENTITIES:-de=de,pm=pm}
+      PROVISION_LIFETIME: ${PROVISION_LIFETIME:-}
+      PROVISION_LANG: ${PROVISION_LANG:-zh-TW}
+      # Where the agent will reach the server from, which the container cannot
+      # work out for itself — it only knows the port it bound inside.
+      PROVISION_PUBLIC_URL: ${PROVISION_PUBLIC_URL:-http://localhost:${MCP_PUBLISHED_PORT:-8000}/mcp}
+    volumes:
+      - mcp-keys:/keys # public halves, shared with the server
+      - mcp-private:/private # signing key, deliberately not shared
+      - ./out:/out # the tokens, for you to collect
+      # Uncomment to edit the roles without rebuilding the image.
+      # - ./docker/roles.toml:/etc/mcp/roles.toml:ro
+
+  server:
+    <<: *image
+    command: serve
+    restart: unless-stopped
+    depends_on:
+      provision:
+        condition: service_completed_successfully
+    environment:
+      <<: *shape
+      MCP_HOST: 0.0.0.0
+      MCP_PORT: 8000
+      MCP_REQUIRE_AUTH: "true"
+      MCP_AUTHORIZED_KEYS_DIR: /keys
+      MCP_AUDIT_LOG: /data/audit/audit.jsonl
+    # Connection secrets come from a file git never sees. SHOP_HOST,
+    # SHOP_USER, SHOP_PASSWORD, SHOP_DB … for MCP_CONNECTION_REF=shop.
+    env_file:
+      - path: .env
+        required: false
+    volumes:
+      - mcp-keys:/keys:ro # read-only: the server only ever verifies
+      - mcp-data:/data
+      # A file-backed engine needs its source reachable from inside the
+      # container, and read-only says the connector is not the thing that
+      # writes to it. Networked engines want nothing here.
+      #   MCP_ENGINE=sqlite   SHOP_PATH=/source/shop.db
+      #   MCP_ENGINE=datalake SHOP_PATH=/source
+      # - ./shop.db:/source/shop.db:ro
+    ports:
+      - "${MCP_PUBLISHED_PORT:-8000}:8000"
+    healthcheck:
+      # The MCP endpoint answers only to a proper session, so this checks the
+      # one thing a probe can honestly check: that the port is accepting.
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import socket; socket.create_connection(('127.0.0.1', 8000), 3).close()",
+        ]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+volumes:
+  mcp-keys:
+  mcp-private:
+  mcp-data:

@@ -68,32 +68,40 @@ def test_create_adapter_rejects_unknown_engine():
     [
         (SourceEngine.SQLITE, "SqliteAdapter"),
         (SourceEngine.DATALAKE, "DatalakeAdapter"),
+        (SourceEngine.POSTGRES, "PostgresAdapter"),
+        (SourceEngine.MYSQL, "MysqlAdapter"),
+        # one adapter serves both: mariadb is a fork with the same catalog
+        (SourceEngine.MARIADB, "MysqlAdapter"),
+        (SourceEngine.MSSQL, "MssqlAdapter"),
+        (SourceEngine.MONGODB, "MongoAdapter"),
+        (SourceEngine.MCP, "RemoteMcpAdapter"),
     ],
 )
 def test_load_implemented_adapter(engine: SourceEngine, expected: str):
     assert load_adapter_class(engine).__name__ == expected
 
 
-@pytest.mark.parametrize("engine", [SourceEngine.SQLITE, SourceEngine.DATALAKE])
+@pytest.mark.parametrize("engine", list(SourceEngine))
 def test_adapter_class_satisfies_the_factory_protocol(engine: SourceEngine):
+    """Every engine, not a chosen few: the registry is what the pool goes
+    through, so an adapter that cannot be built from a `ConnectionInfo` is only
+    discovered on the first tool call."""
     assert isinstance(load_adapter_class(engine), AdapterFactory)
 
 
-@pytest.mark.parametrize(
-    "engine",
-    [
-        SourceEngine.POSTGRES,
-        SourceEngine.MYSQL,
-        SourceEngine.MSSQL,
-        SourceEngine.MONGODB,
-    ],
-)
-def test_unimplemented_adapter_says_so_instead_of_blaming_the_driver(
-    engine: SourceEngine,
+def test_an_unwritten_adapter_says_so_instead_of_blaming_the_driver(
+    monkeypatch: pytest.MonkeyPatch,
 ):
-    """A missing adapter module must not be reported as a missing driver."""
+    """Every engine has a module today. The message still has to be right for the
+    next one registered before it is written."""
+    monkeypatch.setitem(
+        factory._ADAPTER_REGISTRY,
+        SourceEngine.POSTGRES,
+        ("src.adapter.oracle", "OracleAdapter"),
+    )
+
     with pytest.raises(AdapterNotAvailableError) as excinfo:
-        load_adapter_class(engine)
+        load_adapter_class(SourceEngine.POSTGRES)
 
     message = str(excinfo.value)
     assert "not implemented yet" in message

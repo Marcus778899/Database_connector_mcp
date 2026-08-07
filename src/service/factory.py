@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import importlib
+import os
+from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 from src.core.config import ConnectionInfo, SourceEngine
 from src.core.contracts import SourceAdaptor
+from src.core.engines import EXTRAS
 from src.core.log import log
 
 _ADAPTER_REGISTRY: dict[SourceEngine, tuple[str, str]] = {
@@ -18,15 +21,10 @@ _ADAPTER_REGISTRY: dict[SourceEngine, tuple[str, str]] = {
     SourceEngine.MCP: ("src.adapter.remote_mcp", "RemoteMcpAdapter"),
 }
 
-# Engine -> the `uv sync --extra <name>` that installs its driver.
+# Engine -> the `uv sync --extra <name>` that installs its driver. The mapping
+# itself lives in src/core/engines.py, because the Dockerfile reads it too.
 _ENGINE_EXTRA: dict[SourceEngine, str] = {
-    SourceEngine.POSTGRES: "postgres",
-    SourceEngine.MYSQL: "mysql",
-    SourceEngine.MARIADB: "mysql",
-    SourceEngine.MSSQL: "mssql",
-    SourceEngine.MONGODB: "mongo",
-    SourceEngine.DATALAKE: "datalake",
-    SourceEngine.MCP: "mcp",
+    engine: extras[0] for engine, extras in EXTRAS.items() if extras
 }
 
 
@@ -66,6 +64,17 @@ def resolve_engine(engine: SourceEngine | str) -> SourceEngine:
         ) from exc
 
 
+def _in_container() -> bool:
+    """
+    Whether the advice below should be about images or about this checkout.
+
+    `/.dockerenv` is written by the docker runtime itself; the environment
+    variable is set by this project's own Dockerfile, so the answer survives
+    runtimes that do not write that file.
+    """
+    return Path("/.dockerenv").exists() or bool(os.environ.get("MCP_IN_CONTAINER"))
+
+
 def _import_failure_message(
     engine: SourceEngine, module_path: str, exc: ImportError
 ) -> str:
@@ -75,12 +84,23 @@ def _import_failure_message(
     if missing == module_path or module_path.startswith(f"{missing}."):
         return f"the {engine} adapter is not implemented yet ({module_path} is missing)"
     extra = _ENGINE_EXTRA.get(engine)
-    if extra:
+    if not extra:
+        return f"the {engine} adapter could not be imported: {exc}"
+    if _in_container():
+        # `uv sync` inside a running container is the wrong answer twice over:
+        # it does not install the OS-level parts (mssql needs a driver that is
+        # not a python package), and whatever it does install is gone on the
+        # next start. The engine is a build argument here.
         return (
-            f"the {engine} adapter needs its driver: uv sync --extra {extra} "
-            f"(missing module {missing!r})"
+            f"this image was not built for {engine} (missing module {missing!r}). "
+            f"An image carries the driver for the engine it was built with: "
+            f"rebuild with MCP_ENGINE={engine}, e.g. "
+            f"`MCP_ENGINE={engine} docker compose up --build`."
         )
-    return f"the {engine} adapter could not be imported: {exc}"
+    return (
+        f"the {engine} adapter needs its driver: uv sync --extra {extra} "
+        f"(missing module {missing!r})"
+    )
 
 
 def load_adapter_class(engine: SourceEngine | str) -> type[AdapterFactory]:

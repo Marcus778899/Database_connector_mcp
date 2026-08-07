@@ -1,0 +1,39 @@
+---
+name: {{skill_slug}}
+description: {{skill_description}}
+---
+
+# {{server_name}}
+
+A read-only catalog of a {{engine_display}} source, reached over MCP. Use it to
+answer "what data is there", "what does this column mean" and "what joins to
+what" without opening a database client.
+
+You are connected as `{{agent}}`{{role_line}}. {{expiry_line}}
+
+## Read this first: the catalog does not fit
+
+A warehouse catalog is far larger than a context window, and the fix is not a
+bigger window — it is not putting the catalog in the window at all. Every tool
+below is built so a wrong first move is expensive and the right one is cheap.
+
+{{catalog_guidance}}
+
+{{conditional_sections}}
+
+## Every call is on the record
+
+Who called, which tool, with what arguments, the SQL it rendered and how many
+rows came back — all of it lands in an audit trail. That is not a reason to be
+timid, it is a reason to be deliberate: a scan you started and abandoned is
+visible, and so is a sample you took because you did not check the schema first.
+
+{{tool_reference}}
+
+{{limits}}
+
+## When something is refused
+
+A refusal here is configuration, not a puzzle to solve. You cannot widen your
+own access, and retrying with different arguments will not change the answer.
+Say what you were refused and what you would need, and let a person decide.

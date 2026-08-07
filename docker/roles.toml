@@ -1,0 +1,83 @@
+#
+# 角色定義：一個 token 能做什麼，寫在這裡。
+#
+# provision 依這裡的內容簽 token，並依同一份內容產生對應的 SKILL.md，所以
+# 「agent 拿到的權限」和「agent 讀到的說明」不可能講不一樣的話。改完這個檔案
+# 之後重跑 provision（`PROVISION_FORCE=1 docker compose up provision`）即可。
+#
+# 可用的設定：
+#
+#   description         一句話，會出現在 `mcp-connector role show` 和 SKILL.md
+#   extends             繼承另一個角色，再用 add_tools / drop_tools 增減
+#   tools               完整取代繼承來的清單（和 add_tools/drop_tools 互斥）
+#   add_tools           在繼承的清單上追加
+#   drop_tools          從繼承的清單上移除；移除一個沒繼承到的名字會報錯
+#   databases           限定只能讀這幾個 database；不寫＝不限制
+#   containers.allow    只能讀符合這些 glob 的表；不寫＝除了 deny 以外都可以
+#   containers.deny     永遠不能讀的 glob；deny 贏過 allow
+#   allow_raw_sample    允許 get_sample(mask=False) 取得未遮罩的值
+#   annotate_as_human   寫入的描述記為「人寫的」而不是「agent 猜的」
+#   lifetime            token 有效期，如 30d / 12h / 90m
+#
+# tools 裡的名字會在載入時比對 src/core/tools.py，打錯字直接報錯，不會變成一個
+# 「簽得出來但呼叫不到任何東西」的 token。
+
+# ---------------------------------------------------------------- PM ----
+# 跟客戶對資料用的。目的是「不用自己寫 SQL 也能回答客戶關於資料的問題」，
+# 所以給的是查詢與閱讀，不給任何會讓資料庫做工或改動盤點內容的東西。
+#
+# 前提是 DE 已經盤點過：PM 讀的是 inventory 裡的結果，不是即時掃描。
+[roles.pm]
+description = "與客戶對資料：查得到、看得懂、講得出關聯，但不啟動掃描也不改盤點內容"
+tools = [
+  # 這個來源長什麼樣
+  "list_databases",
+  "list_containers",
+  "get_schema",
+  # 客戶問「這個欄位到底放什麼」的時候，看幾筆遮罩過的實際資料
+  "get_sample",
+  # 盤點結果：先問總量，再搜尋，再讀單一張表
+  "inventory_summary",
+  "inventory_search",
+  "inventory_containers",
+  "inventory_columns",
+  # 「這兩張表怎麼接」是對資料時最常被問的一句
+  "inventory_relationships",
+  # 交付一份資料字典給客戶（format="markdown"）
+  "inventory_export",
+]
+lifetime = "30d"
+
+# 客戶端如果有絕對不該出現在對話裡的表，在這裡擋掉。deny 贏過 allow，而且
+# list_containers 之類的列表工具會直接濾掉，不是等到讀取才拒絕。
+# containers.deny = ["*_pii", "dbo.employee_salary"]
+
+# ---------------------------------------------------------------- DE ----
+# 工程面的完整權限：跑盤點、補描述、匯出 dbt schema.yml。
+#
+# 寫成繼承 pm 而不是各自列一份，是因為 DE 的權限確實是 PM 的超集，而兩份各自
+# 維護的清單遲早會有一份忘了更新。這裡看得到的就是「DE 比 PM 多了什麼」。
+[roles.de]
+description = "盤點與交付：跑掃描、補資料描述、匯出 dbt schema.yml"
+extends = "pm"
+add_tools = [
+  # 掃描的三件套
+  "inventory_start",
+  "inventory_status",
+  "inventory_cancel",
+  # 即時統計，用在盤點結果不夠回答問題的時候
+  "profile_column",
+  # 上游 schema 兩次掃描之間變了什麼
+  "inventory_changes",
+  # 把看懂的東西寫回盤點，dbt schema.yml 的 description 就是從這裡來的
+  "inventory_annotate",
+]
+lifetime = "30d"
+
+# annotate_as_human 刻意留 false：即使是 DE 在操作，描述仍然是 agent 寫的，
+# 盤點裡記成人寫的會讓之後沒有人知道哪些描述被人看過。DE 自己審過之後要改記
+# 為人寫的，在這裡設 true。
+#
+# allow_raw_sample 同樣留 false：建 schema.yml 不需要看到真值，而取樣出來的
+# 資料會進 agent 的 context 並留在每一份 transcript 裡。真的需要時，發一張
+# 短效期的 token 而不是把這裡打開。

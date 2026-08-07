@@ -4,7 +4,7 @@ from uuid import UUID
 
 import pytest
 
-from src.utils.serialize import jsonify
+from src.utils.serialize import as_text, jsonify
 
 
 @pytest.mark.parametrize(
@@ -56,3 +56,35 @@ def test_unknown_type_falls_back_to_str():
             return "weird"
 
     assert jsonify(Weird()) == "weird"
+
+
+# ---- as_text ----
+
+
+def test_as_text_keeps_none_as_none():
+    """A profile bound that is absent is not the string "None"."""
+    assert as_text(None) is None
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("already", "already"),
+        (7, "7"),
+        (Decimal("9.50"), "9.50"),
+        (date(2024, 1, 2), "2024-01-02"),
+        (datetime(2024, 1, 2, 3, 4), "2024-01-02T03:04:00"),
+        (
+            UUID("00000000-0000-0000-0000-000000000001"),
+            "00000000-0000-0000-0000-000000000001",
+        ),
+    ],
+)
+def test_as_text_reports_a_value_as_itself_rather_than_as_its_repr(value, expected):
+    """Through `jsonify` first: `str(date(...))` happens to agree, and
+    `str(Decimal)` and `str(bytes)` do not."""
+    assert as_text(value) == expected
+
+
+def test_as_text_of_bytes_is_the_base64_jsonify_chose():
+    assert as_text(b"\x00\x01") == "AAE="

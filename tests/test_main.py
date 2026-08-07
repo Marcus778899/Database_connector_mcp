@@ -13,8 +13,9 @@ import pytest
 from fastmcp import Client
 
 import main as entry
-from src.core.config import ServerConfig, SourceEngine
+from src.core.config import ConnectionInfo, ServerConfig, SourceEngine
 from src.core.contracts import ProfileMode
+from src.service import factory
 
 LIVE_TOOLS = {
     "list_databases",
@@ -54,6 +55,7 @@ def no_ambient_env(monkeypatch: pytest.MonkeyPatch):
         "MCP_PROFILE_MODES",
         "MCP_REQUIRE_AUTH",
         "MCP_ALLOW_INSECURE_HTTP",
+        "MCP_CONNECTION_CHECK",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -278,14 +280,213 @@ def test_staging_into_the_source_is_refused(source_env: str, db: Path):
         entry.build(ServerConfig(connection_ref=source_env, staging_db_path=db))
 
 
-def test_an_unimplemented_engine_is_reported(monkeypatch: pytest.MonkeyPatch, db: Path):
-    """postgres is registered but has no module yet; the pool builds lazily, so
-    the failure surfaces on the first call rather than at build time."""
-    monkeypatch.setenv("PG_URI", "postgresql://localhost/x")
-    mcp = entry.build(ServerConfig(engine=SourceEngine.POSTGRES, connection_ref="pg"))
+# ---- the connection is checked before the port is bound ----
 
-    with pytest.raises(Exception, match="not implemented yet"):
-        _call(mcp, "list_containers")
+
+def test_a_reachable_source_is_confirmed_in_the_log(source_env: str, caplog):
+    """
+    The point of the whole check: something in the log that says the login
+    worked, rather than silence that means nobody has tried yet.
+    """
+    entry.build(ServerConfig(connection_ref=source_env), check_connection=True)
+
+    assert "login is accepted" in caplog.text
+
+
+def test_an_unreachable_source_stops_the_server_starting(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """
+    A wrong host used to be discovered by an agent, mid-task, through a tool
+    error — on a server whose own logs said it started fine.
+    """
+    monkeypatch.setenv("LOCAL_PATH", str(tmp_path / "nope" / "missing.db"))
+
+    with pytest.raises(entry.ConfigurationError, match="cannot reach"):
+        entry.build(ServerConfig(connection_ref="local"), check_connection=True)
+
+
+def test_the_failure_says_how_to_start_anyway(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    monkeypatch.setenv("LOCAL_PATH", str(tmp_path / "nope" / "missing.db"))
+
+    with pytest.raises(entry.ConfigurationError) as caught:
+        entry.build(ServerConfig(connection_ref="local"), check_connection=True)
+
+    assert "MCP_CONNECTION_CHECK=warn" in str(caught.value)
+
+
+def test_warn_starts_anyway(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog):
+    """For a source that is legitimately slower to come up than this is."""
+    monkeypatch.setenv("LOCAL_PATH", str(tmp_path / "nope" / "missing.db"))
+
+    entry.build(
+        ServerConfig(connection_ref="local", connection_check="warn"),
+        check_connection=True,
+    )
+
+    assert "starting anyway" in caplog.text
+
+
+def test_off_does_not_open_a_connection(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    monkeypatch.setenv("LOCAL_PATH", str(tmp_path / "nope" / "missing.db"))
+
+    entry.build(
+        ServerConfig(connection_ref="local", connection_check="off"),
+        check_connection=True,
+    )
+
+
+def test_building_without_serving_does_not_touch_the_source(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """`build` is what the tests do; only `main` is what serves."""
+    monkeypatch.setenv("LOCAL_PATH", str(tmp_path / "nope" / "missing.db"))
+
+    entry.build(ServerConfig(connection_ref="local"))
+
+
+@pytest.mark.parametrize(
+    "conn, expected",
+    [
+        (
+            ConnectionInfo(
+                host="db.internal", port=1433, user="reader", database="shop"
+            ),
+            "mssql as reader@db.internal:1433/shop",
+        ),
+        (ConnectionInfo(host="db.internal"), "mssql as db.internal"),
+        (ConnectionInfo(path="/source/shop.db"), "mssql at /source/shop.db"),
+    ],
+)
+def test_the_source_is_described_without_its_password(
+    conn: ConnectionInfo, expected: str
+):
+    config = ServerConfig(engine=SourceEngine.MSSQL, connection_ref="shop")
+
+    assert entry.describe_source(config, conn) == expected
+
+
+def test_a_uri_is_never_quoted_back(caplog):
+    """It carries the password inside it, and this string goes to a log."""
+    config = ServerConfig(engine=SourceEngine.POSTGRES, connection_ref="shop")
+    conn = ConnectionInfo(uri="postgresql://reader:s3cret@db.internal/shop")
+
+    described = entry.describe_source(config, conn)
+
+    assert "s3cret" not in described
+    assert "SHOP_URI" in described
+
+
+def test_test_connection_reports_a_source_it_can_reach(
+    source_env: str, monkeypatch: pytest.MonkeyPatch, capsys
+):
+    monkeypatch.setenv("MCP_CONNECTION_REF", source_env)
+
+    assert entry.main(["test-connection"]) == 0
+    assert "login is accepted" in capsys.readouterr().out
+
+
+def test_test_connection_reports_one_it_cannot(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys
+):
+    """
+    The command exists for exactly this: `connection_check=require` stops the
+    server starting, and a server that is not running cannot be exec'd into to
+    find out why.
+    """
+    monkeypatch.setenv("LOCAL_PATH", str(tmp_path / "nope" / "missing.db"))
+    monkeypatch.setenv("MCP_CONNECTION_REF", "local")
+
+    assert entry.main(["test-connection"]) == 1
+    assert "cannot reach" in capsys.readouterr().err
+
+
+def test_test_connection_answers_even_when_the_check_is_off(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys
+):
+    """Someone running this has asked the question directly; `off` should not
+    turn the answer into silence."""
+    monkeypatch.setenv("LOCAL_PATH", str(tmp_path / "nope" / "missing.db"))
+    monkeypatch.setenv("MCP_CONNECTION_REF", "local")
+    monkeypatch.setenv("MCP_CONNECTION_CHECK", "off")
+
+    assert entry.main(["test-connection"]) == 1
+
+
+def test_test_connection_needs_a_ref(capsys):
+    assert entry.main(["test-connection"]) == 2
+    assert "no connection" in capsys.readouterr().err
+
+
+def test_the_check_is_required_by_default():
+    assert ServerConfig().connection_check == "require"
+
+
+def test_the_check_can_be_set_from_the_environment():
+    config = _config([], {"MCP_CONNECTION_CHECK": "warn"})
+
+    assert config.connection_check == "warn"
+
+
+def test_a_check_mode_nobody_recognises_is_refused():
+    with pytest.raises(entry.ConfigurationError):
+        _config([], {"MCP_CONNECTION_CHECK": "maybe"})
+
+
+def test_an_unimplemented_engine_is_reported(monkeypatch: pytest.MonkeyPatch, db: Path):
+    """
+    Refused at build time, not at the first call.
+
+    The pool loads adapters lazily, which used to mean an image built without
+    the driver started cleanly and then failed on every tool call — a symptom
+    a long way from its cause. One image now carries one engine's driver, so
+    the mismatch is worth catching before the port is bound.
+    """
+    monkeypatch.setitem(
+        factory._ADAPTER_REGISTRY,
+        SourceEngine.POSTGRES,
+        ("src.adapter.oracle", "OracleAdapter"),
+    )
+    monkeypatch.setenv("PG_URI", "postgresql://localhost/x")
+
+    with pytest.raises(entry.ConfigurationError, match="not implemented yet"):
+        entry.build(ServerConfig(engine=SourceEngine.POSTGRES, connection_ref="pg"))
+
+
+def test_a_missing_driver_in_a_container_says_to_rebuild(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """
+    The advice has to match where it is read.
+
+    `uv sync --extra mssql` is right in a checkout and wrong in a container:
+    it installs no OS-level driver, and nothing it does install survives the
+    next start. Inside an image the engine is a build argument.
+    """
+    monkeypatch.setenv("MCP_IN_CONTAINER", "1")
+    monkeypatch.setattr(
+        factory.importlib,
+        "import_module",
+        _raise(ImportError("No module named 'pyodbc'", name="pyodbc")),
+    )
+
+    with pytest.raises(factory.AdapterNotAvailableError) as caught:
+        factory.load_adapter_class(SourceEngine.MSSQL)
+
+    message = str(caught.value)
+    assert "MCP_ENGINE=mssql" in message
+    assert "uv sync" not in message
+
+
+def _raise(exc: Exception):
+    def raiser(*_args: object, **_kwargs: object):
+        raise exc
+
+    return raiser
 
 
 # ---- transport ----

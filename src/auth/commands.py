@@ -1,10 +1,11 @@
 """
-The `token` subcommand: what an operator runs to create a key pair and sign a
-token with it.
+The `token` and `role` subcommands: what an operator runs to create a key pair,
+sign a token with it, and read back what a role actually grants.
 
-Argument parsing only — the signing itself is `issue.py`, which is worth
-testing without a command line around it. Nothing here runs while the server
-is serving; `main` dispatches to one or the other, never both.
+Argument parsing only — the signing itself is `issue.py` and the roles file is
+`src.core.roles`, both worth testing without a command line around them.
+Nothing here runs while the server is serving; `main` dispatches to one or the
+other, never both.
 """
 
 from __future__ import annotations
@@ -24,8 +25,14 @@ from src.auth.issue import (
 )
 from src.auth.keys import KEY_SUFFIX, MalformedKeyIdError
 from src.core.config import DEFAULT_AUDIENCE
+from src.core.roles import ENV_ROLES_FILE, Role, RoleError, find_roles_file, load_roles
 
 COMMAND = "token"
+ROLE_COMMAND = "role"
+
+# argparse cannot say whether `--lifetime 30d` was typed or defaulted, and a
+# role's own lifetime should not be overridden by a default nobody chose.
+DEFAULT_LIFETIME = "30d"
 
 
 def add_token_command(commands: argparse._SubParsersAction) -> None:
@@ -70,6 +77,15 @@ def add_token_command(commands: argparse._SubParsersAction) -> None:
     issue.add_argument("--kid", required=True, help="which public key verifies it")
     issue.add_argument("--subject", help="who the token speaks for; defaults to --kid")
     issue.add_argument(
+        "--role",
+        help="grant what this role grants, from the roles file. Flags below are "
+        "added on top of it, and never take anything away — see `role show`.",
+    )
+    issue.add_argument(
+        "--roles-file",
+        help=f"where the roles are defined. env {ENV_ROLES_FILE}",
+    )
+    issue.add_argument(
         "--audience",
         default=DEFAULT_AUDIENCE,
         help=f"must match the server's --audience (default {DEFAULT_AUDIENCE})",
@@ -80,7 +96,11 @@ def add_token_command(commands: argparse._SubParsersAction) -> None:
         default=[],
         help="a tool this token may call; repeatable. No scopes means no tools.",
     )
-    issue.add_argument("--lifetime", default="30d", help="30d, 12h, 90m (default 30d)")
+    issue.add_argument(
+        "--lifetime",
+        default=DEFAULT_LIFETIME,
+        help=f"30d, 12h, 90m (default {DEFAULT_LIFETIME}, or the role's own)",
+    )
     issue.add_argument(
         "--database",
         action="append",
@@ -118,15 +138,99 @@ def add_token_command(commands: argparse._SubParsersAction) -> None:
     )
 
 
+def add_role_command(commands: argparse._SubParsersAction) -> None:
+    """
+    `role list` and `role show`.
+
+    Reading a token back is possible but nobody does it, so a role that grants
+    more than its author thought stays unnoticed until it matters. These print
+    the resolved answer — inheritance applied, defaults filled in.
+    """
+    role = commands.add_parser(
+        ROLE_COMMAND,
+        help="what the named sets of grants in the roles file actually grant",
+        description=(
+            "Roles are what `token issue --role` cuts a token from. `show` prints "
+            "one with its inheritance resolved, which is the form worth reviewing "
+            "— a role that extends another does not read as what it grants."
+        ),
+    )
+    role.add_argument(
+        "--roles-file", help=f"where the roles are defined. env {ENV_ROLES_FILE}"
+    )
+    actions = role.add_subparsers(dest="role_command", required=True)
+    actions.add_parser("list", help="every role, with what it can call")
+    show = actions.add_parser("show", help="one role, in full")
+    show.add_argument("name", help="the role to describe")
+
+
 def run_token_command(args: argparse.Namespace) -> int:
     """Dispatch `token …`. Returns the process's exit code."""
     try:
         if args.token_command == "keygen":
             return _keygen(args)
         return _issue(args)
-    except (IssueError, MalformedKeyIdError, OSError) as exc:
+    except (IssueError, MalformedKeyIdError, RoleError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+
+
+def run_role_command(args: argparse.Namespace) -> int:
+    """Dispatch `role …`. Returns the process's exit code."""
+    try:
+        path = find_roles_file(args.roles_file)
+        roles = load_roles(path)
+    except RoleError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    if args.role_command == "list":
+        print(f"# {path}")
+        for role in roles.values():
+            print(f"\n{role.name}  ({len(role.tools)} tools)")
+            if role.description:
+                print(f"  {role.description}")
+        return 0
+
+    role = roles.get(args.name)
+    if role is None:
+        known = ", ".join(roles) or "none"
+        print(
+            f"error: no role {args.name!r} in {path}. Known: {known}", file=sys.stderr
+        )
+        return 2
+    _print_role(role)
+    return 0
+
+
+def _print_role(role: Role) -> None:
+    print(f"{role.name}")
+    if role.description:
+        print(f"  {role.description}")
+    print(f"\n  may call ({len(role.tools)}):")
+    for tool in role.tools:
+        print(f"    {tool}")
+    print("\n  databases:  " + (", ".join(role.databases) or "all of them"))
+    print(
+        "  allow:      " + (", ".join(role.allow_containers) or "everything not denied")
+    )
+    print("  deny:       " + (", ".join(role.deny_containers) or "nothing"))
+    # Spelled out rather than printed as True/False: these two are the settings
+    # a reviewer is actually looking for, and "yes" next to a name reads faster
+    # than a boolean.
+    print(
+        "  raw rows:   "
+        + ("yes — get_sample(mask=False) is allowed" if role.allow_raw_sample else "no")
+    )
+    print(
+        "  writes as:  "
+        + (
+            "a person"
+            if role.annotate_as_human
+            else "an agent (descriptions marked as guesses)"
+        )
+    )
+    print("  lifetime:   " + (role.lifetime or "the issuer's default"))
 
 
 def _keygen(args: argparse.Namespace) -> int:
@@ -159,23 +263,73 @@ def _keygen(args: argparse.Namespace) -> int:
     return 0
 
 
+def _grants(args: argparse.Namespace) -> tuple[dict[str, object], str]:
+    """
+    What goes in the token, and the lifetime to sign it for.
+
+    A role supplies the starting point; the flags add to it. Only adding, never
+    removing: `--role pm --allow-raw-sample` is a widening, which is a thing an
+    operator does deliberately, whereas a flag that quietly narrowed a role
+    would produce a token that does not match the role's own SKILL.md.
+    """
+    role: Role | None = None
+    if args.role:
+        roles = load_roles(args.roles_file)
+        role = roles.get(args.role)
+        if role is None:
+            known = ", ".join(roles) or "none"
+            raise IssueError(f"no role {args.role!r} in the roles file. Known: {known}")
+
+    grants: dict[str, object] = (
+        role.issue_kwargs()
+        if role
+        else {
+            "scopes": [],
+            "databases": [],
+            "allow_containers": [],
+            "deny_containers": [],
+            "allow_raw_sample": False,
+            "annotate_as_human": False,
+        }
+    )
+    for key, extra in (
+        ("scopes", args.scope),
+        ("databases", args.database),
+        ("allow_containers", args.allow_container),
+        ("deny_containers", args.deny_container),
+    ):
+        merged = list(grants[key])  # type: ignore[arg-type]
+        merged.extend(item for item in extra if item not in merged)
+        grants[key] = merged
+    grants["allow_raw_sample"] = (
+        bool(grants["allow_raw_sample"]) or args.allow_raw_sample
+    )
+    grants["annotate_as_human"] = (
+        bool(grants["annotate_as_human"]) or args.annotate_as_human
+    )
+
+    # `--lifetime` has a default, so it cannot be told apart from an explicit
+    # one; the role's own lifetime therefore wins unless the flag was moved off
+    # that default.
+    lifetime = args.lifetime
+    if role and role.lifetime and lifetime == DEFAULT_LIFETIME:
+        lifetime = role.lifetime
+    return grants, lifetime
+
+
 def _issue(args: argparse.Namespace) -> int:
+    grants, lifetime = _grants(args)
     token = issue_token(
         Path(args.key).read_text(encoding="utf-8"),
         kid=args.kid,
         subject=args.subject or args.kid,
         audience=args.audience,
-        scopes=args.scope,
-        lifetime=parse_duration(args.lifetime),
-        databases=args.database,
-        allow_containers=args.allow_container,
-        deny_containers=args.deny_container,
-        allow_raw_sample=args.allow_raw_sample,
-        annotate_as_human=args.annotate_as_human,
+        lifetime=parse_duration(lifetime),
+        **grants,  # type: ignore[arg-type]
     )
-    if not args.scope:
+    if not grants["scopes"]:
         print(
-            "warning: no --scope given, so this token may call nothing",
+            "warning: no --scope and no --role given, so this token may call nothing",
             file=sys.stderr,
         )
     if args.out:

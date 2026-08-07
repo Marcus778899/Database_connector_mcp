@@ -1,356 +1,364 @@
 # database-mcp-connector
 
-An MCP server that makes an upstream data source's catalog — **containers, columns,
-types and descriptions** — readable by an AI agent, so two kinds of people can get
-at it without holding a database credential:
+一個 MCP server，讓 AI agent 讀得到資料來源的 catalog —— **有哪些表、哪些欄位、什麼
+型別、代表什麼意思** —— 而不需要把資料庫帳密交給任何人。帳密只存在 server 的環境變
+數裡。對資料來源全部是唯讀的。
 
-- a **data engineer** who wants the whole catalog inventoried at once
-- a **PM** who cannot write SQL, but can explore through an agent
+支援 sqlite、postgres、mysql/mariadb、mssql、mongodb、datalake（parquet/csv/json），
+以及把另一個 MCP server 當成來源。
 
-The database credential lives only in this server's environment. Whoever uses the
-server never sees it.
+> 本文的 `container` 一律指**來源裡的表 / view / collection**，不是 Docker 容器。
 
-Where this is going, and why: [docs/inventory-roadmap.md](docs/inventory-roadmap.md).
+- [部署](#部署)
+- [設定](#設定)
+- [角色與身分](#角色與身分)
+- [交給 agent](#交給-agent)
+- [有哪些工具](#有哪些工具)
+- [遇到問題](#遇到問題)
+- [不用 Docker](#不用-docker)
 
-## Status
+---
 
-sqlite and datalake (parquet/csv/json) work today. postgres, mysql, mssql and
-mongodb are registered but not written yet — asking for one says so. A network
-transport can now be authenticated with a signed token (see
-[Authentication](#authentication)); without one it must stay on loopback.
-
-## Install
+## 部署
 
 ```bash
-uv sync --extra server
+cp .env.example .env    # 編輯：engine、連線、要發哪些身分
+docker compose up -d --build
 ```
 
-The server extra is what makes the MCP layer importable. Each engine's driver is
-its own extra:
+就這樣。`.env` 裡的 `MCP_ENGINE` 同時決定 image 裝哪個驅動、server 用哪個 adapter、
+以及 image 的 tag，所以你只要在那裡寫一次。
 
-| engine | extra | notes |
+`--build` 只有在第一次、或改了 `MCP_ENGINE` 之後才需要。
+
+起來的是兩個服務：
+
+| 服務 | 生命週期 | 做什麼 |
 |---|---|---|
-| `sqlite` | — | stdlib, nothing to install |
-| `datalake` | `uv sync --extra datalake` | parquet / csv / json via pyarrow |
-| `mcp` | `uv sync --extra mcp` | front another MCP server as a source |
-| `postgres` | `uv sync --extra postgres` | adapter not implemented yet |
-| `mysql` / `mariadb` | `uv sync --extra mysql` | adapter not implemented yet |
-| `mssql` | `uv sync --extra mssql` | adapter not implemented yet |
-| `mongodb` | `uv sync --extra mongo` | adapter not implemented yet |
+| `provision` | 跑一次就結束 | 產生金鑰、簽 token、生出要交給 agent 的檔案 |
+| `server` | 長駐 | 驗證 token，提供服務 |
 
-## Run
+`server` 等 `provision` 成功才會起來。簽章金鑰寫在一個 `server` 沒有掛載的 volume
+上，所以就算 server 被攻下，攻擊者也沒辦法自己簽一張 token。
 
-Connection details are **not** passed as flags. They live in environment
-variables under a prefix you choose, and `--connection-ref` names that prefix:
+**server 會先真的連一次資料庫才開始服務**——連得到，而且帳密被接受——連不上就不啟
+動。成功的話 log 裡會有一行：
 
-```bash
-export SHOP_PATH=./var/shop.db
-uv run mcp-connector --engine sqlite --connection-ref shop --staging-db ./var/staging.db
+```
+connected to mssql as readonly@192.168.0.142:1433/shop: the address answers and the login is accepted
 ```
 
-`SHOP_PATH` above is `<REF>_PATH`. The recognised suffixes are `_HOST`, `_PORT`,
-`_USER`, `_PASSWORD`, `_DB` / `_DATABASE`, `_URI`, `_PATH` and `_TOKEN`; an engine
-uses the ones that apply to it. A repo-local `.env` is loaded automatically.
+這是為了讓打錯的 host 或密碼在這裡就被發現，而不是等 agent 做到一半才從一個 tool 錯
+誤裡看到。來源開機比 server 慢的話，設 `MCP_CONNECTION_CHECK=warn`（記一筆 log 然後
+照常啟動）。
 
-Every other setting has a flag and an `MCP_*` variable, and the flag wins:
+`provision` 每次 `up` 都會再跑，但只在「server 現在會拒絕手上這張 token」時才重簽
+（金鑰換了、過期了、audience 改了），並且會說明原因。要無條件重簽：
 
-| flag | variable | default |
+```bash
+PROVISION_FORCE=1 docker compose up provision
+```
+
+### 換 engine
+
+換 image，不是換設定：
+
+```bash
+# .env: MCP_ENGINE=mssql
+docker compose up -d --build
+```
+
+一個 engine 一個 image，tag 帶著 engine（`database-mcp-connector:mssql`）。驅動沒辦
+法在 runtime 決定——mssql 的 ODBC 驅動不是 python 套件，而 image 是唯讀的、process
+也不是 root。所以依賴在 build 時就照 `MCP_ENGINE` 裝好。
+
+engine 和 image 對不上的時候 server **不會啟動**，錯誤訊息會直接說要用哪個
+`MCP_ENGINE` 重 build。
+
+> 你也可以寫成 `MCP_ENGINE=mssql docker compose up -d --build`，shell 的值會蓋過
+> `.env`。但那樣**每次都得記得打**——漏一次就會退回預設的 sqlite，build 出另一個
+> image、用錯的 adapter 起來。放在 `.env` 就是為了不用記。兩者擇一，不需要都做。
+
+---
+
+## 設定
+
+全部在 `.env`。完整範例見 [.env.example](.env.example)。
+
+### 來源
+
+```bash
+MCP_ENGINE=mssql
+MCP_CONNECTION_REF=shop     # 下面那組變數的前綴
+```
+
+連線資訊住在你自己選的前綴底下：
+
+```bash
+SHOP_HOST=192.168.0.142
+SHOP_PORT=1433
+SHOP_USER=readonly
+SHOP_PASSWORD=…
+SHOP_DB=shop
+```
+
+認得的字尾：`_HOST` `_PORT` `_USER` `_PASSWORD` `_DB`/`_DATABASE` `_URI` `_PATH`
+`_TOKEN` `_TRUST_SERVER_CERTIFICATE`。
+
+| engine | 需要 | 也可以改用 |
+|---|---|---|
+| `sqlite` | `_PATH`（`.db` 檔） | `_URI` |
+| `datalake` | `_PATH` 或 `_URI`（`s3://…`、`gs://…`） | |
+| `postgres` | `_HOST` `_USER` `_PASSWORD` `_DB` | `_URI` —— 完整 libpq conninfo，也是唯一能接 unix socket 的方式 |
+| `mysql` / `mariadb` | `_HOST` `_USER` `_PASSWORD` `_DB` | `_URI` |
+| `mssql` | `_HOST` `_USER` `_PASSWORD` `_DB` | `_URI` —— 完整 ODBC 連線字串 |
+| `mongodb` | `_URI` 或 `_HOST`，加 `_DB` | |
+| `mcp` | `_URI` 或 `_PATH`，加 `_TOKEN` | |
+
+檔案型的 engine（sqlite、datalake）要把來源掛進容器，`docker-compose.yml` 裡有註解
+掉的範例。
+
+### mssql 的自簽憑證
+
+ODBC Driver 18 預設一定驗證憑證，所以地端伺服器第一次連會撞到
+`certificate verify failed`。
+
+```bash
+SHOP_TRUST_SERVER_CERTIFICATE=1
+```
+
+**加密仍然開著**，關掉的只是「對方是不是它宣稱的那個人」這項驗證——也就是說這條連線
+可以被中間人攔截，只適合你控制的網段。打開時 server 會在 log 裡講一次。
+
+DBeaver、SSMS 這類客戶端預設就勾著「信任伺服器憑證」，所以它們連得過而且不會提這件
+事。**用 GUI 連得上不代表這裡連得上**，兩邊的預設剛好相反。
+
+先確認再改設定：
+
+```bash
+docker compose run --rm server test-connection
+```
+
+---
+
+## 角色與身分
+
+一個角色 = 一組權限。定義在 [docker/roles.toml](docker/roles.toml)，預設兩個：
+
+| 角色 | 給誰 | 拿得到 |
+|---|---|---|
+| `pm` | 跟客戶對資料的人 | 讀盤點結果、看 schema、取遮罩過的樣本、匯出資料字典。**不能**啟動掃描、不能改盤點內容 |
+| `de` | 做盤點交付的工程師 | `pm` 的全部，再加跑掃描、即時統計、補描述、匯出 `dbt schema.yml` |
+
+```bash
+docker compose run --rm provision role list       # 有哪些角色
+docker compose run --rm provision role show de    # 展開繼承後的實際權限
+```
+
+### 發身分
+
+`.env` 裡是 `<名字>=<角色>`：
+
+```bash
+PROVISION_IDENTITIES=de=de,pm=pm,alice=pm
+```
+
+每個身分各自一組金鑰、一張 token、一包 `out/<名字>/`。補發一個人不用動 `.env`：
+
+```bash
+docker compose run --rm provision --kid bob --role pm
+```
+
+**撤銷**就是刪掉那把公鑰，不用重啟，30 秒內生效：
+
+```bash
+docker compose run --rm provision rm /keys/bob.pub
+```
+
+### 改權限
+
+編輯 `docker/roles.toml`，然後重簽：
+
+```bash
+PROVISION_FORCE=1 docker compose up provision
+```
+
+```toml
+[roles.analyst]
+extends    = "pm"                       # 繼承，再增減
+add_tools  = ["profile_column"]
+databases  = ["analytics"]              # 只能讀這幾個 database
+containers = { deny = ["*_pii"] }       # 永遠讀不到；deny 贏過 allow
+lifetime   = "7d"
+```
+
+工具名在載入時會比對真實的工具清單，打錯字直接報錯。可用的設定寫在
+`roles.toml` 的檔頭。
+
+---
+
+## 交給 agent
+
+`out/<名字>/` 整包就是一個身分——token、連線設定、使用說明都在裡面。
+
+```
+out/de/
+  de.jwt                            憑證
+  .mcp.json                         server 連線設定，token 直接寫在裡面
+  skills/etl-agent-mcp/SKILL.md     這個角色能用什麼、該怎麼用
+  .claude-plugin/plugin.json
+  codex.toml                        同一個 server 的 Codex 寫法
+  INSTALL.md
+```
+
+**整包是憑證**，不要進版控，交給誰就整包給誰。
+
+Claude Code：
+
+```bash
+cp -r out/de ~/.claude/plugins/de
+```
+
+Codex：把 `codex.toml` 附加到 `~/.codex/config.toml`，並把 `SKILL.md` 當 context 傳
+進去。
+
+`SKILL.md` 是照那張 token 實際拿到的權限生成的，所以不會描述到這個角色叫不動的工
+具。語言由 `PROVISION_LANG` 決定（`zh-TW` 或 `en`，預設 `zh-TW`）；工具名和參數名不
+會被翻譯。
+
+---
+
+## 有哪些工具
+
+**直接問來源**（永遠都在）：
+
+| 工具 | 回傳 |
+|---|---|
+| `list_databases` | 這條連線碰得到的資料庫 |
+| `list_containers` | 一頁的表 / view / collection |
+| `get_schema` | 某個 container 的欄位，含主鍵與可否為 null |
+| `get_sample` | 幾筆資料，**預設遮罩個資** |
+| `profile_column` | 單一欄位的單一統計值，當場算 |
+
+**讀盤點結果**（`MCP_STAGING_DB` 設了才有，compose 預設有）：
+
+| 工具 | 做什麼 |
+|---|---|
+| `inventory_start` / `inventory_status` / `inventory_cancel` | 背景掃描 |
+| `inventory_summary` | 盤點結果的統計數字 —— **先問這個** |
+| `inventory_containers` / `inventory_columns` | 一頁已盤點的表 / 欄位 |
+| `inventory_search` | 用關鍵字找表和欄位 |
+| `inventory_relationships` | 所有外鍵，可以直接畫 ER 圖 |
+| `inventory_changes` | 兩次掃描之間上游 schema 變了什麼 |
+| `inventory_annotate` | 寫下這張表或欄位到底裝什麼 |
+| `inventory_export` | 整份寫成檔案，**只回傳路徑**（`markdown` / `csv` / `dbt_yaml`） |
+
+典型的交付流程：`inventory_start` 跑一次掃描 → `inventory_annotate` 把看懂的東西寫
+回去 → `inventory_export(format="dbt_yaml")` 產出 `schema.yml`。之後 PM 讀的就是這
+份盤點結果，不會再去打資料庫。
+
+`get_sample` 預設把個資遮罩成 `a***@***.com`、`***`——形狀留著，值不留，因為取樣出
+來的資料會進 agent 的 context 並留在每一份對話記錄裡。要看真值需要
+`--allow-raw-sample` 那項授權，預設兩個角色都沒有。
+
+postgres 和 mssql 的 container 名字帶 schema（`dbo.orders`）；只有一個 schema 有那
+張表的話，寫 `orders` 也可以。
+
+---
+
+## 遇到問題
+
+**`token 格式不對` / server 回 401**
+把 token 手動貼進 `.mcp.json` 如果就通了，代表是 `${...}` 沒被展開。預設已經是直接
+寫入 token，所以會遇到這個通常是設了 `PROVISION_INLINE_TOKEN=0`——那個寫法要求
+client 會展開變數，而且啟動它的 shell 就是你 `export` 的那個 shell；從桌面應用程式
+啟動的 client 兩個都不成立。
+
+**`this image was not built for <engine>`**
+`.env` 的 `MCP_ENGINE` 和 image 對不上。`docker compose up -d --build`。
+
+**`cannot reach …` 而且 server 起不來**
+啟動時的連線檢查擋下來了，後面接著的就是真正的原因（見下面幾條）。
+
+server 沒起來就 `exec` 不進去，所以排查用這個——它在一個用完就丟的容器裡跑，設定跟
+server 完全一樣，但不服務任何東西：
+
+```bash
+docker compose run --rm server test-connection
+```
+
+它回報的是**登入**成功與否，不是只有 ping 到 IP。要先讓 server 起來再慢慢查，設
+`MCP_CONNECTION_CHECK=warn`。
+
+**`Login timeout expired (HYT00)`**
+連不到。容器裡的 `localhost` 是容器自己——資料庫跑在 docker host 上的話要用
+`SHOP_HOST=host.docker.internal`。
+
+**`Login failed for user (28000)`**
+連得到，但帳密或預設資料庫不對。網路沒問題。
+
+**`certificate verify failed`**
+自簽憑證。`SHOP_TRUST_SERVER_CERTIFICATE=1`，見
+[mssql 的自簽憑證](#mssql-的自簽憑證)。**DBeaver 連得過不代表這裡連得過**——它預設
+就勾著 "Trust server certificate"，而且不會告訴你。
+
+**`InvalidSignatureError`**
+`docker compose down -v` 會帶走金鑰的 volume，但留下 bind mount 的 `./out`——手上那
+張 token 是用已經不存在的金鑰簽的。重跑 `docker compose up provision` 會偵測到並重
+簽。
+
+**agent 說某個工具被拒絕**
+那是設定，不是故障。`docker compose run --rm provision role show <角色>` 看它實際拿
+到什麼。
+
+---
+
+## 不用 Docker
+
+```bash
+uv sync --extra server --extra postgres
+export SHOP_HOST=db.internal SHOP_USER=readonly SHOP_PASSWORD=… SHOP_DB=shop
+uv run mcp-connector --engine postgres --connection-ref shop --staging-db ./var/staging.db
+```
+
+`--extra server` 是 MCP 那層，每個 engine 的驅動各自一個 extra（`postgres`、`mysql`
+含 mariadb、`mssql`、`mongo`、`datalake`、`mcp`）。sqlite 不用裝。mssql 的 ODBC 驅動
+本身不是 python 套件，要另外裝。對照表在
+[src/core/engines.py](src/core/engines.py)。
+
+每個設定都有一個 flag 和一個 `MCP_*` 環境變數，flag 優先：
+
+| flag | 環境變數 | 預設 |
 |---|---|---|
 | `--engine` | `MCP_ENGINE` | `sqlite` |
-| `--connection-ref` | `MCP_CONNECTION_REF` | *required* |
-| `--database` | `MCP_DATABASE` | the engine's own default |
+| `--connection-ref` | `MCP_CONNECTION_REF` | *必填* |
+| `--database` | `MCP_DATABASE` | engine 自己的預設 |
 | `--transport` | `MCP_TRANSPORT` | `stdio` |
 | `--host` / `--port` | `MCP_HOST` / `MCP_PORT` | `127.0.0.1` / `8000` |
 | `--max-sample-limit` | `MCP_MAX_SAMPLE_LIMIT` | `100` |
-| `--staging-db` | `MCP_STAGING_DB` | unset — **no inventory tools** |
-| `--export-dir` | `MCP_EXPORT_DIR` | unset — **no export tool** |
-| `--audit-log` | `MCP_AUDIT_LOG` | unset — log only |
-| `--audit-max-mb` | `MCP_AUDIT_MAX_MB` | `10` — `0` never rotates |
-| `--audit-backups` | `MCP_AUDIT_BACKUPS` | `5` |
-| `--profile-mode` | `MCP_PROFILE_MODES` | unset — chosen per column |
-| `--no-profile` | `MCP_PROFILE=false` | off — statistics are gathered |
+| `--connection-check` | `MCP_CONNECTION_CHECK` | `require` —— 也可以是 `warn` / `off` |
+| `--staging-db` | `MCP_STAGING_DB` | 未設 —— **沒有 inventory 工具** |
+| `--export-dir` | `MCP_EXPORT_DIR` | 未設 —— **沒有 export 工具** |
+| `--audit-log` | `MCP_AUDIT_LOG` | 未設 —— 只寫 log |
+| `--audit-max-mb` / `--audit-backups` | `MCP_AUDIT_MAX_MB` / `MCP_AUDIT_BACKUPS` | `10` / `5` |
+| `--profile-mode` | `MCP_PROFILE_MODES` | 未設 —— 每個欄位各自決定 |
+| `--no-profile` | `MCP_PROFILE=false` | 預設會收集統計 |
 | `--server-name` | `MCP_SERVER_NAME` | `etl-agent-mcp` |
 | `--require-auth` | `MCP_REQUIRE_AUTH` | `false` |
+| `--authorized-keys-dir` | `MCP_AUTHORIZED_KEYS_DIR` | 未設 |
+| `--audience` | `MCP_AUDIENCE` | `etl-agent-mcp` |
 | `--allow-insecure-http` | `MCP_ALLOW_INSECURE_HTTP` | `false` |
+| | `MCP_ROLES_FILE` | 容器裡是 `/etc/mcp/roles.toml` |
 
-`--staging-db` is deliberately off by default: without somewhere to accumulate a
-scan there is nowhere to put what it gathers, so the inventory tools are not
-served at all rather than served and broken. It must not point at the database
-being inventoried; the store refuses that.
+走 `stdio` 時沒有 token 也不需要——能啟動這個 process 的人已經握有資料庫帳密，所以
+`--require-auth` 在 stdio 上會直接報錯。走網路 transport 時，除非綁在 loopback 或明
+確加上 `--allow-insecure-http`，否則不會在沒有認證的情況下對外服務。
 
-`--profile-mode` applies the modes you name to every column. Left unset, each
-column gets what its type warrants — a range for a number or a date, the
-commonest values for a categorical one, and nothing beyond a null ratio for a
-type that means nothing to us. `--no-profile` turns it off entirely.
-
-## Connect an agent
-
-```json
-{
-  "mcpServers": {
-    "shop-catalog": {
-      "command": "uv",
-      "args": [
-        "run", "mcp-connector",
-        "--engine", "sqlite",
-        "--connection-ref", "shop",
-        "--staging-db", "./var/staging.db"
-      ],
-      "cwd": "/path/to/Database_connector_mcp",
-      "env": { "SHOP_PATH": "./var/shop.db" }
-    }
-  }
-}
-```
-
-Over stdio the client spawns the process and already holds its environment, so
-there is nothing for authentication to add — `--require-auth` is refused there on
-purpose.
-
-## Authentication
-
-Only for the http transports. The threat is "whoever learns the URL can read the
-database"; over stdio there is nothing to defend, because spawning the process
-already hands over the credential.
-
-`mcp.json` can carry a static header but cannot compute a signature, so the
-signing happens outside the serving process. Same command, one word apart:
+image 本身也可以當 CLI 用：
 
 ```bash
-uv run mcp-connector token keygen --kid pm-explorer --keys-dir ./keys --out ./pm-explorer.pem
+docker compose run --rm provision token issue --key … --role pm
 ```
 
-That writes `./keys/pm-explorer.pub`, which the server reads, and the signing key,
-which the server never reads. Then per token:
-
-```bash
-uv run mcp-connector token issue --key ./pm-explorer.pem --kid pm-explorer --scope list_containers --scope get_schema --lifetime 30d
-```
-
-The result goes in the agent's `Authorization: Bearer …` header. Serve with:
-
-```bash
-uv run mcp-connector --engine sqlite --connection-ref shop --transport http --host 0.0.0.0 --require-auth --authorized-keys-dir ./keys
-```
-
-| claim | what it does |
-|---|---|
-| `kid` (header) | names the public key in `--authorized-keys-dir` that verifies it |
-| `sub` | who the caller is, and what the audit trail records |
-| `aud` | must equal `--audience`, so a token signed for elsewhere is refused here |
-| `exp` | required; expiry is the main way a token stops working |
-| `scopes` | the tools it may call, by name. No scopes, no tools. |
-
-**Revoking** is `rm ./keys/<kid>.pub` — no restart, effective within 30 seconds.
-Keys are re-read that often rather than cached for the life of the process, which
-is the whole reason revocation works without one.
-
-`exp` is checked with 60 seconds of leeway, so a token is accepted for up to a
-minute past its expiry — a token that has just run out was almost certainly
-issued against a clock a shade different from this one. It matters only if you
-issue very short lifetimes: a `--lifetime 5m` token is good for six.
-
-Signatures are asymmetric only (EdDSA, ES256, RS256). An HMAC algorithm is never
-accepted: the keys here are public, so a token signed with one of them as a
-shared secret would be a forgery anyone could produce.
-
-Authentication is not authorisation. A valid token still gets a tool error for a
-tool outside its scopes, and the refusal is recorded in the audit trail like any
-other call.
-
-### In a container
-
-`token keygen --if-missing` succeeds quietly when the signing key is already
-there, which is what an entrypoint that runs on every start needs — generating a
-fresh pair would invalidate every token already handed out. It also puts the
-public half back if only that is gone, since the two can sit on different
-volumes.
-
-```bash
-#!/bin/sh
-set -e
-mcp-connector token keygen --kid pm-explorer \
-    --keys-dir /keys --out /secrets/pm-explorer.pem --if-missing
-mcp-connector token issue --key /secrets/pm-explorer.pem --kid pm-explorer \
-    --scope list_containers --scope get_schema --scope get_sample \
-    --lifetime 30d --out /tokens/pm-explorer.jwt
-exec mcp-connector --engine sqlite --connection-ref shop \
-    --transport http --host 0.0.0.0 --require-auth --authorized-keys-dir /keys
-```
-
-Hand `/tokens/pm-explorer.jwt` to the agent that needs it — that is the thing
-that goes in `mcp.json`, not the public key, which never leaves the server.
-
-One thing to be deliberate about: this puts the signing key on the server's
-host, which is the arrangement the split was meant to avoid — whoever takes the
-container can then mint tokens for any subject, and the audit trail's account of
-who did what stops being evidence. It is a defensible trade for a single-tenant
-deployment, where that container already holds the database credential. Keep
-`/secrets` a mounted volume rather than a baked-in layer, and if the audit trail
-ever has to stand up to scrutiny, move `keygen` out to wherever you run it by
-hand and let the container do nothing but `issue` — or nothing at all.
-
-## Tools
-
-Read-only against the source. Five answer live:
-
-| tool | what it gives |
-|---|---|
-| `list_databases` | databases this connection can inventory |
-| `list_containers` | one page of tables / views / collections, keyset paged |
-| `get_schema` | a container's columns, with key and nullability flags |
-| `get_sample` | a few rows, capped by `--max-sample-limit` |
-| `profile_column` | one statistic about one column |
-
-Seven more appear when `--staging-db` is set. A scan of a large source outlasts
-any single tool call, so it runs in the background:
-
-| tool | what it does |
-|---|---|
-| `inventory_start` | begin a scan, return a job id |
-| `inventory_status` | how far it got, and why it stopped |
-| `inventory_cancel` | stop after the container in flight; progress is kept |
-| `inventory_summary` | counts over what has been inventoried — **ask for this first** |
-| `inventory_containers` | one page of inventoried containers |
-| `inventory_columns` | one page of a container's columns |
-| `inventory_search` | containers and columns matching a keyword |
-| `inventory_relationships` | every foreign key, as edges to draw an ER diagram from |
-| `inventory_changes` | what the upstream schema did between scans |
-| `inventory_annotate` | describe a table or its columns |
-
-A scan resumes from its cursor if it dies, and skips containers whose schema
-fingerprint has not changed. What it does notice — a table appearing or
-disappearing, a column added, removed or retyped — is kept append-only and read
-back with `inventory_changes`. A run that resumed from a cursor never reports
-anything removed: it did not look at what came before it.
-
-One more appears when `--export-dir` is set: `inventory_export`.
-
-## Reading a catalog that will not fit
-
-A catalog of any size does not belong in an agent's context, and the fix is not
-a bigger window — it is not putting it there:
-
-| you want | ask for |
-|---|---|
-| how big is this | `inventory_summary` — counts only, a few hundred bytes |
-| where is the thing I mean | `inventory_search` — narrow hits, no statistics |
-| what is in this table | `inventory_columns` — one page, `include_profile=False` on a wide one |
-| all of it | `inventory_export` — **a file**, and only its path comes back |
-
-`inventory_export` writes `markdown` (a data dictionary to read), `csv` (a row
-per column) or `dbt_yaml` (a `schema.yml` for a dbt project), and returns where
-it wrote and how much — never the contents. That is what makes "inventory the
-whole warehouse" a request this server can answer.
-
-```bash
-uv run mcp-connector --engine sqlite --connection-ref shop \
-    --staging-db ./var/staging.db --export-dir ./var/exports
-```
-
-Without `--export-dir` the tool is not served at all: there would be nowhere to
-put what it writes. A path given to it is relative to that directory and cannot
-leave it — `../` and symlinks are resolved before the check, because the caller
-is an agent relaying a path someone gave it.
-
-The budgets are measured, not hoped for: `tests/test_context_budget.py` builds a
-500-table catalog and asserts what each tool costs.
-
-## Personal data
-
-`get_sample` puts real rows into an agent's context, and from there into every
-log, transcript and history that context touches. So **rows are masked by
-default**:
-
-```
-{"id": 1, "email": "a***@***.com", "note": "hello", "api_key": "***"}
-```
-
-The shape survives where it is useful — an agent reasoning about the table can
-still see that the column holds email addresses — and a secret keeps nothing,
-because there is no shape worth showing.
-
-Which columns count is decided by the scan, from the column name first and then
-from a small sample of values for the names that give nothing away. Only the
-verdict is stored, never the values it was reached from. It is a guess, and
-`inventory_annotate` overrides it:
-
-```json
-{"column": "internal_ref", "sensitivity": "pii"}
-```
-
-A verdict written that way is never overruled by a later scan — somebody looked
-at the thing, and a pattern match did not.
-
-`mask=False` returns the rows as they are. Over stdio that is allowed, because
-whoever spawned the process already holds the database credential. Over an
-authenticated transport the key has to have been granted it, and the audit trail
-records that it happened.
-
-## What a key may see
-
-Beyond the list of tools, a token can carry:
-
-```bash
-uv run mcp-connector token issue --key ./pm.pem --kid pm-explorer \
-    --scope list_containers --scope get_schema --scope get_sample \
-    --database analytics \
-    --allow-container 'dim_*' --allow-container 'fct_*' \
-    --deny-container '*_pii'
-```
-
-| flag | claim | absent means |
-|---|---|---|
-| `--database` | `databases` | every database |
-| `--allow-container` / `--deny-container` | `containers` | everything not denied |
-| `--allow-raw-sample` | `allow_raw_sample` | **no** — masked rows only |
-| `--annotate-as-human` | `annotate_as_human` | descriptions are recorded as an agent's |
-
-Deny beats allow. A container a key may not read is refused **by name** when
-asked for directly — an agent told a table is not there goes looking for it,
-one told it may not look asks for access — and left out of listings, searches
-and exports, so the catalog's shape does not leak to someone who cannot read it.
-
-These are claims *added* to the token, so one issued before any of them existed
-still means exactly what it meant: all tools it was scoped for, every database,
-every container, and no raw rows.
-
-## Descriptions
-
-A schema without descriptions is a list of names and types, which is exactly
-what a PM cannot read. So the inventory keeps two kinds of description, in
-separate columns:
-
-- **`native_description`** — the source's own comment. A scan reads it and
-  overwrites it, and it is part of the fingerprint, so a comment edited upstream
-  is a change worth rescanning for. sqlite has no comments at all.
-- **`description`** — written through `inventory_annotate` by an agent or a
-  person. **A scan never touches it**, and it stays out of the fingerprint so
-  that writing one cannot trigger its own rescan.
-
-`inventory_annotate` is the only tool here that writes, and the only thing it
-can write to is the inventory — the source database is never touched by
-anything in this server. Who a description came from is decided by the server
-from the caller's key, not claimed by the caller: `human` needs a token
-carrying the `annotate:human` scope, and everything else is `ai`.
-
-The staging file carries its layout version. A file written by an older build is
-refused with instructions rather than migrated: an inventory is derived data
-that a rescan reproduces, so the only thing genuinely lost is what was
-annotated.
-
-## Develop
-
-```bash
-uv sync --all-extras --dev
-uv run pytest
-```
-
-Layering is enforced by a test, not by convention: `core` holds the contracts and
-must not import any implementation. `tests/test_layering.py` fails if that
-direction is broken, and a new package under `src/` has to be given a rule there.
-
-```bash
-uvx ruff@0.4.4 format . && uvx ruff@0.4.4 check .
-uvx pyright
-```
+每一次呼叫——誰、哪個工具、什麼參數、跑出來的 SQL、回傳幾筆——都會進稽核記錄
+（`MCP_AUDIT_LOG`，compose 預設寫在 `mcp-data` volume 的 `audit/audit.jsonl`）。
