@@ -4,9 +4,11 @@ import re
 import threading
 import time
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from typing import Any, ClassVar
 
 from src.core.contracts import ColumnInfo, ContainerPage, ProfileMode, ProfileResult
+from src.core.log import log
 
 
 class UnknownContainerError(Exception):
@@ -15,6 +17,24 @@ class UnknownContainerError(Exception):
 
 class UnknownColumnError(Exception):
     """The column is not in the container's schema."""
+
+
+def render_sql(sql: str, params: Sequence[Any] = (), placeholder: str = "?") -> str:
+    """
+    The statement with its parameters inlined, for the audit trail.
+
+    Split once rather than replacing the placeholder repeatedly: a value that
+    itself contains one would become the next placeholder, and the audit line
+    would then be quietly wrong about what ran — worse than having no line at
+    all, because it reads as authoritative.
+    """
+    head, *tails = sql.split(placeholder)
+    rendered = [head]
+    for index, tail in enumerate(tails):
+        # more placeholders than parameters: leave the extras as placeholders
+        rendered.append(repr(params[index]) if index < len(params) else placeholder)
+        rendered.append(tail)
+    return "".join(rendered)
 
 
 class AdapterBase(ABC):
@@ -261,10 +281,44 @@ class SqlAdapterBase(AdapterBase):
             raise ValueError(f"illegal identifier：{ident!r}")
         return f"{self._QUOTE_OPEN}{ident}{self._QUOTE_CLOSE}"
 
+    def _quote_container(self, container: str) -> str:
+        """
+        A container name, quoted a part at a time.
+
+        An engine with a schema layer names a container `public.users`, and
+        quoting that whole string would ask for one identifier that happens to
+        contain a dot — a different table, if it exists at all. Each part still
+        has to be a plain identifier on its own.
+        """
+        return ".".join(self._quote(part) for part in container.split("."))
+
+    def _qualify(self, container: str) -> str:
+        """
+        The catalog's own name for a container, given what the caller typed.
+
+        An engine with a schema layer catalogs `public.users`, but an agent
+        relaying a name someone said will ask for `users`. Where exactly one
+        schema holds that name it is the one meant; where several do, saying so
+        is the only honest answer — picking one would quietly read the wrong
+        table. A flat catalog never reaches the search at all.
+        """
+        known = self._known_containers()
+        if container in known or "." in container:
+            return container
+        matches = sorted(name for name in known if name.rpartition(".")[2] == container)
+        if len(matches) == 1:
+            return matches[0]
+        if matches:
+            raise UnknownContainerError(
+                f"{container!r} is in more than one schema; name one of "
+                f"{', '.join(matches)}"
+            )
+        return container  # unknown, and _require_container is where that is said
+
     def _require_container(self, container: str) -> str:
-        if container not in self._known_containers():
+        if (name := self._qualify(container)) not in self._known_containers():
             raise UnknownContainerError(container)
-        return self._quote(container)
+        return self._quote_container(name)
 
     def _require_column(self, container: str, column: str) -> str:
         cols = {c.name for c in self._cached_schema(container)}
@@ -309,3 +363,146 @@ class SqlAdapterBase(AdapterBase):
             f"FROM {quoted_table}",
             (),
         )
+
+
+class DbApiAdapterBase(SqlAdapterBase):
+    """
+    What every PEP 249 driver needs alike: one connection, rows as dicts, and
+    the statement recorded as it was sent.
+
+    One connection guarded by a lock, not one per thread. FastMCP runs sync
+    tools in a threadpool and the scan worker has a thread of its own, so the
+    connection is shared; the pool holds one adapter per database rather than
+    one per thread. The cost is that statements serialise, which is the same
+    trade sqlite makes — if it ever bites, the fix is a connection per thread,
+    not a finer lock.
+
+    A subclass sets its connection parameters **before** calling
+    `super().__init__()`, which is what connects.
+    """
+
+    _PING_SQL: ClassVar[str] = "SELECT 1"
+
+    def __init__(
+        self,
+        *,
+        database: str = "",
+        max_sample_limit: int | None = None,
+        catalog_ttl: float | None = None,
+    ) -> None:
+        super().__init__(
+            database=database,
+            max_sample_limit=max_sample_limit,
+            catalog_ttl=catalog_ttl,
+        )
+        self._lock = threading.Lock()
+        self._closed = False
+        self._conn = self._connect()
+        self._after_connect()
+
+    @abstractmethod
+    def _connect(self) -> Any:
+        """A live DB-API connection to this adapter's source."""
+        raise NotImplementedError
+
+    def _after_connect(self) -> None:
+        """Session settings the engine wants — refusing writes, mostly."""
+
+    def _adopt_database(self, connected: str) -> None:
+        """
+        Settle what the database this connection is on is called.
+
+        Unnamed, it is whatever the server says — a driver may well have chosen
+        one, and reporting an empty name would leave every container labelled
+        with nothing. Named, the two have to agree, and a disagreement is fatal
+        rather than logged: every row served is labelled with the name, so a
+        connection that quietly went elsewhere would file one database's catalog
+        under another's, which no caller could tell from the truth.
+
+        An engine whose server cannot be asked passes `""` and keeps the name.
+        """
+        if not self._database:
+            self._database = connected
+            return
+        if connected and connected != self._database:
+            raise ValueError(
+                f"asked for database {self._database!r}, but the connection is on "
+                f"{connected!r} — a connection string naming its own database "
+                f"cannot be pointed at a different one"
+            )
+
+    # ---- lifecycle ----
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._conn.close()
+
+    def ping(self) -> bool:
+        """
+        A real round-trip, so the pool rebuilds a connection the server dropped.
+
+        Deliberately not through `_rows`: pool bookkeeping is not a statement the
+        audit trail should attribute to a tool call.
+        """
+        if self._closed:
+            return False
+        try:
+            with self._lock:
+                self._fetch(self._PING_SQL, ())
+        except Exception:  # noqa: BLE001 - any failure means unusable
+            return False
+        return True
+
+    # ---- querying ----
+
+    def _rows(self, sql: str, params: Sequence[Any] = ()) -> list[dict[str, Any]]:
+        self._record_sql(render_sql(sql, params, self._PARAM))
+        with self._lock:
+            return self._fetch(sql, params)
+
+    def _fetch(self, sql: str, params: Sequence[Any]) -> list[dict[str, Any]]:
+        """Rows as dicts, keyed by `cursor.description` — the one thing every
+        driver reports the same way, where row objects differ per driver."""
+        cursor = self._conn.cursor()
+        try:
+            # An empty parameter sequence is not the same as none: a driver that
+            # interpolates client-side reads the statement's own `%` as a
+            # placeholder the moment parameters are passed at all.
+            if params:
+                cursor.execute(sql, tuple(params))
+            else:
+                cursor.execute(sql)
+            if cursor.description is None:
+                return []
+            names = [column[0] for column in cursor.description]
+            return [dict(zip(names, row)) for row in cursor.fetchall()]
+        finally:
+            cursor.close()
+
+    def _unrecorded(self, sql: str) -> list[dict[str, Any]]:
+        """
+        Rows for the adapter's own bookkeeping — a session setting, or asking the
+        server what it just connected to.
+
+        Kept out of the audit trail on purpose: the trail answers "what did this
+        tool call read", and a statement no caller asked for does not belong in
+        the answer.
+        """
+        with self._lock:
+            return self._fetch(sql, ())
+
+    def _session_sql(self, sql: str) -> None:
+        """A session setting. A server that does not know the statement is logged
+        and carried on from — these harden a connection that already works."""
+        try:
+            self._unrecorded(sql)
+        except Exception as exc:  # noqa: BLE001 - a hardening step, not the job
+            log.warning(f"{self._database or '<default>'}: {sql!r} refused: {exc}")
+
+    def _scalar(self, sql: str, params: Sequence[Any] = ()) -> Any:
+        """The first column of the first row, or None where there is no row."""
+        rows = self._rows(sql, params)
+        return next(iter(rows[0].values())) if rows else None

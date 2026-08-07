@@ -15,6 +15,7 @@ from fastmcp import Client
 import main as entry
 from src.core.config import ServerConfig, SourceEngine
 from src.core.contracts import ProfileMode
+from src.service import factory
 
 LIVE_TOOLS = {
     "list_databases",
@@ -279,8 +280,13 @@ def test_staging_into_the_source_is_refused(source_env: str, db: Path):
 
 
 def test_an_unimplemented_engine_is_reported(monkeypatch: pytest.MonkeyPatch, db: Path):
-    """postgres is registered but has no module yet; the pool builds lazily, so
-    the failure surfaces on the first call rather than at build time."""
+    """The pool builds lazily, so an adapter that cannot be loaded surfaces on
+    the first call rather than at build time."""
+    monkeypatch.setitem(
+        factory._ADAPTER_REGISTRY,
+        SourceEngine.POSTGRES,
+        ("src.adapter.oracle", "OracleAdapter"),
+    )
     monkeypatch.setenv("PG_URI", "postgresql://localhost/x")
     mcp = entry.build(ServerConfig(engine=SourceEngine.POSTGRES, connection_ref="pg"))
 

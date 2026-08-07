@@ -14,10 +14,11 @@ Where this is going, and why: [docs/inventory-roadmap.md](docs/inventory-roadmap
 
 ## Status
 
-sqlite and datalake (parquet/csv/json) work today. postgres, mysql, mssql and
-mongodb are registered but not written yet — asking for one says so. A network
-transport can now be authenticated with a signed token (see
-[Authentication](#authentication)); without one it must stay on loopback.
+Every engine in the table below has an adapter: sqlite, datalake
+(parquet/csv/json), postgres, mysql/mariadb, mssql, mongodb, and another MCP
+server fronted as a source. A network transport can be authenticated with a
+signed token (see [Authentication](#authentication)); without one it must stay
+on loopback.
 
 ## Install
 
@@ -33,10 +34,10 @@ its own extra:
 | `sqlite` | — | stdlib, nothing to install |
 | `datalake` | `uv sync --extra datalake` | parquet / csv / json via pyarrow |
 | `mcp` | `uv sync --extra mcp` | front another MCP server as a source |
-| `postgres` | `uv sync --extra postgres` | adapter not implemented yet |
-| `mysql` / `mariadb` | `uv sync --extra mysql` | adapter not implemented yet |
-| `mssql` | `uv sync --extra mssql` | adapter not implemented yet |
-| `mongodb` | `uv sync --extra mongo` | adapter not implemented yet |
+| `postgres` | `uv sync --extra postgres` | psycopg 3 |
+| `mysql` / `mariadb` | `uv sync --extra mysql` | one adapter serves both |
+| `mssql` | `uv sync --extra mssql` | pyodbc — the ODBC driver itself is not a python package |
+| `mongodb` | `uv sync --extra mongo` | schema inferred from a sample; see [Collections have no schema](#collections-have-no-schema) |
 
 ## Run
 
@@ -51,6 +52,27 @@ uv run mcp-connector --engine sqlite --connection-ref shop --staging-db ./var/st
 `SHOP_PATH` above is `<REF>_PATH`. The recognised suffixes are `_HOST`, `_PORT`,
 `_USER`, `_PASSWORD`, `_DB` / `_DATABASE`, `_URI`, `_PATH` and `_TOKEN`; an engine
 uses the ones that apply to it. A repo-local `.env` is loaded automatically.
+
+Which ones each engine wants:
+
+| engine | needs | instead of, or as well |
+|---|---|---|
+| `sqlite` | `_PATH` (a `.db` file) | `_URI` |
+| `datalake` | `_URI` (`s3://…`, `gs://…`) or `_PATH` | |
+| `postgres` | `_HOST`, `_USER`, `_PASSWORD`, `_DB` | `_URI` — a whole libpq conninfo, and the only way to reach a unix socket |
+| `mysql` / `mariadb` | `_HOST`, `_USER`, `_PASSWORD`, `_DB` | `_URI` (`mysql://user:pass@host:port/db`) |
+| `mssql` | `_HOST`, `_USER`, `_PASSWORD`, `_DB` | `_URI` — a whole ODBC connection string |
+| `mongodb` | `_URI` (`mongodb://…`) or `_HOST`, plus `_DB` | the url's path counts as `_DB` |
+| `mcp` | `_URI` (`http://…`) or `_PATH`, plus `_TOKEN` | |
+
+`_DB` is what `--database` overrides, and for postgres, mysql, mssql and mongodb
+it selects one database on a server that has several. Asking for another one
+opens a second connection, which the pool keeps beside the first.
+
+The mssql connection string is built with `Encrypt=yes` and the certificate
+checked. A server with a self-signed certificate needs
+`TrustServerCertificate=yes`, and the way to say so is a whole `<REF>_URI` — it
+is a decision to take on purpose, not a default to inherit.
 
 Every other setting has a flag and an `MCP_*` variable, and the flag wins:
 
@@ -192,7 +214,13 @@ hand and let the container do nothing but `issue` — or nothing at all.
 
 ## Tools
 
-Read-only against the source. Five answer live:
+Read-only against the source, and where the engine can enforce that rather than
+be trusted about it, it does: sqlite opens the file `mode=ro`, postgres and
+mysql set the session read-only, and a write that ever slipped in would fail at
+the server. sql server has no such switch and the datalake and mongo drivers
+none either, so there the guarantee is that this code issues nothing but reads.
+
+Five tools answer live:
 
 | tool | what it gives |
 |---|---|
@@ -225,6 +253,39 @@ back with `inventory_changes`. A run that resumed from a cursor never reports
 anything removed: it did not look at what came before it.
 
 One more appears when `--export-dir` is set: `inventory_export`.
+
+### What a container is called
+
+Every tool takes a container as one string, so that string has to identify one
+container. On postgres and sql server it therefore always carries the schema:
+
+```
+public.users        dbo.orders        sales.users
+```
+
+A bare `users` still works where exactly one schema has one — an agent relaying
+a name somebody said will not have the schema. Where several do, the call is
+refused with the list rather than answered from whichever came first: reading
+the wrong table and saying nothing about it is the worse failure.
+
+sqlite, mysql and mongodb have no schema layer below the database, so their
+containers are named plainly. mysql's `SCHEMA` is a synonym for `DATABASE`, and
+passing one that is not the connected database is refused rather than ignored.
+
+### Collections have no schema
+
+mongodb has no declared schema to read, so `get_schema` **infers** one from the
+first hundred documents of a collection: the fields they carry, and the BSON
+types each was seen holding. That makes it a description of the sample rather
+than a guarantee about the collection, which is why:
+
+- a field seen holding more than one type is reported as all of them, `int|string`
+- a field missing from a document counts as null in that document
+- only top-level fields are reported — a nested document is `object` and an
+  array is `array`, because flattening `a.b.c` turns one collection into an
+  unbounded list of paths that would still only describe the sample
+- profiling a field no sampled document carried is refused, rather than
+  answered with a null ratio of 1.0 that reads as a fact about the collection
 
 ## Reading a catalog that will not fit
 
