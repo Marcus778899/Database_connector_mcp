@@ -11,12 +11,15 @@
 
 name: database-mcp-connector
 
+# Both services run this one image. Only `provision` declares how to build it:
+# two services sharing an image name and each carrying a `build:` become two
+# bake targets that build concurrently and then race to export the same tag,
+# which fails with `image "…": already exists` — and the second `up` then
+# succeeds, because by that point the loser's work is on disk. `provision` is
+# the one that builds because `server` waits for it anyway, so the image is
+# always there before anything needs to start.
 x-image: &image
   image: database-mcp-connector:${MCP_ENGINE:-sqlite}
-  build:
-    context: .
-    args:
-      MCP_ENGINES: ${MCP_ENGINE:-sqlite}
 
 # What the server is, shared by both services. `provision` needs it not to
 # serve anything but to describe it: which tools exist depends on whether a
@@ -40,6 +43,10 @@ services:
   # the server down rather than serving an allowlist nobody is in.
   provision:
     <<: *image
+    build:
+      context: .
+      args:
+        MCP_ENGINES: ${MCP_ENGINE:-sqlite}
     command: provision
     restart: "no"
     environment:

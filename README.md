@@ -41,6 +41,17 @@ docker compose up -d --build
 `server` 等 `provision` 成功才會起來。簽章金鑰寫在一個 `server` 沒有掛載的 volume
 上，所以就算 server 被攻下，攻擊者也沒辦法自己簽一張 token。
 
+**server 會先真的連一次資料庫才開始服務**——連得到，而且帳密被接受——連不上就不啟
+動。成功的話 log 裡會有一行：
+
+```
+connected to mssql as readonly@192.168.0.142:1433/shop: the address answers and the login is accepted
+```
+
+這是為了讓打錯的 host 或密碼在這裡就被發現，而不是等 agent 做到一半才從一個 tool 錯
+誤裡看到。來源開機比 server 慢的話，設 `MCP_CONNECTION_CHECK=warn`（記一筆 log 然後
+照常啟動）。
+
 `provision` 每次 `up` 都會再跑，但只在「server 現在會拒絕手上這張 token」時才重簽
 （金鑰換了、過期了、audience 改了），並且會說明原因。要無條件重簽：
 
@@ -257,6 +268,10 @@ client 會展開變數，而且啟動它的 shell 就是你 `export` 的那個 s
 **`this image was not built for <engine>`**
 `.env` 的 `MCP_ENGINE` 和 image 對不上。`docker compose up -d --build`。
 
+**`cannot reach …` 而且 server 起不來**
+啟動時的連線檢查擋下來了，後面接著的就是真正的原因（見下面幾條）。要先讓 server 起
+來再慢慢查，設 `MCP_CONNECTION_CHECK=warn`。
+
 **`Login timeout expired (HYT00)`**
 連不到。容器裡的 `localhost` 是容器自己——資料庫跑在 docker host 上的話要用
 `SHOP_HOST=host.docker.internal`。確認路由：
@@ -264,6 +279,9 @@ client 會展開變數，而且啟動它的 shell 就是你 `export` 的那個 s
 ```bash
 docker compose exec server python -c "import socket;socket.create_connection(('192.168.0.142',1433),5);print('ok')"
 ```
+
+**`Login failed for user (28000)`**
+連得到，但帳密或預設資料庫不對。網路沒問題。
 
 **`certificate verify failed`**
 自簽憑證，見 [mssql 的自簽憑證](#mssql-的自簽憑證)。
@@ -302,6 +320,7 @@ uv run mcp-connector --engine postgres --connection-ref shop --staging-db ./var/
 | `--transport` | `MCP_TRANSPORT` | `stdio` |
 | `--host` / `--port` | `MCP_HOST` / `MCP_PORT` | `127.0.0.1` / `8000` |
 | `--max-sample-limit` | `MCP_MAX_SAMPLE_LIMIT` | `100` |
+| `--connection-check` | `MCP_CONNECTION_CHECK` | `require` —— 也可以是 `warn` / `off` |
 | `--staging-db` | `MCP_STAGING_DB` | 未設 —— **沒有 inventory 工具** |
 | `--export-dir` | `MCP_EXPORT_DIR` | 未設 —— **沒有 export 工具** |
 | `--audit-log` | `MCP_AUDIT_LOG` | 未設 —— 只寫 log |

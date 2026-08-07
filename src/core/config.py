@@ -15,6 +15,7 @@ from src.core.log import log
 # the enum only moved because the Dockerfile has to read it before pydantic is
 # installed. See src/core/engines.py.
 __all__ = [
+    "ConnectionCheck",
     "ConnectionInfo",
     "DEFAULT_AUDIENCE",
     "MissingConnectionEnvError",
@@ -28,6 +29,7 @@ DEFAULT_AUDIENCE = "etl-agent-mcp"
 _REF_NORMALISE = re.compile(r"[^A-Za-z0-9]+")
 
 Transport = Literal["stdio", "http", "streamable-http", "sse"]
+ConnectionCheck = Literal["require", "warn", "off"]
 
 
 _CONN_SUFFIXES: dict[str, str] = {
@@ -88,6 +90,13 @@ class ServerConfig(BaseModel):
     transport: Transport = "stdio"
     host: str = "127.0.0.1"
     port: int = 8000
+
+    # Whether to open a real connection before serving. `require` is the default
+    # because the alternative is a server that starts, reports itself healthy,
+    # and then fails every tool call — the wrong host is discovered by an agent
+    # mid-task rather than by whoever set it. `warn` suits a source that is
+    # legitimately slower to come up than this is.
+    connection_check: ConnectionCheck = "require"
 
     # Auth applies to network transports only; stdio is trusted at the process
     # level (the client spawned us and already has our environment).

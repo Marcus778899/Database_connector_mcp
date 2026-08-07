@@ -28,6 +28,7 @@ from src.auth.commands import (
     run_token_command,
 )
 from src.core.config import (
+    ConnectionInfo,
     MissingConnectionEnvError,
     ServerConfig,
     SourceEngine,
@@ -43,6 +44,7 @@ from src.service.pool import AdapterPool
 from src.service.staging import StagingError, StagingStore
 
 _TRANSPORTS: tuple[str, ...] = ("stdio", "http", "streamable-http", "sse")
+_CONNECTION_CHECKS: tuple[str, ...] = ("require", "warn", "off")
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 _FALSY = frozenset({"0", "false", "no", "off"})
 
@@ -72,6 +74,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--host", help="env MCP_HOST")
     parser.add_argument("--port", help="env MCP_PORT")
     parser.add_argument("--max-sample-limit", help="env MCP_MAX_SAMPLE_LIMIT")
+    parser.add_argument(
+        "--connection-check",
+        choices=_CONNECTION_CHECKS,
+        help="open a real connection before serving, so a wrong host or "
+        "password is found here and not by an agent mid-task. `require` "
+        "(default) refuses to start, `warn` logs and carries on, `off` skips "
+        "it. env MCP_CONNECTION_CHECK",
+    )
     parser.add_argument(
         "--staging-db",
         help="where a scan accumulates. Without it the inventory tools are not "
@@ -173,6 +183,7 @@ def config_from_args(
     pick("connection_ref", args.connection_ref, "MCP_CONNECTION_REF")
     pick("database", args.database, "MCP_DATABASE")
     pick("max_sample_limit", args.max_sample_limit, "MCP_MAX_SAMPLE_LIMIT")
+    pick("connection_check", args.connection_check, "MCP_CONNECTION_CHECK")
     pick("transport", args.transport, "MCP_TRANSPORT")
     pick("host", args.host, "MCP_HOST")
     pick("port", args.port, "MCP_PORT")
@@ -208,12 +219,73 @@ def config_from_args(
         raise ConfigurationError(str(exc)) from exc
 
 
-def build(config: ServerConfig) -> FastMCP:
+def describe_source(config: ServerConfig, conn_info: ConnectionInfo) -> str:
+    """
+    The connection, in a form fit for a log line.
+
+    Assembled from the parts rather than printed whole: a `<REF>_URI` carries
+    the password inside it, and this string ends up in logs, in `docker compose
+    logs`, and in whatever anyone pastes into a ticket.
+    """
+    if conn_info.path:
+        return f"{config.engine} at {conn_info.path}"
+    where = conn_info.host or "?"
+    if conn_info.port:
+        where = f"{where}:{conn_info.port}"
+    if conn_info.uri and not conn_info.host:
+        # A whole URI was given and there are no parts to read; name the
+        # variable it came from without quoting any of it.
+        ref = (config.connection_ref or "source").upper()
+        where = f"the address in {ref}_URI"
+    who = f"{conn_info.user}@" if conn_info.user else ""
+    database = f"/{conn_info.database}" if conn_info.database else ""
+    return f"{config.engine} as {who}{where}{database}"
+
+
+def verify_connection(
+    config: ServerConfig, conn_info: ConnectionInfo, provider: AdapterPool
+) -> None:
+    """
+    Open one real connection before the port is bound.
+
+    The pool is lazy, so without this the first thing to discover a wrong host
+    or a wrong password is an agent, halfway through a task, via a tool error —
+    on a server whose logs said it started fine. Opening a connection here is
+    the whole check: the driver authenticates during the handshake and the
+    adapter runs a statement immediately after, so a success means the host is
+    reachable *and* the credentials are accepted, not merely that something
+    answers on the port.
+
+    `require` refuses to start, which is the honest state for a server that
+    cannot serve: it crash-loops visibly under `restart: unless-stopped`
+    instead of accepting requests it will fail. `warn` is for a source that is
+    legitimately not up yet when this is.
+    """
+    target = describe_source(config, conn_info)
+    try:
+        provider.get()
+    except Exception as exc:  # noqa: BLE001 - every driver has its own errors
+        message = f"cannot reach {target}: {exc}"
+        if config.connection_check == "warn":
+            log.warning(f"{message} — starting anyway (connection_check=warn)")
+            return
+        raise ConfigurationError(
+            f"{message}\nThe server will not start while it cannot reach its "
+            f"source. Fix the connection, or set MCP_CONNECTION_CHECK=warn to "
+            f"start anyway and fail per request."
+        ) from exc
+    log.info(f"connected to {target}: the address answers and the login is accepted")
+
+
+def build(config: ServerConfig, *, check_connection: bool = False) -> FastMCP:
     """
     Wire the tools onto the configured source.
 
     Nothing starts listening here; `main` picks the transport. The server's
     lifespan owns the teardown of everything built below.
+
+    `check_connection` is off by default and on when serving: building a server
+    is also what the tests do, and they should not need a database to do it.
     """
     if not config.connection_ref:
         raise ConfigurationError(
@@ -245,6 +317,9 @@ def build(config: ServerConfig) -> FastMCP:
         max_sample_limit=config.max_sample_limit,
         default_database=config.database,
     )
+
+    if check_connection and config.connection_check != "off":
+        verify_connection(config, conn_info, provider)
 
     inventory = None
     if config.staging_db_path is not None:
@@ -293,7 +368,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         config = config_from_args(args)
-        mcp = build(config)
+        # Serving, so the source has to be there: this is the one caller that
+        # opens a connection before anything is wired up.
+        mcp = build(config, check_connection=True)
     except (ConfigurationError, ValueError) as exc:
         # stderr, never stdout: on stdio that stream carries JSON-RPC
         print(f"error: {exc}", file=sys.stderr)

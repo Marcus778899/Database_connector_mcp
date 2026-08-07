@@ -12,6 +12,11 @@
 [skill]
 # The frontmatter description. This line is what a skill is matched against, so
 # it carries the words a request would actually use.
+#
+# Do not quote it yourself. It is wrapped as a valid YAML string, with escaping,
+# when the document is generated — a normal sentence sooner or later contains a
+# colon followed by a space, which an unquoted YAML scalar reads as a nested
+# mapping, and the whole frontmatter then fails to parse.
 description = "Explore the {engine_display} data catalog behind {server_name}: what tables and columns exist, what they mean, and how they join. Use when asked about the data itself rather than about code."
 role_line = " in the `{role}` role ({role_description})"
 role_line_plain = " in the `{role}` role"

@@ -259,6 +259,24 @@ def codex_toml(
 # ------------------------------------------------------------------- rendering ---
 
 
+def yaml_scalar(text: str) -> str:
+    """
+    One line of free text, safe to drop into the SKILL.md frontmatter.
+
+    A YAML plain scalar may not contain `: ` — colon then space — and a skill
+    description is a sentence, so sooner or later it does. Unquoted, the parser
+    reads the text after the colon as a nested mapping and the whole frontmatter
+    fails; the client then sees a skill with no description, or no skill at all.
+
+    Quoting happens here rather than in the template because the text comes from
+    a phrases file that anyone may edit, and quoting it there would leave the
+    escaping to whoever writes the sentence. `json.dumps` is exactly the right
+    tool despite the name: a JSON string *is* a YAML double-quoted scalar, with
+    the same escapes.
+    """
+    return json.dumps(" ".join(text.split()), ensure_ascii=False)
+
+
 def render(template: str, values: dict[str, str]) -> str:
     """`{{name}}` and nothing else, so prose containing $ or ${} is left alone."""
     missing: list[str] = []
@@ -572,8 +590,12 @@ def main() -> int:
         (template_dir / "SKILL.md.tmpl").read_text(encoding="utf-8"),
         {
             "skill_slug": slug,
-            "skill_description": phrases["skill"]["description"].format(
-                server_name=server_name, engine_display=engine_display
+            # Already quoted — see `yaml_scalar`. The template must not add
+            # quotes of its own.
+            "skill_description": yaml_scalar(
+                phrases["skill"]["description"].format(
+                    server_name=server_name, engine_display=engine_display
+                )
             ),
             "server_name": server_name,
             "engine": engine,

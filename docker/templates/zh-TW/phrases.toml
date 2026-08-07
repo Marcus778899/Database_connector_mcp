@@ -9,6 +9,10 @@
 [skill]
 # frontmatter 的 description。這一行是決定 skill 要不要被觸發的比對依據，所以中英
 # 關鍵詞都要在裡面——使用者可能用任何一種語言問。
+#
+# 不要自己加引號。產生的時候會包成合法的 YAML 字串並處理跳脫——一句正常的句子遲早
+# 會出現「冒號加空格」，那在沒有引號的 YAML 裡會被讀成巢狀 mapping，整份 frontmatter
+# 就壞了。
 description = "查詢 {server_name} 後面那個 {engine_display} 來源的資料目錄：有哪些資料表與欄位、代表什麼意思、彼此怎麼關聯。Explore the {engine_display} data catalog: tables, columns, meanings and joins. 當問題是關於「資料本身」而不是關於程式碼時使用。"
 role_line = "，角色是 `{role}`（{role_description}）"
 role_line_plain = "，角色是 `{role}`"

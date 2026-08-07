@@ -13,7 +13,7 @@ import pytest
 from fastmcp import Client
 
 import main as entry
-from src.core.config import ServerConfig, SourceEngine
+from src.core.config import ConnectionInfo, ServerConfig, SourceEngine
 from src.core.contracts import ProfileMode
 from src.service import factory
 
@@ -55,6 +55,7 @@ def no_ambient_env(monkeypatch: pytest.MonkeyPatch):
         "MCP_PROFILE_MODES",
         "MCP_REQUIRE_AUTH",
         "MCP_ALLOW_INSECURE_HTTP",
+        "MCP_CONNECTION_CHECK",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -277,6 +278,122 @@ def test_staging_into_the_source_is_refused(source_env: str, db: Path):
     """The staging store would otherwise write into the database being read."""
     with pytest.raises(entry.ConfigurationError, match="MCP_STAGING_DB"):
         entry.build(ServerConfig(connection_ref=source_env, staging_db_path=db))
+
+
+# ---- the connection is checked before the port is bound ----
+
+
+def test_a_reachable_source_is_confirmed_in_the_log(source_env: str, caplog):
+    """
+    The point of the whole check: something in the log that says the login
+    worked, rather than silence that means nobody has tried yet.
+    """
+    entry.build(ServerConfig(connection_ref=source_env), check_connection=True)
+
+    assert "login is accepted" in caplog.text
+
+
+def test_an_unreachable_source_stops_the_server_starting(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """
+    A wrong host used to be discovered by an agent, mid-task, through a tool
+    error — on a server whose own logs said it started fine.
+    """
+    monkeypatch.setenv("LOCAL_PATH", str(tmp_path / "nope" / "missing.db"))
+
+    with pytest.raises(entry.ConfigurationError, match="cannot reach"):
+        entry.build(ServerConfig(connection_ref="local"), check_connection=True)
+
+
+def test_the_failure_says_how_to_start_anyway(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    monkeypatch.setenv("LOCAL_PATH", str(tmp_path / "nope" / "missing.db"))
+
+    with pytest.raises(entry.ConfigurationError) as caught:
+        entry.build(ServerConfig(connection_ref="local"), check_connection=True)
+
+    assert "MCP_CONNECTION_CHECK=warn" in str(caught.value)
+
+
+def test_warn_starts_anyway(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog):
+    """For a source that is legitimately slower to come up than this is."""
+    monkeypatch.setenv("LOCAL_PATH", str(tmp_path / "nope" / "missing.db"))
+
+    entry.build(
+        ServerConfig(connection_ref="local", connection_check="warn"),
+        check_connection=True,
+    )
+
+    assert "starting anyway" in caplog.text
+
+
+def test_off_does_not_open_a_connection(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    monkeypatch.setenv("LOCAL_PATH", str(tmp_path / "nope" / "missing.db"))
+
+    entry.build(
+        ServerConfig(connection_ref="local", connection_check="off"),
+        check_connection=True,
+    )
+
+
+def test_building_without_serving_does_not_touch_the_source(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """`build` is what the tests do; only `main` is what serves."""
+    monkeypatch.setenv("LOCAL_PATH", str(tmp_path / "nope" / "missing.db"))
+
+    entry.build(ServerConfig(connection_ref="local"))
+
+
+@pytest.mark.parametrize(
+    "conn, expected",
+    [
+        (
+            ConnectionInfo(
+                host="db.internal", port=1433, user="reader", database="shop"
+            ),
+            "mssql as reader@db.internal:1433/shop",
+        ),
+        (ConnectionInfo(host="db.internal"), "mssql as db.internal"),
+        (ConnectionInfo(path="/source/shop.db"), "mssql at /source/shop.db"),
+    ],
+)
+def test_the_source_is_described_without_its_password(
+    conn: ConnectionInfo, expected: str
+):
+    config = ServerConfig(engine=SourceEngine.MSSQL, connection_ref="shop")
+
+    assert entry.describe_source(config, conn) == expected
+
+
+def test_a_uri_is_never_quoted_back(caplog):
+    """It carries the password inside it, and this string goes to a log."""
+    config = ServerConfig(engine=SourceEngine.POSTGRES, connection_ref="shop")
+    conn = ConnectionInfo(uri="postgresql://reader:s3cret@db.internal/shop")
+
+    described = entry.describe_source(config, conn)
+
+    assert "s3cret" not in described
+    assert "SHOP_URI" in described
+
+
+def test_the_check_is_required_by_default():
+    assert ServerConfig().connection_check == "require"
+
+
+def test_the_check_can_be_set_from_the_environment():
+    config = _config([], {"MCP_CONNECTION_CHECK": "warn"})
+
+    assert config.connection_check == "warn"
+
+
+def test_a_check_mode_nobody_recognises_is_refused():
+    with pytest.raises(entry.ConfigurationError):
+        _config([], {"MCP_CONNECTION_CHECK": "maybe"})
 
 
 def test_an_unimplemented_engine_is_reported(monkeypatch: pytest.MonkeyPatch, db: Path):
