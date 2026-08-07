@@ -80,6 +80,50 @@ cmd_serve() {
 
 # -------------------------------------------------------------- provision ---
 
+# Why the server would refuse the token on file, or nothing at all when it
+# would accept it.
+#
+# Existence is not enough to go on. `docker compose down -v` takes the key
+# volumes with it and leaves the bind-mounted ./out behind, so the next start
+# regenerates the key pair while yesterday's token is still sitting there —
+# and the server then rejects it with InvalidSignatureError, which reads as a
+# broken deployment rather than a stale file. An expired token and an audience
+# changed in .env fail the same way, so ask the only question that settles all
+# three: would the server accept this?
+_token_rejected_because() {
+    python - "$1" "$2" "${MCP_AUDIENCE:-}" <<'PY'
+import sys
+
+import jwt
+
+token_path, public_path, audience = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    token = open(token_path, encoding="utf-8").read().strip()
+    public = open(public_path, encoding="utf-8").read()
+except OSError as exc:
+    print(f"{exc.filename} cannot be read")
+    raise SystemExit(0)
+
+# Mirrors src/auth/verifier.py, so a token that passes here passes there.
+try:
+    jwt.decode(
+        token,
+        public,
+        algorithms=["EdDSA", "ES256", "RS256"],
+        audience=audience or None,
+        options={"verify_aud": bool(audience)},
+    )
+except jwt.ExpiredSignatureError:
+    print("it has expired")
+except jwt.InvalidAudienceError:
+    print(f"it was signed for a different audience than {audience!r}")
+except jwt.InvalidSignatureError:
+    print("it was signed by a key that is no longer on file")
+except jwt.PyJWTError as exc:
+    print(f"it is unusable ({type(exc).__name__})")
+PY
+}
+
 cmd_provision() {
     local kid="${PROVISION_KID:-}"
     local has_scope=0
@@ -153,10 +197,20 @@ cmd_provision() {
         --out "$private_key" \
         --if-missing >&2
 
-    if [ -e "$token_file" ] && ! is_true "${PROVISION_FORCE:-}"; then
-        say "token         $token_file   already there, keeping it" \
-            "(PROVISION_FORCE=1 to sign a new one)"
+    local reason=""
+    if is_true "${PROVISION_FORCE:-}"; then
+        reason="PROVISION_FORCE is set"
+    elif [ ! -e "$token_file" ]; then
+        reason="there is no token yet"
     else
+        reason="$(_token_rejected_because "$token_file" "$KEYS_DIR/$kid.pub")"
+    fi
+
+    if [ -z "$reason" ]; then
+        say "token         $token_file   still verifies against $KEYS_DIR/$kid.pub," \
+            "keeping it (PROVISION_FORCE=1 to sign a new one)"
+    else
+        say "signing a token: $reason"
         # --out keeps the token off stdout: it belongs in a file with 0600 on
         # it, not in a compose log that anything can scroll back through.
         mcp-connector token issue \

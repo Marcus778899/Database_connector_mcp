@@ -79,6 +79,11 @@ class ProvisionError(Exception):
     """The artifacts cannot be generated from what was given."""
 
 
+def _truthy(raw: str | None) -> bool:
+    """The spellings entrypoint.sh and main.py both accept."""
+    return (raw or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 @dataclass(frozen=True)
 class Tool:
     name: str
@@ -215,21 +220,29 @@ def mcp_json(
     image: str,
     connection_ref: str,
     engine: str,
+    inline_token: str | None = None,
 ) -> dict[str, Any]:
     """
     The server entry a client adds.
 
-    The token is referenced as `${VAR}` rather than written in: this file ends
-    up in a project, and a bearer token pasted into a project is a credential in
-    everything that project is ever copied into.
+    The token is referenced as `${VAR}` by default rather than written in: this
+    file ends up in a project, and a bearer token pasted into a project is a
+    credential in every copy that project ever has.
+
+    Not every client expands `${...}` though, and one that does not sends the
+    literal text as the bearer token — which the server rejects for having the
+    wrong shape, not for being the wrong token, so the error says nothing about
+    the cause. `PROVISION_INLINE_TOKEN=1` writes the token itself for those
+    clients. Gitignore the result.
     """
     if transport in NETWORK_TRANSPORTS:
+        bearer = inline_token if inline_token else f"${{{token_env}}}"
         return {
             "mcpServers": {
                 server_name: {
                     "type": "http",
                     "url": url,
-                    "headers": {"Authorization": f"Bearer ${{{token_env}}}"},
+                    "headers": {"Authorization": f"Bearer {bearer}"},
                 }
             }
         }
@@ -433,6 +446,7 @@ def install_notes(
     url: str,
     token_env: str,
     token_file: Path,
+    inline_token: str | None = None,
 ) -> str:
     lines = [
         f"# Installing `{server_name}`",
@@ -454,15 +468,31 @@ def install_notes(
         "## The credential",
         "",
     ]
-    if transport in NETWORK_TRANSPORTS:
+    if transport in NETWORK_TRANSPORTS and inline_token:
         lines += [
-            f"The token is in `{token_file.name}` and is referenced as",
-            f"`${{{token_env}}}` rather than written into the config. Export it",
-            "from wherever you keep secrets:",
+            f"`.mcp.json` carries the token itself, because PROVISION_INLINE_TOKEN",
+            "was set. **That file is now a credential** — gitignore it, and do not",
+            "copy it anywhere you would not copy the password.",
+            "",
+            f"The server is expected at {url}.",
+        ]
+    elif transport in NETWORK_TRANSPORTS:
+        lines += [
+            f"The token is in `{token_file.name}`. `.mcp.json` refers to it as",
+            f"`${{{token_env}}}` rather than embedding it, so export it in the",
+            "shell you start the client from:",
             "",
             "```bash",
             f"export {token_env}=$(cat {token_file.name})",
             "```",
+            "",
+            "**If your client does not expand `${...}`**, it sends that text",
+            "verbatim and the server rejects it as malformed — the error talks",
+            "about the token's shape and not about the variable, so it is easy to",
+            "misread. Two ways out: replace the placeholder in `.mcp.json` with",
+            f"the contents of `{token_file.name}` by hand, or re-run provision",
+            "with `PROVISION_INLINE_TOKEN=1` to have it written in. Either way the",
+            "file becomes a credential — gitignore it.",
             "",
             f"The server is expected at {url}. Change it in `.mcp.json` if you",
             "publish it elsewhere.",
@@ -498,8 +528,10 @@ def main() -> int:
     image = os.environ.get("PROVISION_IMAGE") or "database-mcp-connector:slim"
     url = os.environ.get("PROVISION_PUBLIC_URL") or "http://localhost:8000/mcp"
 
-    claims = token_claims(token_path.read_text(encoding="utf-8"))
+    raw_token = token_path.read_text(encoding="utf-8").strip()
+    claims = token_claims(raw_token)
     scopes = {s for s in claims.get("scopes", []) if isinstance(s, str)}
+    inline = raw_token if _truthy(os.environ.get("PROVISION_INLINE_TOKEN")) else None
 
     tools = served(
         discover_tools(_server_source()),
@@ -530,6 +562,7 @@ def main() -> int:
         image=image,
         connection_ref=connection_ref,
         engine=engine,
+        inline_token=inline,
     )
 
     skill = render(
@@ -572,10 +605,14 @@ def main() -> int:
             url=url,
             token_env=token_env,
             token_file=token_path,
+            inline_token=inline,
         )),
     ]
     for path, content in written:
         path.write_text(content, encoding="utf-8")
+    if inline is not None:
+        # It now holds a bearer token, so it gets a credential's permissions.
+        (plugin_dir / ".mcp.json").chmod(0o600)
 
     # stderr throughout: this runs from the entrypoint, whose stdout may be a
     # JSON-RPC channel.
@@ -587,6 +624,23 @@ def main() -> int:
         f"{', '.join(sorted(callable_names)) or 'none'}",
         file=sys.stderr,
     )
+    # The step that is easy to miss, and whose failure surfaces as a complaint
+    # about the token's shape rather than about the variable never being set.
+    if transport in NETWORK_TRANSPORTS and inline is None:
+        print(
+            f"\n.mcp.json refers to the token as ${{{token_env}}}. Export it in the "
+            f"shell you start the client from:\n"
+            f"    export {token_env}=$(cat {token_path})\n"
+            f"A client that does not expand ${{...}} needs the token written in "
+            f"instead — re-run with PROVISION_INLINE_TOKEN=1. See INSTALL.md.",
+            file=sys.stderr,
+        )
+    elif transport in NETWORK_TRANSPORTS:
+        print(
+            f"\n.mcp.json carries the token itself and is now a credential (0600). "
+            f"Gitignore it.",
+            file=sys.stderr,
+        )
     return 0
 
 

@@ -101,8 +101,14 @@ docker compose up -d
 **切割點在 volume，不在 image。** 簽章金鑰寫進一個 `server` 沒有掛載的 volume，所
 以就算 server 被攻下，攻擊者也沒有能力自己簽一張 token 給自己。維持這個狀態。
 
-`provision` 是冪等的 —— 每次 `up` 都會再跑一次，但會沿用已經產生的金鑰和 token，
-因為重新產生金鑰對會讓所有已經發出去的 token 全部失效。要重簽就 `PROVISION_FORCE=1`。
+`provision` 是冪等的 —— 每次 `up` 都會再跑一次，但只有在「server 現在**會拒絕**手上
+這張 token」時才重簽：金鑰被換掉、token 過期、或 `MCP_AUDIENCE` 改了。三種情況它都
+會說明原因。想無條件重簽就 `PROVISION_FORCE=1`。
+
+> 這裡有個一定要知道的組合：金鑰在 named volume 上，token 在 bind mount 的 `./out`
+> 上。`docker compose down -v` 會帶走前者、留下後者。所以檢查的是「這張 token 還驗
+> 得過嗎」，而不是「檔案還在嗎」—— 只看檔案在不在的話，你會拿著一張用已經不存在的
+> 金鑰簽出來的 token，然後 server 回 `InvalidSignatureError`。
 
 跑完之後你收到的東西：
 
@@ -269,8 +275,19 @@ marketplace 指向它。
 }
 ```
 
-token 請保持 `${VAR}` 引用，不要直接貼進去。這個檔案最後會躺在專案裡，而躺在專案裡
-的 bearer token 等於在這個專案的每一份拷貝裡都有一份憑證。
+token 預設保持 `${VAR}` 引用，不直接貼進去 —— 這個檔案最後會躺在專案裡，而躺在專案
+裡的 bearer token 等於在這個專案的每一份拷貝裡都有一份憑證。變數的值來自**啟動
+client 的那個 shell**：
+
+```bash
+export ETL_AGENT_MCP_TOKEN=$(cat out/agent.jwt)
+```
+
+但不是每個 client 都會展開 `${...}`。不展開的 client 會把那串字面值當成 token 送出，
+server 則以「格式不是 JWT」拒絕 —— 錯誤訊息講的是 token 的形狀，完全不會提到變數，
+所以很容易往錯的方向查。遇到這種 client，用 `PROVISION_INLINE_TOKEN=1` 重跑
+provision，它會把 token 直接寫進 `.mcp.json` 並設成 `0600`。那個檔案從此是一份憑證，
+記得加進 `.gitignore`。
 
 ## 認證
 
