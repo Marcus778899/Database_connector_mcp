@@ -2,14 +2,21 @@
 # holds the signing key and never listens, `server` listens and never sees a
 # signing key. Losing the server therefore does not get you the ability to
 # issue yourself a token.
+#
+# MCP_ENGINE is named once, in .env, and reaches both the build (which drivers
+# to install) and the runtime (which adapter to use). The tag carries it too,
+# because `docker compose up` without --build reuses whatever image already has
+# the name: a tag that stayed the same while the engine changed would hand you
+# a container configured for one engine and carrying another's drivers.
 
 name: database-mcp-connector
 
 x-image: &image
-  image: database-mcp-connector:${MCP_TAG:-slim}
+  image: database-mcp-connector:${MCP_ENGINE:-sqlite}
   build:
     context: .
-    target: ${MCP_TARGET:-slim}
+    args:
+      MCP_ENGINES: ${MCP_ENGINE:-sqlite}
 
 # What the server is, shared by both services. `provision` needs it not to
 # serve anything but to describe it: which tools exist depends on whether a
@@ -37,18 +44,22 @@ services:
     restart: "no"
     environment:
       <<: *shape
-      PROVISION_KID: ${PROVISION_KID:-agent}
-      # Comma separated; the tools this token may call. Nothing else is
-      # reachable with it, and the generated SKILL.md lists exactly these.
-      PROVISION_SCOPES: ${PROVISION_SCOPES:-list_containers,get_schema,get_sample,inventory_summary,inventory_search,inventory_columns,inventory_export}
-      PROVISION_LIFETIME: ${PROVISION_LIFETIME:-30d}
+      # `<kid>=<role>` pairs: the agent's name, and what it may do. Each gets
+      # its own key pair, its own token and its own bundle under ./out, with a
+      # SKILL.md describing that role and no other. Roles are defined in
+      # docker/roles.toml — `docker compose run --rm provision role list`.
+      PROVISION_IDENTITIES: ${PROVISION_IDENTITIES:-de=de,pm=pm}
+      PROVISION_LIFETIME: ${PROVISION_LIFETIME:-}
+      PROVISION_LANG: ${PROVISION_LANG:-zh-TW}
       # Where the agent will reach the server from, which the container cannot
       # work out for itself — it only knows the port it bound inside.
       PROVISION_PUBLIC_URL: ${PROVISION_PUBLIC_URL:-http://localhost:${MCP_PUBLISHED_PORT:-8000}/mcp}
     volumes:
       - mcp-keys:/keys # public halves, shared with the server
       - mcp-private:/private # signing key, deliberately not shared
-      - ./out:/out # the token, for you to collect
+      - ./out:/out # the tokens, for you to collect
+      # Uncomment to edit the roles without rebuilding the image.
+      # - ./docker/roles.toml:/etc/mcp/roles.toml:ro
 
   server:
     <<: *image

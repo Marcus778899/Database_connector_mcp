@@ -10,12 +10,14 @@ describe every arrangement, and would therefore describe none of them — worse,
 it would name tools that are not served, which an agent then spends turns
 discovering.
 
-Two things are read rather than assumed:
+Three things are read rather than assumed:
 
-  * the tool list comes from the AST of `src/server.py`, so it cannot drift
-    from what the server actually registers;
+  * the tool list comes from `src.core.tools`, the same table the roles file is
+    validated against, so a skill cannot name a tool the server has not got;
   * the grants come from the token that was just signed, so the skill and the
-    credential can never disagree.
+    credential can never disagree;
+  * the role's own description comes from the roles file, so an agent is told
+    what its role is *for* and not only what it may call.
 
 Run by entrypoint.sh after `token issue`. Opens no database and contacts no
 server.
@@ -23,19 +25,32 @@ server.
 
 from __future__ import annotations
 
-import ast
 import base64
-import importlib.util
 import json
 import os
 import re
 import sys
-from dataclasses import dataclass
+import tomllib
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+# Installed as a wheel in the image; a checkout needs the repository root on the
+# path, since this file lives in docker/ rather than beside src/.
+try:
+    from src.core.engines import DISPLAY_NAMES, parse_engine
+    from src.core.tools import ToolGroup, ToolSpec, served
+except ImportError:  # pragma: no cover - exercised by running from a checkout
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from src.core.engines import DISPLAY_NAMES, parse_engine
+    from src.core.tools import ToolGroup, ToolSpec, served
+
 TEMPLATE_DIR = Path(__file__).resolve().parent / "templates"
+
+# The language the generated documents are written in. Tool names, parameter
+# names and claim names are identifiers and are never translated — a SKILL.md
+# that localised `get_sample` would describe a tool that does not exist.
+DEFAULT_LANG = "zh-TW"
 
 # The transports that mean "a client connects to a URL" rather than "a client
 # spawns the process". They need different artifacts, not different values in
@@ -45,25 +60,6 @@ NETWORK_TRANSPORTS = frozenset({"http", "streamable-http", "sse"})
 # Registered inside `_register_inventory_tools`, and only reached when an export
 # directory was configured — src/server.py returns before it otherwise.
 NEEDS_EXPORT_DIR = "inventory_export"
-
-# How a catalog too large to read should be approached, in the order a task
-# should try them. Kept here rather than in the template because the rows have
-# to be dropped when the tool behind them is not served.
-CATALOG_ROUTES: tuple[tuple[str, str, str], ...] = (
-    ("how big is this", "inventory_summary", "counts only, a few hundred bytes"),
-    ("where is the thing I mean", "inventory_search", "narrow hits, no statistics"),
-    (
-        "what is in this table",
-        "inventory_columns",
-        "one page; pass `include_profile=False` on a wide one",
-    ),
-    (
-        "all of it",
-        "inventory_export",
-        "**a file** — only its path comes back, never the contents",
-    ),
-)
-
 
 # Prose that is only true when the tool it is about is reachable. Telling an
 # agent how to sample responsibly when it cannot sample at all wastes context
@@ -84,101 +80,40 @@ def _truthy(raw: str | None) -> bool:
     return (raw or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
-@dataclass(frozen=True)
-class Tool:
-    name: str
-    summary: str
-    inventory: bool
+def _is_false(raw: str | None) -> bool:
+    """
+    Explicitly turned off, as opposed to not mentioned.
+
+    Needed where the default is on: an unset variable and `PROVISION_INLINE_TOKEN=0`
+    have to mean different things.
+    """
+    return (raw or "").strip().lower() in {"0", "false", "no", "off"}
 
 
 # ------------------------------------------------------------ what is served ---
 
 
-def _server_source() -> Path:
+def load_phrases(lang: str) -> tuple[dict[str, Any], Path]:
     """
-    Locate `src/server.py` without importing it.
+    The strings for one language, and the directory they came from.
 
-    `find_spec` imports the parent package only, which is a namespace package
-    here and therefore free. Importing the module itself would drag in every
-    adapter, and the slim image deliberately lacks some of their drivers.
+    An unknown language is refused rather than quietly falling back to English:
+    a deployment that set PROVISION_LANG=zh and got English would look like the
+    setting did nothing.
     """
+    directory = TEMPLATE_DIR / lang
+    phrases = directory / "phrases.toml"
+    if not phrases.is_file():
+        available = ", ".join(
+            sorted(entry.name for entry in TEMPLATE_DIR.iterdir() if entry.is_dir())
+        )
+        raise ProvisionError(
+            f"no templates for PROVISION_LANG={lang!r}. Available: {available}"
+        )
     try:
-        spec = importlib.util.find_spec("src.server")
-    except (ImportError, ValueError):
-        spec = None
-    if spec is not None and spec.origin:
-        return Path(spec.origin)
-
-    # Running from a checkout rather than the image.
-    local = Path(__file__).resolve().parent.parent / "src" / "server.py"
-    if local.is_file():
-        return local
-    raise ProvisionError("cannot find src/server.py to read the tool list from")
-
-
-def _is_tool_decorator(node: ast.expr) -> bool:
-    """Matches `@mcp.tool`, which is how every tool in server.py is registered."""
-    target = node.func if isinstance(node, ast.Call) else node
-    return isinstance(target, ast.Attribute) and target.attr == "tool"
-
-
-def _summarise(doc: str | None) -> str:
-    """
-    The first sentence of the docstring, on one line.
-
-    The whole docstring is what the MCP client already shows the model; this is
-    for a table of contents, where the job is to be scannable.
-    """
-    if not doc:
-        return ""
-    first = doc.strip().split("\n\n")[0]
-    collapsed = " ".join(first.split())
-    match = re.search(r"^(.+?[.;])(?:\s|$)", collapsed)
-    if match is None:
-        return collapsed
-    # A docstring that runs on past a semicolon is being cut mid-thought, so the
-    # clause that is kept ends as a sentence rather than as a dangling ';'.
-    return (
-        match.group(1).rstrip(";") + "."
-        if match.group(1).endswith(";")
-        else match.group(1)
-    )
-
-
-def discover_tools(source: Path) -> list[Tool]:
-    """Every `@mcp.tool` in server.py, in the order it is registered."""
-    tree = ast.parse(source.read_text(encoding="utf-8"))
-    tools: list[Tool] = []
-    for registrar in tree.body:
-        if not isinstance(registrar, ast.FunctionDef):
-            continue
-        if not registrar.name.startswith("_register"):
-            continue
-        inventory = "inventory" in registrar.name
-        for node in registrar.body:
-            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                continue
-            if not any(_is_tool_decorator(dec) for dec in node.decorator_list):
-                continue
-            tools.append(
-                Tool(
-                    name=node.name,
-                    summary=_summarise(ast.get_docstring(node)),
-                    inventory=inventory,
-                )
-            )
-    if not tools:
-        raise ProvisionError(f"no @mcp.tool functions found in {source}")
-    return tools
-
-
-def served(tools: list[Tool], *, staging: bool, export: bool) -> list[Tool]:
-    """Filter to what this server actually registers, matching main.py's gates."""
-    return [
-        tool
-        for tool in tools
-        if (staging or not tool.inventory) and (export or tool.name != NEEDS_EXPORT_DIR)
-    ]
+        return tomllib.loads(phrases.read_text(encoding="utf-8")), directory
+    except tomllib.TOMLDecodeError as exc:
+        raise ProvisionError(f"cannot read {phrases}: {exc}") from exc
 
 
 # ------------------------------------------------------------------- the token ---
@@ -228,15 +163,18 @@ def mcp_json(
     """
     The server entry a client adds.
 
-    The token is referenced as `${VAR}` by default rather than written in: this
-    file ends up in a project, and a bearer token pasted into a project is a
-    credential in every copy that project ever has.
+    The token is written in by default. `${VAR}` reads better and is what this
+    used to do, but it asks two things at once: that the client expands
+    variables, and that the shell which exported it is the one that started the
+    client. A client launched from a desktop app satisfies neither, and what it
+    sends is the literal placeholder — which the server rejects for its shape
+    rather than for being the wrong token, so the error names neither the
+    variable nor the cause.
 
-    Not every client expands `${...}` though, and one that does not sends the
-    literal text as the bearer token — which the server rejects for having the
-    wrong shape, not for being the wrong token, so the error says nothing about
-    the cause. `PROVISION_INLINE_TOKEN=1` writes the token itself for those
-    clients. Gitignore the result.
+    Nothing is lost by writing it in. The bundle already holds the same token as
+    a file next to this one, so the directory is a credential either way, and
+    both get 0600. `PROVISION_INLINE_TOKEN=0` goes back to the placeholder for
+    a client that does expand it.
     """
     if transport in NETWORK_TRANSPORTS:
         bearer = inline_token if inline_token else f"${{{token_env}}}"
@@ -342,125 +280,172 @@ def render(template: str, values: dict[str, str]) -> str:
     return re.sub(r"\n{3,}", "\n\n", output)
 
 
-def catalog_guidance(callable_names: set[str]) -> str:
+def catalog_guidance(phrases: dict, callable_names: set[str]) -> str:
     """
     The routes through a catalog too large to read, and the advice that closes
     them. Both halves are generated: without the inventory tools the table has
     nothing in it, and the advice that would follow it — reach for an export —
     names a tool that is not there.
     """
-    rows = [
-        (want, tool, note)
-        for want, tool, note in CATALOG_ROUTES
-        if tool in callable_names
-    ]
+    section = phrases["catalog"]
+    rows = [route for route in section["routes"] if route["tool"] in callable_names]
     if not rows:
-        return (
-            "This connection has no stored catalog to page through, so there is\n"
-            "nothing to summarise or export. Work from `list_containers` and then\n"
-            "`get_schema`, one container at a time, and keep what you learn in your\n"
-            "own notes rather than asking again."
-        )
-    lines = ["| you want | ask for | what comes back |", "|---|---|---|"]
-    lines += [f"| {want} | `{tool}` | {note} |" for want, tool, note in rows]
-    closing = "\nWork outside in. Ask for counts, then narrow, then read one page."
+        return section["empty"].strip()
+
+    head = section["head"]
+    lines = [
+        "| " + " | ".join(head) + " |",
+        "|" + "---|" * len(head),
+    ]
+    lines += [
+        f"| {route['want']} | `{route['tool']}` | {route['gets']} |" for route in rows
+    ]
+    closing = section["closing"]
     if NEEDS_EXPORT_DIR in callable_names:
-        closing += (
-            ' Reach\nfor an export when the answer is "all of it" — the file is the '
-            "deliverable\nand only its path comes back."
-        )
-    return "\n".join(lines) + "\n" + closing
+        # The separator is the language's, not a space: a space between two
+        # sentences is an English convention, and one after `。` reads as a
+        # typo in Chinese.
+        closing += section.get("sentence_join", " ") + section["closing_export"]
+    return "\n".join(lines) + "\n\n" + closing
 
 
-def conditional_sections(callable_names: set[str]) -> str:
+def conditional_sections(directory: Path, callable_names: set[str]) -> str:
     """The fragments whose subject this token can actually reach."""
     chosen = [
-        (TEMPLATE_DIR / filename).read_text(encoding="utf-8").strip()
+        (directory / filename).read_text(encoding="utf-8").strip()
         for tool, filename in CONDITIONAL_SECTIONS
         if tool in callable_names
     ]
     return "\n\n".join(chosen)
 
 
-def tool_reference(tools: list[Tool], callable_names: set[str]) -> str:
-    lines = ["## Tools you can call", ""]
-    for group, label in ((False, "Catalog"), (True, "Inventory")):
-        rows = [t for t in tools if t.inventory is group and t.name in callable_names]
+def tool_reference(
+    phrases: dict, tools: tuple[ToolSpec, ...], callable_names: set[str]
+) -> str:
+    section = phrases["tools"]
+    lines = [section["heading"], ""]
+    for group, label in (
+        (ToolGroup.CATALOG, section["catalog"]),
+        (ToolGroup.INVENTORY, section["inventory"]),
+    ):
+        rows = [
+            spec
+            for spec in tools
+            if spec.group is group and spec.name in callable_names
+        ]
         if not rows:
             continue
+        # The registry's summaries are English, because they sit next to the
+        # code. A language pack may override them; anything it does not name
+        # falls back, so adding a tool never leaves a blank line in a document.
+        summaries = section.get("summaries", {})
         lines += [f"### {label}", ""]
-        lines += [f"- `{tool.name}` — {tool.summary}" for tool in rows]
+        lines += [
+            f"- `{spec.name}` — {summaries.get(spec.name, spec.summary)}"
+            for spec in rows
+        ]
         lines += [""]
 
-    withheld = [t.name for t in tools if t.name not in callable_names]
+    withheld = [spec.name for spec in tools if spec.name not in callable_names]
     if withheld:
+        names = ", ".join(f"`{name}`" for name in withheld)
         lines += [
-            "### Served, but not to you",
+            section["withheld_heading"],
             "",
-            "Calling one of these is refused; it is not an outage and not worth a",
-            "retry: " + ", ".join(f"`{name}`" for name in withheld) + ".",
+            section["withheld_body"].format(names=names),
             "",
         ]
     return "\n".join(lines).rstrip()
 
 
-def limits_section(claims: dict[str, Any]) -> str:
-    lines = ["## What this connection may see", ""]
+def limits_section(phrases: dict, claims: dict[str, Any]) -> str:
+    section = phrases["limits"]
+    lines = [section["heading"], ""]
+
     databases = claims.get("databases") or []
     if databases:
-        lines.append(
-            "- Databases: " + ", ".join(f"`{name}`" for name in databases) + " only."
-        )
+        names = ", ".join(f"`{name}`" for name in databases)
+        lines.append(section["databases_only"].format(names=names))
     else:
-        lines.append("- Databases: every database this connection reaches.")
+        lines.append(section["databases_all"])
 
     containers = claims.get("containers") or {}
     allow = containers.get("allow") or []
     deny = containers.get("deny") or []
     if allow:
-        lines.append("- Containers: only " + ", ".join(f"`{p}`" for p in allow) + ".")
+        lines.append(
+            section["containers_allow"].format(
+                names=", ".join(f"`{pattern}`" for pattern in allow)
+            )
+        )
     if deny:
         lines.append(
-            "- Never readable: "
-            + ", ".join(f"`{p}`" for p in deny)
-            + ". These are filtered out of listings too, so a name you cannot find "
-            "may simply be one you are not shown."
+            section["containers_deny"].format(
+                names=", ".join(f"`{pattern}`" for pattern in deny)
+            )
         )
     if not allow and not deny:
-        lines.append("- Containers: no name-based restriction.")
+        lines.append(section["containers_none"])
 
-    if claims.get("allow_raw_sample") is True:
-        lines.append(
-            "- `get_sample(mask=False)` is granted. It is still the wrong default; "
-            "use it when the task turns on the literal value."
-        )
-    else:
-        lines.append(
-            "- `get_sample(mask=False)` is **not** granted. Masked rows are all you "
-            "get, and asking again will not change that."
-        )
+    lines.append(
+        section["raw_granted"]
+        if claims.get("allow_raw_sample") is True
+        else section["raw_denied"]
+    )
     if claims.get("annotate_as_human") is True:
-        lines.append(
-            "- Descriptions you write are recorded as a person's rather than an "
-            "agent's. Be correspondingly careful."
-        )
+        lines.append(section["human"])
     return "\n".join(lines)
 
 
-def expiry_line(claims: dict[str, Any]) -> str:
+def expiry_line(phrases: dict, claims: dict[str, Any]) -> str:
     exp = claims.get("exp")
     if not isinstance(exp, int):
         return ""
     when = datetime.fromtimestamp(exp, UTC).strftime("%Y-%m-%d %H:%M UTC")
-    return (
-        f"The credential expires on {when}; after that every call is refused until "
-        "someone issues a new one."
-    )
+    return phrases["skill"]["expiry"].format(when=when)
+
+
+def role_line(phrases: dict, role: str, description: str) -> str:
+    """
+    What follows the agent's name: which role it is, and what that role is for.
+
+    An agent that knows only its list of tools has to infer the job from the
+    list. Naming the role is a sentence, and it is the sentence that stops a
+    `pm` token from trying to run a scan because it looked useful.
+    """
+    if not role:
+        return ""
+    key = "role_line" if description else "role_line_plain"
+    return phrases["skill"][key].format(role=role, role_description=description)
+
+
+def role_description(role: str) -> str:
+    """
+    The role's own description, if the roles file can be read.
+
+    Best effort: a missing or unreadable roles file is not a reason to fail a
+    provision that has already signed a working token. The document is simply
+    a little less specific.
+    """
+    if not role:
+        return ""
+    try:
+        from src.core.roles import load_roles
+
+        found = load_roles().get(role)
+    except Exception as exc:  # noqa: BLE001 - a document, not a decision
+        print(f"warning: cannot read the roles file ({exc})", file=sys.stderr)
+        return ""
+    return found.description if found else ""
 
 
 def install_notes(
     *,
-    plugin_dir: Path,
+    phrases: dict,
+    bundle: Path,
+    agent: str,
+    role: str,
+    role_summary: str,
     server_name: str,
     transport: str,
     url: str,
@@ -468,65 +453,36 @@ def install_notes(
     token_file: Path,
     inline_token: str | None = None,
 ) -> str:
-    lines = [
-        f"# Installing `{server_name}`",
-        "",
-        "## Claude Code",
-        "",
-        "```bash",
-        f"cp -r {plugin_dir.name} ~/.claude/plugins/{plugin_dir.name}",
-        "```",
-        "",
-        "Or point a marketplace at this directory. `.mcp.json` registers the",
-        "server and `skills/` carries the usage guidance, so both arrive together.",
-        "",
-        "## Codex",
-        "",
-        "Append `codex.toml` to `~/.codex/config.toml`. Codex has no skills, so",
-        "pass `skills/*/SKILL.md` in as context, or paste it into `AGENTS.md`.",
-        "",
-        "## The credential",
-        "",
+    section = phrases["install"]
+    parts = [
+        section["title"].format(server_name=server_name, agent=agent),
+        section["claude_code"].format(bundle=bundle.name).strip(),
+        section["codex"].strip(),
     ]
     if transport in NETWORK_TRANSPORTS and inline_token:
-        lines += [
-            "`.mcp.json` carries the token itself, because PROVISION_INLINE_TOKEN",
-            "was set. **That file is now a credential** — gitignore it, and do not",
-            "copy it anywhere you would not copy the password.",
-            "",
-            f"The server is expected at {url}.",
-        ]
+        parts.append(
+            section["credential_inline"].format(token_env=token_env, url=url).strip()
+        )
     elif transport in NETWORK_TRANSPORTS:
-        lines += [
-            f"The token is in `{token_file.name}`. `.mcp.json` refers to it as",
-            f"`${{{token_env}}}` rather than embedding it, so export it in the",
-            "shell you start the client from:",
-            "",
-            "```bash",
-            f"export {token_env}=$(cat {token_file.name})",
-            "```",
-            "",
-            "**If your client does not expand `${...}`**, it sends that text",
-            "verbatim and the server rejects it as malformed — the error talks",
-            "about the token's shape and not about the variable, so it is easy to",
-            "misread. Two ways out: replace the placeholder in `.mcp.json` with",
-            f"the contents of `{token_file.name}` by hand, or re-run provision",
-            "with `PROVISION_INLINE_TOKEN=1` to have it written in. Either way the",
-            "file becomes a credential — gitignore it.",
-            "",
-            f"The server is expected at {url}. Change it in `.mcp.json` if you",
-            "publish it elsewhere.",
-        ]
+        parts.append(
+            section["credential_env"]
+            .format(token_env=token_env, token_name=token_file.name, url=url)
+            .strip()
+        )
     else:
-        lines += [
-            "Over stdio the client spawns the container and there is no token:",
-            "whoever can start the process already holds the database credential.",
-            "",
-            "Check the `-e` flags in `.mcp.json` — they pass the connection",
-            "variables through from your own environment, and a file-backed engine",
-            "needs a `-v` mount adding for its source.",
-        ]
-    return "\n".join(lines) + "\n"
+        parts.append(section["credential_stdio"].strip())
+
+    if role:
+        parts.append(
+            section["role_note"]
+            .format(
+                agent=agent,
+                role=role,
+                role_description=role_summary or role,
+            )
+            .strip()
+        )
+    return "\n\n".join(parts) + "\n"
 
 
 # ------------------------------------------------------------------------ main ---
@@ -534,6 +490,7 @@ def install_notes(
 
 def main() -> int:
     kid = os.environ.get("PROVISION_KID", "").strip()
+    role = os.environ.get("PROVISION_ROLE", "").strip()
     token_path = Path(os.environ.get("PROVISION_TOKEN_FILE", ""))
     out_dir = Path(os.environ.get("MCP_OUT_DIR", "/out"))
     if not kid:
@@ -545,24 +502,49 @@ def main() -> int:
     engine = os.environ.get("MCP_ENGINE") or "sqlite"
     transport = os.environ.get("MCP_TRANSPORT") or "stdio"
     connection_ref = os.environ.get("MCP_CONNECTION_REF") or "source"
-    image = os.environ.get("PROVISION_IMAGE") or "database-mcp-connector:slim"
+    # The image tag carries the engine, because that is what it was built for.
+    image = os.environ.get("PROVISION_IMAGE") or f"database-mcp-connector:{engine}"
     url = os.environ.get("PROVISION_PUBLIC_URL") or "http://localhost:8000/mcp"
+    lang = os.environ.get("PROVISION_LANG", "").strip() or DEFAULT_LANG
+
+    try:
+        engine_display = DISPLAY_NAMES[parse_engine(engine)]
+    except ValueError:
+        engine_display = engine
+
+    phrases, template_dir = load_phrases(lang)
 
     raw_token = token_path.read_text(encoding="utf-8").strip()
     claims = token_claims(raw_token)
     scopes = {s for s in claims.get("scopes", []) if isinstance(s, str)}
-    inline = raw_token if _truthy(os.environ.get("PROVISION_INLINE_TOKEN")) else None
+    # Written in by default. The `${VAR}` form needs the client to expand
+    # variables *and* to have been started from the shell that exported them,
+    # and a client launched from a desktop app satisfies neither — it sends the
+    # placeholder as the bearer token, which the server rejects for its shape.
+    # The bundle already holds the token as a file, so it is a credential
+    # either way; the only thing the placeholder buys is a failure mode.
+    inline = None if _is_false(os.environ.get("PROVISION_INLINE_TOKEN")) else raw_token
 
     tools = served(
-        discover_tools(_server_source()),
         staging=bool(os.environ.get("MCP_STAGING_DB")),
-        export=bool(os.environ.get("MCP_EXPORT_DIR")),
+        export_dir=bool(os.environ.get("MCP_EXPORT_DIR")),
     )
-    callable_names = {tool.name for tool in tools if tool.name in scopes}
+    callable_names = {spec.name for spec in tools if spec.name in scopes}
     if not callable_names:
         print(
-            f"warning: none of this token's scopes ({', '.join(sorted(scopes)) or 'none'}) "
-            f"name a tool this server serves. Check --scope against the tool list.",
+            f"warning: none of {kid}'s scopes ({', '.join(sorted(scopes)) or 'none'}) "
+            f"name a tool this server serves. Check the role against `role list`.",
+            file=sys.stderr,
+        )
+    # A role that grants tools this server does not register is not an error —
+    # a `de` token is still fine on a server with no staging database — but it
+    # is worth saying, because the difference shows up as a refusal later.
+    unserved = sorted(scopes - {spec.name for spec in tools})
+    if unserved:
+        print(
+            f"note: {kid} is granted {', '.join(unserved)}, which this server does "
+            f"not register (no staging database or export directory configured). "
+            f"They are left out of its SKILL.md.",
             file=sys.stderr,
         )
 
@@ -570,6 +552,7 @@ def main() -> int:
     token_env = env_var_for(server_name)
     plugin_dir = out_dir / kid
     skill_dir = plugin_dir / "skills" / slug
+    summary = role_description(role)
 
     (plugin_dir / ".claude-plugin").mkdir(parents=True, exist_ok=True)
     skill_dir.mkdir(parents=True, exist_ok=True)
@@ -586,22 +569,22 @@ def main() -> int:
     )
 
     skill = render(
-        (TEMPLATE_DIR / "SKILL.md.tmpl").read_text(encoding="utf-8"),
+        (template_dir / "SKILL.md.tmpl").read_text(encoding="utf-8"),
         {
             "skill_slug": slug,
-            "skill_description": (
-                f"Explore the {engine} catalog behind {server_name}: what tables and "
-                f"columns exist, what they mean, and how they join. Use when asked "
-                f"about the data itself rather than about code."
+            "skill_description": phrases["skill"]["description"].format(
+                server_name=server_name, engine_display=engine_display
             ),
             "server_name": server_name,
             "engine": engine,
+            "engine_display": engine_display,
             "agent": kid,
-            "expiry_line": expiry_line(claims),
-            "catalog_guidance": catalog_guidance(callable_names),
-            "conditional_sections": conditional_sections(callable_names),
-            "tool_reference": tool_reference(tools, callable_names),
-            "limits": limits_section(claims),
+            "role_line": role_line(phrases, role, summary),
+            "expiry_line": expiry_line(phrases, claims),
+            "catalog_guidance": catalog_guidance(phrases, callable_names),
+            "conditional_sections": conditional_sections(template_dir, callable_names),
+            "tool_reference": tool_reference(phrases, tools, callable_names),
+            "limits": limits_section(phrases, claims),
         },
     )
 
@@ -609,7 +592,9 @@ def main() -> int:
         (
             plugin_dir / ".claude-plugin" / "plugin.json",
             json.dumps(
-                plugin_json(slug=slug, server_name=server_name, engine=engine), indent=2
+                plugin_json(slug=slug, server_name=server_name, engine=engine_display),
+                indent=2,
+                ensure_ascii=False,
             )
             + "\n",
         ),
@@ -628,7 +613,11 @@ def main() -> int:
         (
             plugin_dir / "INSTALL.md",
             install_notes(
-                plugin_dir=plugin_dir,
+                phrases=phrases,
+                bundle=plugin_dir,
+                agent=kid,
+                role=role,
+                role_summary=summary,
                 server_name=server_name,
                 transport=transport,
                 url=url,
@@ -646,7 +635,7 @@ def main() -> int:
 
     # stderr throughout: this runs from the entrypoint, whose stdout may be a
     # JSON-RPC channel.
-    print(f"\nplugin        {plugin_dir}", file=sys.stderr)
+    print(f"\nbundle        {plugin_dir}", file=sys.stderr)
     for path, _ in written:
         print(f"  {path.relative_to(plugin_dir)}", file=sys.stderr)
     print(
@@ -654,20 +643,22 @@ def main() -> int:
         f"{', '.join(sorted(callable_names)) or 'none'}",
         file=sys.stderr,
     )
-    # The step that is easy to miss, and whose failure surfaces as a complaint
-    # about the token's shape rather than about the variable never being set.
     if transport in NETWORK_TRANSPORTS and inline is None:
+        # The step that is easy to miss, and whose failure surfaces as a
+        # complaint about the token's shape rather than about the variable
+        # never having been set.
         print(
             f"\n.mcp.json refers to the token as ${{{token_env}}}. Export it in the "
             f"shell you start the client from:\n"
             f"    export {token_env}=$(cat {token_path})\n"
-            f"A client that does not expand ${{...}} needs the token written in "
-            f"instead — re-run with PROVISION_INLINE_TOKEN=1. See INSTALL.md.",
+            f"A client that does not expand ${{...}} — or one started from a desktop "
+            f"app, which never saw that shell — needs the token written in instead. "
+            f"Unset PROVISION_INLINE_TOKEN to go back to that. See INSTALL.md.",
             file=sys.stderr,
         )
     elif transport in NETWORK_TRANSPORTS:
         print(
-            "\n.mcp.json carries the token itself and is now a credential (0600). "
+            "\n.mcp.json carries the token itself and is a credential (0600). "
             "Gitignore it.",
             file=sys.stderr,
         )

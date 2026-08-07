@@ -280,18 +280,55 @@ def test_staging_into_the_source_is_refused(source_env: str, db: Path):
 
 
 def test_an_unimplemented_engine_is_reported(monkeypatch: pytest.MonkeyPatch, db: Path):
-    """The pool builds lazily, so an adapter that cannot be loaded surfaces on
-    the first call rather than at build time."""
+    """
+    Refused at build time, not at the first call.
+
+    The pool loads adapters lazily, which used to mean an image built without
+    the driver started cleanly and then failed on every tool call — a symptom
+    a long way from its cause. One image now carries one engine's driver, so
+    the mismatch is worth catching before the port is bound.
+    """
     monkeypatch.setitem(
         factory._ADAPTER_REGISTRY,
         SourceEngine.POSTGRES,
         ("src.adapter.oracle", "OracleAdapter"),
     )
     monkeypatch.setenv("PG_URI", "postgresql://localhost/x")
-    mcp = entry.build(ServerConfig(engine=SourceEngine.POSTGRES, connection_ref="pg"))
 
-    with pytest.raises(Exception, match="not implemented yet"):
-        _call(mcp, "list_containers")
+    with pytest.raises(entry.ConfigurationError, match="not implemented yet"):
+        entry.build(ServerConfig(engine=SourceEngine.POSTGRES, connection_ref="pg"))
+
+
+def test_a_missing_driver_in_a_container_says_to_rebuild(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """
+    The advice has to match where it is read.
+
+    `uv sync --extra mssql` is right in a checkout and wrong in a container:
+    it installs no OS-level driver, and nothing it does install survives the
+    next start. Inside an image the engine is a build argument.
+    """
+    monkeypatch.setenv("MCP_IN_CONTAINER", "1")
+    monkeypatch.setattr(
+        factory.importlib,
+        "import_module",
+        _raise(ImportError("No module named 'pyodbc'", name="pyodbc")),
+    )
+
+    with pytest.raises(factory.AdapterNotAvailableError) as caught:
+        factory.load_adapter_class(SourceEngine.MSSQL)
+
+    message = str(caught.value)
+    assert "MCP_ENGINE=mssql" in message
+    assert "uv sync" not in message
+
+
+def _raise(exc: Exception):
+    def raiser(*_args: object, **_kwargs: object):
+        raise exc
+
+    return raiser
 
 
 # ---- transport ----

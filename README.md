@@ -11,10 +11,10 @@ server 的環境變數裡，其他地方都沒有。
 > 容器。Docker 的部分會直接寫「容器」。
 
 - [這個 server 提供什麼](#這個-server-提供什麼)
-- [部署](#部署) — [選擇 transport](#選擇-transport)、[Compose](#docker-compose)、[stdio](#docker-走-stdio)、[不用 Docker](#不用-docker)
+- [部署](#部署) — [選擇 transport](#選擇-transport)、[Compose](#docker-compose)、[stdio](#docker-走-stdio)、[Image 與 engine](#image-與-engine)、[不用 Docker](#不用-docker)
 - [設定](#設定)
 - [接上 agent](#接上-agent)
-- [認證](#認證)
+- [認證](#認證) — [角色](#角色)、[一把金鑰看得到什麼](#一把金鑰看得到什麼)
 - [怎麼用才對](#怎麼用才對)
 
 ## 這個 server 提供什麼
@@ -86,9 +86,12 @@ handshake 都會在 client 看到 server 之前就壞掉。這個專案的 entry
 務的那個容器永遠不會持有簽章金鑰**。
 
 ```bash
-cp .env.example .env    # 編輯它 —— engine、連線、scope
-docker compose up -d
+cp .env.example .env    # 編輯它 —— engine、連線、要發哪些身分
+docker compose up -d --build
 ```
+
+`--build` 是因為 image 是照 `MCP_ENGINE` 建的：換 engine 就是換一個 image。詳見
+[Image 與 engine](#image-與-engine)。
 
 | 服務 | 生命週期 | 掛載 | 做什麼 |
 |---|---|---|---|
@@ -110,18 +113,29 @@ docker compose up -d
 > 得過嗎」，而不是「檔案還在嗎」—— 只看檔案在不在的話，你會拿著一張用已經不存在的
 > 金鑰簽出來的 token，然後 server 回 `InvalidSignatureError`。
 
-跑完之後你收到的東西：
+跑完之後你收到的東西 —— `PROVISION_IDENTITIES` 裡每一個身分各一包：
 
 ```
 out/
-  agent.jwt                          憑證，權限 0600，請當憑證看待
-  agent/                             一個 Claude Code plugin
-    .mcp.json                        server 連線設定，token 用 ${VAR} 引用
+  de/                                一個 Claude Code plugin
+    de.jwt                           憑證，權限 0600，請當憑證看待
+    .mcp.json                        server 連線設定，預設直接帶著 token
     .claude-plugin/plugin.json
-    skills/<server-name>/SKILL.md    依這張 token 的 scope 生成
+    skills/<server-name>/SKILL.md    依這個角色實際拿到的權限生成
     codex.toml                       同一個 server 的 Codex 寫法
     INSTALL.md
+  pm/                                同上，但只有 pm 角色的權限
+    …
 ```
+
+一包就是一個身分：token、設定、說明都在同一個目錄裡，交給誰就整包給誰。**整包是憑
+證**，不要進版控。
+
+`.mcp.json` 預設把 token 直接寫進去（0600），而不是寫成 `${ETL_AGENT_MCP_TOKEN}`。
+引用寫法要求兩件事同時成立：client 會展開環境變數，而且啟動它的 shell 就是你
+`export` 的那個 shell。從桌面應用程式啟動的 client 兩個都不成立——它送出去的會是
+`${ETL_AGENT_MCP_TOKEN}` 這串字面文字，server 因為「不是一個 JWT」而拒絕，錯誤訊息
+從頭到尾不會提到變數。要用引用寫法就設 `PROVISION_INLINE_TOKEN=0`。
 
 狀態都在 `mcp-data` volume 上：staging 資料庫、稽核記錄、log。image 裡不烤任何狀
 態 —— staging 的 schema 第一次開檔時會自己建好，不需要事先做任何 setup。
@@ -143,7 +157,7 @@ engine 不需要。
         "-e", "MCP_ENGINE=postgres",
         "-e", "MCP_CONNECTION_REF=shop",
         "-e", "SHOP_HOST", "-e", "SHOP_USER", "-e", "SHOP_PASSWORD", "-e", "SHOP_DB",
-        "database-mcp-connector:slim", "serve"
+        "database-mcp-connector:postgres", "serve"
       ]
     }
   }
@@ -153,23 +167,36 @@ engine 不需要。
 `-e NAME` 不帶值是 docker 的傳遞寫法：值來自啟動 client 的那個環境，所以這個檔案
 裡不會留下任何機密。`MCP_TRANSPORT=stdio` 時 `provision` 會幫你生出這個形狀。
 
-### Build target
+### Image 與 engine
+
+**一個 engine 一個 image。** `MCP_ENGINE` 同時是 build argument 和 runtime 設定，
+compose 從 `.env` 把同一個值餵給兩邊，所以你只需要講一次：
 
 ```bash
-docker build --target slim -t database-mcp-connector:slim .   # 預設
-docker build --target full -t database-mcp-connector:full .
+docker build --build-arg MCP_ENGINES=mssql -t database-mcp-connector:mssql .
 ```
 
-| target | 涵蓋的 engine | 為什麼要分 |
-|---|---|---|
-| `slim` | sqlite、postgres、mysql/mariadb、mongodb、mcp | 純 python wheel，一個 OS 套件都不用裝 |
-| `full` | 上面全部，再加 mssql、datalake | pyodbc 需要在 OS 層裝 unixODBC 和微軟自己的驅動 |
+驅動沒有辦法是 runtime 的決定：pyodbc 綁的是一個不屬於 python 套件的 ODBC 驅動、
+image 是唯讀的、跑的 process 也不是 root。所以「我在 `.env` 指定 engine 了，依賴就
+該裝好」這件事只能發生在 build，而現在就是這樣運作的。
 
-只分兩個 target 而不是一個 engine 一個 image：**要服務哪個 engine 是 runtime 才決
-定的**，所以 image 只需要帶著驅動，不需要帶著那個決定。
+只有 mssql 需要 OS 層的東西（unixODBC 加上微軟自己的驅動，以及一個額外的 apt
+repository）。其他 engine 的 image 完全不會走到那一步，也不會多出 curl 和 gnupg。
+
+**image tag 帶著 engine**（`database-mcp-connector:mssql`）。這不是命名美觀問題：
+`docker compose up` 不加 `--build` 時會直接沿用同名 tag 的既有 image，tag 如果不隨
+engine 改變，你會拿到一個「設定寫著這個 engine、驅動卻是另一個 engine」的容器，而
+那種錯要到第一次呼叫 tool 才會炸。
+
+engine 和 image 對不上的時候，server **不會啟動**——不是起來之後每個請求都失敗。
+錯誤訊息會直接告訴你要用哪個 `MCP_ENGINE` 重 build。
+
+一個 image 裡要放多個驅動就用 `MCP_ENGINES=mssql,postgres`，tag 會變成
+`mssql-postgres`。那是逃生口，不是預設路徑。
 
 **連線資訊永遠不會是 build argument。** build argument 會留在 `docker history` 裡。
-host、帳號、密碼一律只走 runtime 環境變數。
+host、帳號、密碼一律只走 runtime 環境變數。engine 是例外，因為它是一個驅動名稱，
+不是機密。
 
 image 也可以直接當 CLI 用，兩個角色沒涵蓋到的事情都能做 ——
 `docker run --rm <image> token issue …`，或其他任何指令。
@@ -186,6 +213,10 @@ uv run mcp-connector --engine sqlite --connection-ref shop --staging-db ./var/st
 `postgres`、`mysql`（mariadb 共用）、`mssql`、`mongo`、`datalake`、`mcp`。sqlite
 不需要裝任何東西。mssql 的 ODBC 驅動本身不是 python 套件，要另外安裝。
 
+engine 和 extra 的對照表在 [src/core/engines.py](src/core/engines.py)，只有那一份
+——Dockerfile 是把那個檔案當成 script 跑來算出要裝什麼的，所以新增一個 engine 只要
+改那個 dict。
+
 ## 設定
 
 ### 連線
@@ -199,8 +230,9 @@ uv run mcp-connector --engine postgres --connection-ref shop
 ```
 
 認得的字尾有 `_HOST`、`_PORT`、`_USER`、`_PASSWORD`、`_DB` / `_DATABASE`、`_URI`、
-`_PATH`、`_TOKEN`。專案目錄下的 `.env` 會自動載入；用 compose 時，`.env` 同時也是
-拿來填 `docker-compose.yml` 裡 `${...}` 的那份。範例見 [.env.example](.env.example)。
+`_PATH`、`_TOKEN`、`_TRUST_SERVER_CERTIFICATE`。專案目錄下的 `.env` 會自動載入；用
+compose 時，`.env` 同時也是拿來填 `docker-compose.yml` 裡 `${...}` 的那份。範例見
+[.env.example](.env.example)。
 
 | engine | 需要 | 或者，也可以用 |
 |---|---|---|
@@ -216,9 +248,30 @@ uv run mcp-connector --engine postgres --connection-ref shop
 是在一台有多個資料庫的伺服器上選一個；要另一個就會開第二條連線，pool 會把它跟第一
 條並存。
 
-mssql 的連線字串是用 `Encrypt=yes` 且會驗證憑證組出來的。自簽憑證的伺服器需要
-`TrustServerCertificate=yes`，而要這麼做的唯一方式是給一整串 `<REF>_URI` ——
-這是要刻意做的決定，不該是預設繼承來的。
+#### mssql 的 TLS
+
+連線字串是用 `Encrypt=yes` 且會驗證憑證組出來的。ODBC Driver 18 從預設不加密改成
+預設加密，所以地端的自簽憑證伺服器第一次連一定會撞到：
+
+```
+[08001] SSL Provider: … certificate verify failed: self-signed certificate
+```
+
+```bash
+SHOP_TRUST_SERVER_CERTIFICATE=1
+```
+
+**加密仍然開著，關掉的是「對方是不是它宣稱的那個人」這項驗證** —— 也就是說這條連線
+在網路上是可以被中間人攔截的。所以它是一個要明確打開的旗標，不是自動推斷的：同一個
+錯誤既可能是「憑證是自簽的，本來就知道」，也可能是「憑證出事了」，只有人分得出來。
+打開的時候 server 會在 log 裡把這件事講一次。
+
+比較乾淨的做法是把那張憑證放進容器的信任庫，但 runtime 跑的是非 root 使用者，那得
+在 build 階段或掛一份 CA bundle 進去做。
+
+連線逾時預設是 30 秒（驅動自己的預設是 15 秒，跨站台的第一次連線常常不夠）。逾時回
+的是 `HYT00`，而且訊息完全不會提到網路——這個 adapter 會把它翻成一句看得懂的話，並
+且提醒你容器裡的 `localhost` 是容器自己，docker host 要用 `host.docker.internal`。
 
 ### 其他設定
 
@@ -256,10 +309,16 @@ null 比例。
 ## 接上 agent
 
 `provision` 會幫你把 client 端生出來：一份帶 server 設定的 `.mcp.json`，以及一份
-告訴 agent 該怎麼用的 `SKILL.md`。兩份都是**對著實際部署生成的** —— 工具清單是從
-server 自己的原始碼讀出來的，而「這個 agent 可以叫哪些工具」則來自剛剛簽出來的那張
-token，所以兩者不可能對不上。把 `out/<kid>/` 複製到 `~/.claude/plugins/`，或用
-marketplace 指向它。
+告訴 agent 該怎麼用的 `SKILL.md`。兩份都是**對著實際部署生成的** —— 工具清單來自
+[src/core/tools.py](src/core/tools.py)（角色驗證用的也是同一份），「這個 agent 可以
+叫哪些工具」來自剛剛簽出來的那張 token，角色的用途說明來自 `roles.toml`，所以三者
+不可能對不上。把 `out/<kid>/` 複製到 `~/.claude/plugins/`，或用 marketplace 指向它。
+
+文件的語言由 `PROVISION_LANG` 決定（`zh-TW` 或 `en`，預設 `zh-TW`）。**工具名、參
+數名、claim 名一律不翻譯**——那些是要真的打出去的識別碼。frontmatter 的
+`description` 是中英並列的，因為那一行是決定 skill 要不要被觸發的比對依據，使用者
+可能用任何一種語言問。要改用字或加語言，看
+[docker/templates/](docker/templates/)：一個語言一個目錄，版型、片段、字串都在裡面。
 
 手動設定的話，網路 transport 長這樣：
 
@@ -275,19 +334,25 @@ marketplace 指向它。
 }
 ```
 
-token 預設保持 `${VAR}` 引用，不直接貼進去 —— 這個檔案最後會躺在專案裡，而躺在專案
-裡的 bearer token 等於在這個專案的每一份拷貝裡都有一份憑證。變數的值來自**啟動
-client 的那個 shell**：
+token 預設**直接寫進這個檔案**，權限 `0600`。它從此是一份憑證 —— 不要進版控，也不
+要複製到任何你不會複製密碼過去的地方。
+
+之所以不用 `${ETL_AGENT_MCP_TOKEN}` 引用：那個寫法要求兩件事同時成立，**client 會
+展開環境變數**，而且**啟動 client 的 shell 就是你 `export` 的那個 shell**。從桌面
+應用程式（Dock、Finder、IDE）啟動的 client 兩個都不成立——它繼承的是 launchd 的環
+境，不是你的 `.zshrc`。這時候送出去的會是 `${ETL_AGENT_MCP_TOKEN}` 這串字面文字，
+server 因為它不是一個 JWT 而拒絕，而錯誤訊息講的是「token 的形狀」，從頭到尾不會提
+到變數——所以很容易往錯的方向查。
+
+要用引用寫法，設 `PROVISION_INLINE_TOKEN=0` 重跑 provision，然後在**啟動 client 的
+那個 shell** 裡：
 
 ```bash
-export ETL_AGENT_MCP_TOKEN=$(cat out/agent.jwt)
+export ETL_AGENT_MCP_TOKEN=$(cat out/de/de.jwt)
 ```
 
-但不是每個 client 都會展開 `${...}`。不展開的 client 會把那串字面值當成 token 送出，
-server 則以「格式不是 JWT」拒絕 —— 錯誤訊息講的是 token 的形狀，完全不會提到變數，
-所以很容易往錯的方向查。遇到這種 client，用 `PROVISION_INLINE_TOKEN=1` 重跑
-provision，它會把 token 直接寫進 `.mcp.json` 並設成 `0600`。那個檔案從此是一份憑證，
-記得加進 `.gitignore`。
+判斷是哪一種問題的方法：把 token 手動貼進 `.mcp.json`，如果就通了，代表檔案本身有
+被讀到，只是展開沒發生。
 
 ## 認證
 
@@ -333,13 +398,59 @@ agent 拿到的**只有那張 token**。私鑰不會進到 server，公鑰不會
 簽章只接受非對稱演算法（EdDSA、ES256、RS256）；HMAC 類的一律不接受，因為這裡的金鑰
 是公開的。
 
+### 角色
+
+一長串 `--scope` 沒有人會想維護，也沒有人會想 review。權限集中寫在
+`docker/roles.toml`，一個角色一段：
+
+```bash
+docker compose run --rm provision role list       # 有哪些角色
+docker compose run --rm provision role show de    # 展開繼承後的實際權限
+```
+
+預設兩個：
+
+| 角色 | 給誰 | 拿得到什麼 |
+|---|---|---|
+| `pm` | 跟客戶對資料的人 | 讀盤點結果、看 schema、取遮罩過的樣本、匯出資料字典。**不能**啟動掃描、不能改盤點內容 |
+| `de` | 做盤點交付的工程師 | `pm` 的全部，再加上跑掃描、即時統計、補描述、匯出 `dbt schema.yml` |
+
+`de` 是用 `extends = "pm"` 寫的，因為它的權限確實是 `pm` 的超集；兩份各自維護的清
+單遲早會有一份忘了更新。檔案裡看得到的就是「`de` 比 `pm` 多了什麼」。
+
+```toml
+[roles.analyst]
+extends    = "pm"
+add_tools  = ["profile_column"]
+databases  = ["analytics"]
+containers = { deny = ["*_pii"] }
+lifetime   = "7d"
+```
+
+`tools` 取代繼承來的清單，`add_tools` / `drop_tools` 增減。**每個工具名在載入時都會
+比對真實的工具清單**，打錯字直接報錯——一個對不到任何工具的 scope 什麼都不會授予，
+但 token 照樣簽得出來，是最難發現的那種錯。
+
+發身分：
+
+```bash
+# .env
+PROVISION_IDENTITIES=de=de,pm=pm,alice=pm
+```
+
+每個身分各自一組金鑰、一張 token、一包 `out/<kid>/`，SKILL.md 只描述那個角色拿得到
+的工具。`docker compose run --rm provision --kid bob --role pm` 可以只補發一個人。
+
+改完 `roles.toml` 之後要重簽：`PROVISION_FORCE=1 docker compose up provision`。
+
 ### 一把金鑰看得到什麼
 
-除了工具清單，token 還可以帶：
+角色是這些 flag 的集合寫法；直接下 flag 也可以，而且會**疊加**在角色上（只會放寬，
+不會收窄——收窄的話 token 就跟它自己的 SKILL.md 對不上了）：
 
 ```bash
 uv run mcp-connector token issue --key ./pm.pem --kid pm-explorer \
-    --scope list_containers --scope get_schema --scope get_sample \
+    --role pm \
     --database analytics \
     --allow-container 'dim_*' --allow-container 'fct_*' \
     --deny-container '*_pii'

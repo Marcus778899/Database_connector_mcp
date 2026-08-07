@@ -20,7 +20,13 @@ from pydantic import ValidationError
 
 from src.auth import AuthConfigurationError
 from src.auth.commands import COMMAND as TOKEN_COMMAND
-from src.auth.commands import add_token_command, run_token_command
+from src.auth.commands import ROLE_COMMAND
+from src.auth.commands import (
+    add_role_command,
+    add_token_command,
+    run_role_command,
+    run_token_command,
+)
 from src.core.config import (
     MissingConnectionEnvError,
     ServerConfig,
@@ -31,6 +37,7 @@ from src.core.config import (
 from src.core.contracts import ProfileMode
 from src.core.log import log
 from src.server import build_server
+from src.service.factory import AdapterNotAvailableError, load_adapter_class
 from src.service.inventory import InventoryService
 from src.service.pool import AdapterPool
 from src.service.staging import StagingError, StagingStore
@@ -118,6 +125,7 @@ def build_parser() -> argparse.ArgumentParser:
     # is what every mcp.json in the wild already says.
     commands = parser.add_subparsers(dest="command")
     add_token_command(commands)
+    add_role_command(commands)
     return parser
 
 
@@ -214,6 +222,15 @@ def build(config: ServerConfig) -> FastMCP:
             "that hold the connection details"
         )
 
+    # Before anything else, and eagerly: the pool loads an adapter lazily, so a
+    # driver that is not installed would otherwise surface as a failure on the
+    # first tool call — a long way from the cause, on a server that looked like
+    # it started fine. An image built for the wrong engine should not listen.
+    try:
+        load_adapter_class(config.engine)
+    except AdapterNotAvailableError as exc:
+        raise ConfigurationError(str(exc)) from exc
+
     try:
         conn_info = resolve_connection(config.connection_ref)
     except MissingConnectionEnvError as exc:
@@ -266,10 +283,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     load_repo_dotenv()
 
     args = build_parser().parse_args(argv)
-    if getattr(args, "command", None) == TOKEN_COMMAND:
+    command = getattr(args, "command", None)
+    if command == TOKEN_COMMAND:
         # issuing only: nothing below this line runs, so no source is opened
         # and no port is bound
         return run_token_command(args)
+    if command == ROLE_COMMAND:
+        return run_role_command(args)
 
     try:
         config = config_from_args(args)

@@ -56,6 +56,10 @@ class MssqlAdapter(DbApiAdapterBase):
     # The driver has to be installed on this host; the name is what odbc looks it
     # up by. A `<REF>_URI` is the way to name a different one.
     DEFAULT_DRIVER: ClassVar[str] = "ODBC Driver 18 for SQL Server"
+    # Seconds to wait for the login to complete. The driver's own default is 15,
+    # which is short for a first connection across a site-to-site link and shows
+    # up as HYT00 — an error that says nothing about the network being the cause.
+    DEFAULT_LOGIN_TIMEOUT: ClassVar[int] = 30
 
     def __init__(
         self,
@@ -67,9 +71,14 @@ class MssqlAdapter(DbApiAdapterBase):
         password: str | None = None,
         database: str = "",
         driver: str | None = None,
+        trust_server_certificate: bool = False,
+        login_timeout: int | None = None,
         max_sample_limit: int | None = None,
     ) -> None:
         # Read before `super().__init__`, which is what connects.
+        self._login_timeout = (
+            self.DEFAULT_LOGIN_TIMEOUT if login_timeout is None else login_timeout
+        )
         self._connection_string = connection_string or _build_connection_string(
             driver=driver or self.DEFAULT_DRIVER,
             host=host or "127.0.0.1",
@@ -77,7 +86,20 @@ class MssqlAdapter(DbApiAdapterBase):
             user=user,
             password=password,
             database=database,
+            trust_server_certificate=trust_server_certificate,
+            login_timeout=self._login_timeout,
         )
+        if trust_server_certificate:
+            # Loud, once per connection, because it is a check the operator
+            # turned off rather than a default anyone can be assumed to know
+            # about. The traffic is still encrypted; what is gone is the
+            # assurance that the other end is who it claims to be.
+            log.warning(
+                "mssql: TrustServerCertificate is on for this connection. Traffic "
+                "stays encrypted, but the server's identity is not verified, so "
+                "this connection can be intercepted. Intended for a self-signed "
+                "certificate on a network you control."
+            )
         super().__init__(database=database, max_sample_limit=max_sample_limit)
         log.info(f"opened mssql {self._database}")
 
@@ -91,7 +113,16 @@ class MssqlAdapter(DbApiAdapterBase):
         so the guarantee here is the same one the datalake adapter gives: this
         code issues nothing but SELECTs.
         """
-        return pyodbc.connect(self._connection_string, autocommit=True)
+        try:
+            return pyodbc.connect(
+                self._connection_string,
+                autocommit=True,
+                timeout=self._login_timeout,
+            )
+        except pyodbc.Error as exc:
+            raise _connection_error(
+                exc, self._connection_string, self._login_timeout
+            ) from exc
 
     def _after_connect(self) -> None:
         # Unnamed, it is the login's default, whatever that turned out to be.
@@ -121,6 +152,7 @@ class MssqlAdapter(DbApiAdapterBase):
             user=conn_info.user,
             password=conn_info.password,
             database=database or conn_info.database or "",
+            trust_server_certificate=conn_info.trust_server_certificate,
             max_sample_limit=max_sample_limit,
         )
 
@@ -397,6 +429,92 @@ class MssqlAdapter(DbApiAdapterBase):
         }
 
 
+class MssqlConnectionError(Exception):
+    """A failed login, said in terms of what to change."""
+
+
+# What odbc reports, and what it actually means for this deployment. Matched on
+# the sqlstate plus a phrase, because 08001 covers everything from "no route"
+# to "wrong certificate" and the remedies are nothing alike.
+_CONNECTION_HINTS: tuple[tuple[str, str, str], ...] = (
+    (
+        "HYT00",
+        "",
+        "nothing answered at {server} within {timeout}s. From inside a container "
+        "this is usually the address rather than the database: `localhost` is the "
+        "container itself, and the host it runs on is `host.docker.internal`. "
+        "Check the route and the firewall before the credentials.",
+    ),
+    (
+        "08001",
+        "certificate verify failed",
+        "{server} presented a certificate this host does not trust, which is what "
+        "a self-signed certificate looks like. Set <REF>_TRUST_SERVER_CERTIFICATE=1 "
+        "to keep the encryption and skip the check, or install the issuing CA "
+        "where the container can see it.",
+    ),
+    (
+        "08001",
+        "",
+        "could not reach {server}. The port may be closed, or the instance may "
+        "not be listening on TCP.",
+    ),
+    (
+        "28000",
+        "",
+        "{server} refused the login. The account, the password or the default "
+        "database is wrong; the network is fine.",
+    ),
+    (
+        "IM002",
+        "",
+        "the odbc driver named in the connection string is not installed here. "
+        "This image was not built for mssql — rebuild it with MCP_ENGINE=mssql.",
+    ),
+)
+
+
+def _server_of(connection_string: str) -> str:
+    """
+    The `SERVER=` value, for an error message.
+
+    Only that one keyword: the string it comes from also holds `PWD=`, and an
+    error is a thing that gets pasted into tickets and chat.
+    """
+    for part in connection_string.split(";"):
+        keyword, _, value = part.partition("=")
+        if keyword.strip().upper() == "SERVER":
+            return value.strip().strip("{}") or "the server"
+    return "the server"
+
+
+def _connection_error(
+    exc: Exception, connection_string: str, timeout: int
+) -> MssqlConnectionError:
+    """
+    Turn pyodbc's tuple into one sentence naming the thing to change.
+
+    The driver's own text is kept on the end rather than replaced: it is the
+    only part an internet search will match, and whoever ends up reading this
+    may well need to search it.
+    """
+    args = getattr(exc, "args", ())
+    sqlstate = str(args[0]) if args else ""
+    detail = str(args[1]) if len(args) > 1 else str(exc)
+    lowered = detail.lower()
+
+    for state, phrase, hint in _CONNECTION_HINTS:
+        if sqlstate != state:
+            continue
+        if phrase and phrase not in lowered:
+            continue
+        return MssqlConnectionError(
+            hint.format(server=_server_of(connection_string), timeout=timeout)
+            + f" (odbc {sqlstate}: {detail})"
+        )
+    return MssqlConnectionError(f"mssql connection failed (odbc {sqlstate}: {detail})")
+
+
 def _build_connection_string(
     *,
     driver: str,
@@ -405,20 +523,32 @@ def _build_connection_string(
     user: str | None,
     password: str | None,
     database: str,
+    trust_server_certificate: bool = False,
+    login_timeout: int | None = None,
 ) -> str:
     """
     An odbc connection string from the parts `<REF>_*` carries.
 
-    Encryption stays on and the certificate stays checked. A server with a
-    self-signed certificate needs `TrustServerCertificate=yes`, and the way to
-    say so is a full `<REF>_URI` — a deliberate choice rather than this adapter's
-    default.
+    Encryption stays on and, by default, the certificate stays checked.
+    `<REF>_TRUST_SERVER_CERTIFICATE=1` keeps the encryption and drops the
+    check, which is what an on-premises server with a self-signed certificate
+    needs. It is a flag of its own rather than something to be inferred: the
+    same failure means "the certificate is self-signed, as expected" and "the
+    certificate stopped verifying", and only an operator can tell those apart.
+    A whole `<REF>_URI` still overrides everything here.
     """
     parts = [
         f"DRIVER={{{driver}}}",
         f"SERVER={_odbc_value(f'{host},{port}')}",
         "Encrypt=yes",
     ]
+    if trust_server_certificate:
+        parts.append("TrustServerCertificate=yes")
+    if login_timeout is not None:
+        # Named `Connection Timeout` in the connection string; pyodbc's own
+        # `timeout=` argument sets the same thing on the handle. Both are set,
+        # because which one a given driver honours has moved between versions.
+        parts.append(f"Connection Timeout={int(login_timeout)}")
     if database:
         parts.append(f"DATABASE={_odbc_value(database)}")
     if user:

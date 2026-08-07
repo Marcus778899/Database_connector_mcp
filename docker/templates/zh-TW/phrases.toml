@@ -1,0 +1,159 @@
+# 產生 SKILL.md / INSTALL.md 時用到的字串。
+#
+# 版型在 SKILL.md.tmpl，這裡是那些「要看情況才決定放不放」的段落——沒有盤點資料
+# 的 server 不該出現盤點的路線表，不能取樣的 token 不該讀到怎麼負責任地取樣。
+#
+# 大括號是取代參數。工具名、參數名、claim 名一律不翻譯：那些是識別碼，翻了就對不
+# 上實際的 API。
+
+[skill]
+# frontmatter 的 description。這一行是決定 skill 要不要被觸發的比對依據，所以中英
+# 關鍵詞都要在裡面——使用者可能用任何一種語言問。
+description = "查詢 {server_name} 後面那個 {engine_display} 來源的資料目錄：有哪些資料表與欄位、代表什麼意思、彼此怎麼關聯。Explore the {engine_display} data catalog: tables, columns, meanings and joins. 當問題是關於「資料本身」而不是關於程式碼時使用。"
+role_line = "，角色是 `{role}`（{role_description}）"
+role_line_plain = "，角色是 `{role}`"
+expiry = "這張憑證在 {when} 到期，之後每一次呼叫都會被拒絕，直到有人重新發一張。"
+
+[catalog]
+head = ["你想知道", "問這個", "會拿到"]
+empty = """
+這個連線沒有已儲存的盤點資料可以翻，所以沒有東西可以總覽或匯出。從
+`list_containers` 開始，再一張一張 `get_schema`，並且把看懂的東西記在你自己的
+筆記裡，不要重複問同一件事。
+"""
+closing = "由外往內走：先問數量，再縮小範圍，最後只讀一頁。"
+closing_export = "答案是「全部」的時候才用匯出——交付物是那個檔案，而回傳的只有它的路徑。"
+# 中文句號後面不空格。
+sentence_join = ""
+
+[[catalog.routes]]
+tool = "inventory_summary"
+want = "這裡總共有多少東西"
+gets = "只有計數，幾百個位元組"
+
+[[catalog.routes]]
+tool = "inventory_search"
+want = "我要找的東西在哪裡"
+gets = "少量命中，不含統計"
+
+[[catalog.routes]]
+tool = "inventory_columns"
+want = "這張表裡面有什麼"
+gets = "一頁；欄位很多的表加上 `include_profile=False`"
+
+[[catalog.routes]]
+tool = "inventory_export"
+want = "我全部都要"
+gets = "**一個檔案**——回傳的只有路徑，永遠不會是內容"
+
+[tools]
+heading = "## 你可以呼叫的工具"
+catalog = "資料目錄（直接問來源）"
+inventory = "盤點結果（讀掃描記錄下來的）"
+withheld_heading = "### 有服務，但不對你開放"
+withheld_body = "呼叫這些會被拒絕；那不是故障，也不值得重試：{names}。"
+
+# 工具名稱本身永遠不翻譯——那是要真的打出去呼叫的識別碼。這裡翻的只有那句摘要。
+# 沒有列到的工具會沿用 src/core/tools.py 裡的英文摘要，所以新增工具不會在文件裡
+# 留下一行空白。
+[tools.summaries]
+list_databases = "這個連線盤點得到哪些 database。"
+list_containers = "一頁的資料表 / 檢視表 / collection。"
+get_schema = "單一張表的欄位，含主鍵與可否為 null。"
+get_sample = "幾筆資料；除非另外授權，否則個資欄位是遮罩過的。"
+profile_column = "單一欄位的單一項統計，當場算。"
+inventory_start = "啟動背景掃描，回傳 job id。"
+inventory_status = "掃描跑到哪了，以及為什麼停下來。"
+inventory_cancel = "在目前這張表跑完之後停止掃描。"
+inventory_summary = "已盤點內容的各項計數。"
+inventory_containers = "一頁已盤點的資料表，含掃描狀態。"
+inventory_columns = "一頁某張表已記錄的欄位，依 ordinal 排序。"
+inventory_relationships = "盤點裡的所有外鍵，以邊的形式回傳。"
+inventory_changes = "兩次掃描之間上游 schema 變了什麼，新的在前。"
+inventory_search = "名稱或描述有提到某個關鍵字的表與欄位。"
+inventory_annotate = "描述一張已盤點的表和它的欄位實際裝什麼。"
+inventory_export = "把整份盤點寫成檔案，只回傳路徑。"
+
+[limits]
+heading = "## 這個連線看得到什麼"
+databases_all = "- Database：這個連線碰得到的都可以。"
+databases_only = "- Database：只有 {names}。"
+containers_none = "- 資料表：沒有名稱上的限制。"
+containers_allow = "- 資料表：只有符合 {names} 的。"
+containers_deny = "- 永遠讀不到：{names}。這些在列表裡也會被濾掉，所以一個你找不到的名字，有可能只是沒有被顯示給你。"
+raw_granted = "- `get_sample(mask=False)` 有授權。但它仍然不該是預設動作，只在任務真的取決於字面值的時候用。"
+raw_denied = "- `get_sample(mask=False)` **沒有**授權。你拿得到的就是遮罩過的資料，再問一次也不會變。"
+human = "- 你寫的描述會被記成「人寫的」而不是「agent 猜的」，請相對應地謹慎。"
+
+[install]
+title = "# 安裝 `{server_name}`（{agent}）"
+claude_code = """
+## Claude Code
+
+```bash
+cp -r {bundle} ~/.claude/plugins/{bundle}
+```
+
+或者把 marketplace 指到這個目錄。`.mcp.json` 負責註冊 server，`skills/` 帶著使用
+說明，兩者會一起到位。
+"""
+codex = """
+## Codex
+
+把 `codex.toml` 附加到 `~/.codex/config.toml`。Codex 沒有 skills，所以請把
+`skills/*/SKILL.md` 當成 context 傳進去，或貼進 `AGENTS.md`。
+"""
+credential_inline = """
+## 憑證
+
+`.mcp.json` 裡面直接帶著 token（權限 0600）。**這整個目錄是憑證**——加進
+.gitignore，也不要複製到任何你不會複製密碼過去的地方。
+
+之所以是直接寫進去而不是用 `${{{token_env}}}`：那個寫法要求客戶端會展開環境變數，
+而且要求你 export 的那個 shell 就是啟動客戶端的那個 shell。從桌面應用程式啟動的
+客戶端看不到你在終端機 export 的東西，這時候送出去的會是 `${{{token_env}}}` 這串
+字面文字，server 會回報「token 格式不對」——錯誤訊息完全沒提到變數，很難聯想。
+要用環境變數的寫法，設 `PROVISION_INLINE_TOKEN=0` 重跑一次 provision。
+
+Server 預期在 {url}。換位置的話改 `.mcp.json`。
+"""
+credential_env = """
+## 憑證
+
+Token 在 `{token_name}`。`.mcp.json` 用 `${{{token_env}}}` 參照它而不是直接寫進去，
+所以要在**啟動客戶端的那個 shell** 裡 export：
+
+```bash
+export {token_env}=$(cat {token_name})
+```
+
+**如果你的客戶端不會展開 `${{...}}`**，它會把這串字面文字當成 token 送出去，server
+會以格式錯誤拒絕——訊息講的是 token 的形狀而不是變數，很容易誤判。同樣的，從桌面
+應用程式啟動的客戶端看不到你在終端機 export 的東西。兩條出路：把 `.mcp.json` 裡的
+placeholder 手動換成 `{token_name}` 的內容，或用 `PROVISION_INLINE_TOKEN=1` 重跑
+provision 讓它幫你寫進去。無論哪一種，那個檔案都會變成憑證——記得 gitignore。
+
+Server 預期在 {url}。換位置的話改 `.mcp.json`。
+"""
+credential_stdio = """
+## 憑證
+
+走 stdio 的話是客戶端自己把容器叫起來，沒有 token：能啟動這個 process 的人本來就
+已經握有資料庫的連線資訊了。
+
+檢查 `.mcp.json` 裡的 `-e` 參數——它們把連線變數從你自己的環境傳進去；檔案型的
+engine 還要再加一個 `-v` 掛載來源。
+"""
+role_note = """
+## 這個身分能做什麼
+
+`{agent}` 的角色是 `{role}`：{role_description}
+
+完整清單在 `skills/*/SKILL.md`，或在 server 那邊執行：
+
+```bash
+docker compose run --rm provision role show {role}
+```
+
+要調整權限就改 `docker/roles.toml`，然後用 `PROVISION_FORCE=1` 重跑 provision。
+"""
