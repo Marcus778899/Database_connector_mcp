@@ -25,7 +25,7 @@ from src.core.contracts import (
     TopValue,
 )
 from src.core.log import log
-from src.utils.serialize import jsonify
+from src.utils.serialize import as_text, jsonify
 
 # The server's own databases. Never a user's catalog.
 _SYSTEM_DATABASES = frozenset({"admin", "local", "config"})
@@ -408,8 +408,8 @@ class MongoAdapter(AdapterBase):
         if not rows:
             return ProfileResult()
         return ProfileResult(
-            min_value=_text(rows[0]["lo"]),
-            max_value=_text(rows[0]["hi"]),
+            min_value=as_text(rows[0]["lo"]),
+            max_value=as_text(rows[0]["hi"]),
         )
 
     def _profile_distinct_count(
@@ -442,7 +442,7 @@ class MongoAdapter(AdapterBase):
         )
         return ProfileResult(
             top_values=[
-                TopValue(value=_text(row["_id"]) or "", count=int(row["c"]))
+                TopValue(value=as_text(row["_id"]) or "", count=int(row["c"]))
                 for row in rows
             ]
         )
@@ -499,12 +499,3 @@ def _bson_type(value: Any) -> str:
     if isinstance(value, dict):
         return "object"
     return type(value).__name__
-
-
-def _text(value: Any) -> str | None:
-    """A value bound as text. `jsonify` first, so a date or an ObjectId reads as
-    itself rather than as its repr."""
-    if value is None:
-        return None
-    converted = jsonify(value)
-    return converted if isinstance(converted, str) else str(converted)

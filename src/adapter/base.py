@@ -408,6 +408,29 @@ class DbApiAdapterBase(SqlAdapterBase):
     def _after_connect(self) -> None:
         """Session settings the engine wants — refusing writes, mostly."""
 
+    def _adopt_database(self, connected: str) -> None:
+        """
+        Settle what the database this connection is on is called.
+
+        Unnamed, it is whatever the server says — a driver may well have chosen
+        one, and reporting an empty name would leave every container labelled
+        with nothing. Named, the two have to agree, and a disagreement is fatal
+        rather than logged: every row served is labelled with the name, so a
+        connection that quietly went elsewhere would file one database's catalog
+        under another's, which no caller could tell from the truth.
+
+        An engine whose server cannot be asked passes `""` and keeps the name.
+        """
+        if not self._database:
+            self._database = connected
+            return
+        if connected and connected != self._database:
+            raise ValueError(
+                f"asked for database {self._database!r}, but the connection is on "
+                f"{connected!r} — a connection string naming its own database "
+                f"cannot be pointed at a different one"
+            )
+
     # ---- lifecycle ----
 
     def close(self) -> None:

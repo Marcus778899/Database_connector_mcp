@@ -438,3 +438,19 @@ def connected(monkeypatch, connection) -> Any:
 
     monkeypatch.setattr(mysql.pymysql, "connect", fake_connect)
     return recorder
+
+
+def test_a_url_for_another_engine_is_refused():
+    """`urlparse` reads a postgres url quite happily; the mistake would surface
+    as a connection refused on the wrong port."""
+    with pytest.raises(ValueError, match="not a mysql url"):
+        MysqlAdapter.from_connection(
+            ConnectionInfo(uri="postgresql://reader@db.internal/shop")
+        )
+
+
+@pytest.mark.parametrize("scheme", ["mysql", "mariadb", "mysql+pymysql"])
+def test_the_schemes_a_mysql_url_may_call_itself(scheme: str, connected):
+    MysqlAdapter.from_connection(ConnectionInfo(uri=f"{scheme}://db.internal/shop"))
+
+    assert connected.kwargs["host"] == "db.internal"

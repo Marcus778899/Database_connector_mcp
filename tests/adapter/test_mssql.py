@@ -447,3 +447,47 @@ def connected(monkeypatch, connection) -> Any:
 
     monkeypatch.setattr(mssql.pyodbc, "connect", fake_connect)
     return recorder
+
+
+@pytest.mark.parametrize(
+    ("password", "expected"),
+    [
+        ("s3cret", "PWD=s3cret"),
+        # a `;` would otherwise end the keyword, and the rest of the password
+        # would be read as connection settings
+        ("pa;ss", "PWD={pa;ss}"),
+        ("pa{ss", "PWD={pa{ss}"),
+        # inside braces, a closing one is doubled
+        ("pa}ss", "PWD={pa}}ss}"),
+        (" leading", "PWD={ leading}"),
+    ],
+)
+def test_a_password_that_would_break_the_connection_string_is_braced(
+    password: str, expected: str
+):
+    """It fails as a login error, so it reads as a wrong password rather than as
+    a string this built wrong."""
+    built = _build_connection_string(
+        driver="d", host="h", port=1, user="reader", password=password, database=""
+    )
+
+    assert expected in built
+
+
+def test_a_host_or_database_holding_a_separator_is_braced_too():
+    built = _build_connection_string(
+        driver="d", host="h;evil", port=1, user=None, password=None, database="a;b"
+    )
+
+    assert "SERVER={h;evil,1}" in built
+    assert "DATABASE={a;b}" in built
+
+
+def test_a_connection_string_cannot_be_pointed_at_another_database(wire):
+    """A whole `<REF>_URI` carries its own `DATABASE=`, and appending a second
+    one is read differently by different drivers — so the mismatch is caught
+    rather than served under the wrong name."""
+    with pytest.raises(ValueError, match="but the connection is on 'shop'"):
+        wire(
+            MssqlAdapter, [("DB_NAME()", ("name",), [("shop",)])], database="analytics"
+        )

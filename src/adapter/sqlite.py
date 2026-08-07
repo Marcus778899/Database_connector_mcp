@@ -33,11 +33,6 @@ _CONTAINER_TYPES = {"table": ContainerType.TABLE, "view": ContainerType.VIEW}
 _CATALOG_WHERE = r"type IN ('table','view') AND name NOT LIKE 'sqlite\_%' ESCAPE '\'"
 
 
-def _render(sql: str, params: Sequence[Any] = ()) -> str:
-    """The statement with its parameters inlined, for the audit trail."""
-    return render_sql(sql, params, SqliteAdapter._PARAM)
-
-
 class SqliteAdapter(SqlAdapterBase):
     """
     SourceAdapter over one sqlite file.
@@ -132,7 +127,7 @@ class SqliteAdapter(SqlAdapterBase):
     # ---- querying ----
 
     def _rows(self, sql: str, params: Sequence[Any] = ()) -> list[sqlite3.Row]:
-        self._record_sql(_render(sql, params))
+        self._record_sql(render_sql(sql, params))
         with self._lock:
             return self._conn.execute(sql, params).fetchall()
 

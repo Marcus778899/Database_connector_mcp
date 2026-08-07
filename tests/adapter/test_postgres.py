@@ -558,3 +558,45 @@ def connected(monkeypatch, connection) -> Any:
 
     monkeypatch.setattr(postgres.psycopg, "connect", fake_connect)
     return recorder
+
+
+# ---- which database this is actually on ----
+
+
+def test_a_requested_database_overrides_the_one_the_url_names(connected):
+    """The pool builds one adapter per database off the same `<REF>_URI`. Without
+    the override every one of them connects to the url's own database and serves
+    its catalog under a different name."""
+    PostgresAdapter.from_connection(
+        ConnectionInfo(uri="postgresql://db.internal/shop"), database="analytics"
+    )
+
+    assert connected.args == ("postgresql://db.internal/shop",)
+    assert connected.kwargs == {"autocommit": True, "dbname": "analytics"}
+
+
+def test_a_url_with_no_database_asked_for_is_left_alone(connected):
+    PostgresAdapter.from_connection(ConnectionInfo(uri="postgresql://db.internal/shop"))
+
+    assert connected.kwargs == {"autocommit": True}
+
+
+def test_the_database_is_checked_rather_than_trusted(wire):
+    """Every container is labelled with this name, so a connection that quietly
+    went elsewhere would file one database's catalog under another's."""
+    with pytest.raises(ValueError, match="but the connection is on 'shop'"):
+        wire(
+            PostgresAdapter,
+            [("current_database", ("name",), [("shop",)])],
+            database="analytics",
+        )
+
+
+def test_the_database_agreeing_is_not_an_error(wire):
+    adapter = wire(
+        PostgresAdapter,
+        [("current_database", ("name",), [("shop",)])],
+        database="shop",
+    )
+
+    assert adapter._database == "shop"

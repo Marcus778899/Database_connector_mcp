@@ -20,7 +20,7 @@ from src.core.contracts import (
     TopValue,
 )
 from src.core.log import log
-from src.utils.serialize import jsonify
+from src.utils.serialize import as_text, jsonify
 
 # relkind -> what to call it. A partitioned table (`p`) and a foreign table (`f`)
 # are read exactly like a table; a materialised view holds rows but is still a
@@ -98,20 +98,25 @@ class PostgresAdapter(DbApiAdapterBase):
         later one fails with "current transaction is aborted" — one unreadable
         table would take the rest of the scan with it.
         """
-        if self._conninfo:
-            return psycopg.connect(self._conninfo, autocommit=True)
         params = {k: v for k, v in self._params.items() if v is not None}
+        if self._conninfo:
+            # A url names its own database, and the pool builds one adapter per
+            # database off the same `<REF>_URI` — so a requested one has to be
+            # able to win. psycopg merges keywords over the url, which is what
+            # makes that a two-line matter rather than string surgery.
+            override = {"dbname": params["dbname"]} if params.get("dbname") else {}
+            return psycopg.connect(self._conninfo, autocommit=True, **override)
         return psycopg.connect(autocommit=True, **params)
 
     def _after_connect(self) -> None:
         # These tools never write. Enforced by the server rather than by
         # convention, so a write that ever slips in fails loudly.
         self._session_sql("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY")
-        if not self._database:
-            # libpq defaults the database to the user's name; ask what that came
-            # out as rather than reporting an empty one.
-            rows = self._unrecorded("SELECT current_database() AS name")
-            self._database = str(rows[0]["name"]) if rows else ""
+        # libpq defaults the database to the user's name, so an unnamed one has
+        # to be asked for rather than reported empty. Naming one is checked
+        # rather than trusted: every row this serves is labelled with it.
+        rows = self._unrecorded("SELECT current_database() AS name")
+        self._adopt_database(str(rows[0]["name"]) if rows else "")
 
     @classmethod
     def from_connection(
@@ -287,8 +292,8 @@ class PostgresAdapter(DbApiAdapterBase):
             sql, params = self._sql_min_max(quoted, quoted_column)
             row = self._rows(sql, params)[0]
             return ProfileResult(
-                min_value=_text(row["lo"]),
-                max_value=_text(row["hi"]),
+                min_value=as_text(row["lo"]),
+                max_value=as_text(row["hi"]),
             )
 
         if mode == ProfileMode.TOP_VALUES:
@@ -297,7 +302,7 @@ class PostgresAdapter(DbApiAdapterBase):
             )
             return ProfileResult(
                 top_values=[
-                    TopValue(value=_text(row["v"]) or "", count=int(row["c"]))
+                    TopValue(value=as_text(row["v"]) or "", count=int(row["c"]))
                     for row in self._rows(sql, params)
                 ]
             )
@@ -376,12 +381,3 @@ def _estimate(kind: str, reltuples: int | None) -> int | None:
     if kind not in _COUNTED_KINDS or reltuples is None or reltuples < 0:
         return None
     return int(reltuples)
-
-
-def _text(value: Any) -> str | None:
-    """A profile bound as text. `jsonify` first, so a date or a Decimal reads as
-    itself rather than as its repr."""
-    if value is None:
-        return None
-    converted = jsonify(value)
-    return converted if isinstance(converted, str) else str(converted)

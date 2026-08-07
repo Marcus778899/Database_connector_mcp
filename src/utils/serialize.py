@@ -30,3 +30,17 @@ def jsonify(value: Any) -> Any:
     if isinstance(value, (list, tuple, set, frozenset)):
         return [jsonify(v) for v in value]
     return str(value)
+
+
+def as_text(value: Any) -> str | None:
+    """
+    A driver-native value as text, keeping None as None.
+
+    Through `jsonify` first, so a date, a Decimal or an ObjectId reads as itself
+    rather than as its repr. Which is what a profile's bounds and a container's
+    freshness are: a string the caller reads, not a value it computes with.
+    """
+    if value is None:
+        return None
+    converted = jsonify(value)
+    return converted if isinstance(converted, str) else str(converted)

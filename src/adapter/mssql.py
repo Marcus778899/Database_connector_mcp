@@ -20,7 +20,7 @@ from src.core.contracts import (
     TopValue,
 )
 from src.core.log import log
-from src.utils.serialize import jsonify
+from src.utils.serialize import as_text, jsonify
 
 # sys.objects.type: 'U' is a user table, 'V' a view.
 _CONTAINER_TYPES = {"U": ContainerType.TABLE, "V": ContainerType.VIEW}
@@ -94,10 +94,12 @@ class MssqlAdapter(DbApiAdapterBase):
         return pyodbc.connect(self._connection_string, autocommit=True)
 
     def _after_connect(self) -> None:
-        if not self._database:
-            # The login's default database, whatever that turned out to be.
-            rows = self._unrecorded("SELECT DB_NAME() AS name")
-            self._database = str(rows[0]["name"]) if rows else ""
+        # Unnamed, it is the login's default, whatever that turned out to be.
+        # Named, it is checked rather than trusted: a whole `<REF>_URI` carries
+        # its own `DATABASE=`, and appending a second one is read differently by
+        # different drivers — so the mismatch is caught here instead.
+        rows = self._unrecorded("SELECT DB_NAME() AS name")
+        self._adopt_database(str(rows[0]["name"]) if rows else "")
 
     @classmethod
     def from_connection(
@@ -229,7 +231,7 @@ class MssqlAdapter(DbApiAdapterBase):
                     else int(row["estimated_count"])
                 ),
                 native_description=row["comment"] or None,
-                last_modified_at=_text(row["modified_at"]),
+                last_modified_at=as_text(row["modified_at"]),
             )
             for row in page
         ]
@@ -321,7 +323,9 @@ class MssqlAdapter(DbApiAdapterBase):
         if mode == ProfileMode.MIN_MAX:
             sql, params = self._sql_min_max(quoted, quoted_column)
             row = self._rows(sql, params)[0]
-            return ProfileResult(min_value=_text(row["lo"]), max_value=_text(row["hi"]))
+            return ProfileResult(
+                min_value=as_text(row["lo"]), max_value=as_text(row["hi"])
+            )
 
         if mode == ProfileMode.TOP_VALUES:
             sql, params = self._sql_top_values(
@@ -329,7 +333,7 @@ class MssqlAdapter(DbApiAdapterBase):
             )
             return ProfileResult(
                 top_values=[
-                    TopValue(value=_text(row["v"]) or "", count=int(row["c"]))
+                    TopValue(value=as_text(row["v"]) or "", count=int(row["c"]))
                     for row in self._rows(sql, params)
                 ]
             )
@@ -412,18 +416,34 @@ def _build_connection_string(
     """
     parts = [
         f"DRIVER={{{driver}}}",
-        f"SERVER={host},{port}",
+        f"SERVER={_odbc_value(f'{host},{port}')}",
         "Encrypt=yes",
     ]
     if database:
-        parts.append(f"DATABASE={database}")
+        parts.append(f"DATABASE={_odbc_value(database)}")
     if user:
-        parts.append(f"UID={user}")
-        parts.append(f"PWD={password or ''}")
+        parts.append(f"UID={_odbc_value(user)}")
+        parts.append(f"PWD={_odbc_value(password or '')}")
     else:
         # No login named: the odbc driver takes the caller's windows identity.
         parts.append("Trusted_Connection=yes")
     return ";".join(parts)
+
+
+def _odbc_value(value: str) -> str:
+    """
+    A connection-string value, braced where it has to be.
+
+    A `;` in a password ends the keyword as far as odbc is concerned, and the
+    rest of the password is then read as connection settings — which fails as a
+    login error, so it reads as a wrong password rather than as a string this
+    built wrong. Braces are odbc's own escape, and a `}` inside them is doubled.
+
+    Only where it is needed, so an ordinary value goes out looking like itself.
+    """
+    if value == value.strip() and not any(char in value for char in ";{}"):
+        return value
+    return "{" + value.replace("}", "}}") + "}"
 
 
 def _native_type(row: dict[str, Any]) -> str:
@@ -444,12 +464,3 @@ def _native_type(row: dict[str, Any]) -> str:
         # nchar/nvarchar measure bytes; everyone talks about them in characters
         return f"{name}({length // 2 if name in _WIDE_TYPES else length})"
     return name
-
-
-def _text(value: Any) -> str | None:
-    """A value bound as text. `jsonify` first, so a date or a Decimal reads as
-    itself rather than as its repr."""
-    if value is None:
-        return None
-    converted = jsonify(value)
-    return converted if isinstance(converted, str) else str(converted)

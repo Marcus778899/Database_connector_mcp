@@ -21,7 +21,7 @@ from src.core.contracts import (
     TopValue,
 )
 from src.core.log import log
-from src.utils.serialize import jsonify
+from src.utils.serialize import as_text, jsonify
 
 _CONTAINER_TYPES = {
     "BASE TABLE": ContainerType.TABLE,
@@ -41,6 +41,10 @@ _NOT_A_COMMENT = frozenset({"", "VIEW"})
 # comparison uses. information_schema's collation is case-insensitive, under
 # which `Orders` and `orders` are one name — enough for a walk to skip a table.
 _BINARY_NAME = "CAST(TABLE_NAME AS BINARY)"
+
+# What a `<REF>_URI` may call itself. mariadb answers the same protocol, and the
+# `+pymysql` form is what sqlalchemy writes.
+_URI_SCHEMES = frozenset({"mysql", "mariadb", "mysql+pymysql"})
 
 
 class MysqlAdapter(DbApiAdapterBase):
@@ -194,7 +198,7 @@ class MysqlAdapter(DbApiAdapterBase):
                     else int(row["estimated_count"])
                 ),
                 native_description=_comment(row["comment"]),
-                last_modified_at=_timestamp(row["updated_at"]),
+                last_modified_at=as_text(row["updated_at"]),
             )
             for row in page
         ]
@@ -271,7 +275,9 @@ class MysqlAdapter(DbApiAdapterBase):
         if mode == ProfileMode.MIN_MAX:
             sql, params = self._sql_min_max(quoted, quoted_column)
             row = self._rows(sql, params)[0]
-            return ProfileResult(min_value=_text(row["lo"]), max_value=_text(row["hi"]))
+            return ProfileResult(
+                min_value=as_text(row["lo"]), max_value=as_text(row["hi"])
+            )
 
         if mode == ProfileMode.TOP_VALUES:
             sql, params = self._sql_top_values(
@@ -279,7 +285,7 @@ class MysqlAdapter(DbApiAdapterBase):
             )
             return ProfileResult(
                 top_values=[
-                    TopValue(value=_text(row["v"]) or "", count=int(row["c"]))
+                    TopValue(value=as_text(row["v"]) or "", count=int(row["c"]))
                     for row in self._rows(sql, params)
                 ]
             )
@@ -326,9 +332,20 @@ class MysqlAdapter(DbApiAdapterBase):
 
 
 def _from_uri(uri: str) -> dict[str, Any]:
-    """The parts of a `mysql://user:password@host:port/database` url. pymysql
-    takes arguments rather than a url, so somebody has to take it apart."""
+    """
+    The parts of a `mysql://user:password@host:port/database` url. pymysql takes
+    arguments rather than a url, so somebody has to take it apart.
+
+    The scheme is checked because nothing else will: `urlparse` reads a postgres
+    url quite happily, and the mistake would otherwise surface as a connection
+    refused on the wrong port.
+    """
     parsed = urlparse(uri)
+    if parsed.scheme and parsed.scheme not in _URI_SCHEMES:
+        raise ValueError(
+            f"<REF>_URI names {parsed.scheme!r}, which is not a mysql url; "
+            f"expected one of {', '.join(sorted(_URI_SCHEMES))}"
+        )
     return {
         "host": parsed.hostname,
         "port": parsed.port,
@@ -342,16 +359,3 @@ def _comment(value: Any) -> str | None:
     """A comment, or None where mysql has written something that is not one."""
     text = "" if value is None else str(value)
     return None if text in _NOT_A_COMMENT else text
-
-
-def _timestamp(value: Any) -> str | None:
-    return None if value is None else str(jsonify(value))
-
-
-def _text(value: Any) -> str | None:
-    """A profile bound as text. `jsonify` first, so a date or a Decimal reads as
-    itself rather than as its repr."""
-    if value is None:
-        return None
-    converted = jsonify(value)
-    return converted if isinstance(converted, str) else str(converted)
