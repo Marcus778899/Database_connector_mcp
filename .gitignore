@@ -12,6 +12,13 @@ wheels/
 # secret
 .env
 *.rsa.*
+*.pem
+*.jwt
+
+# docker compose 的 provision 產物：私鑰、公鑰、以及當成憑證用的 token
+private/
+keys/
+out/
 
 # loggerhelper 在專案根目錄建立 log/<date>/
 log/

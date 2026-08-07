@@ -1,0 +1,32 @@
+# Everything the build does not need, and the two things it must never see:
+# a local .env (connection secrets) and a signing key.
+.git/
+.github/
+.venv/
+__pycache__/
+**/__pycache__/
+*.py[oc]
+*.egg-info/
+build/
+dist/
+wheels/
+
+.pytest_cache/
+.ruff_cache/
+tests/
+
+log/
+var/
+out/
+keys/
+private/
+
+.env
+*.rsa.*
+*.pem
+*.jwt
+
+.pre-commit-config.yaml
+docker-compose*.yml
+Dockerfile
+.dockerignore
