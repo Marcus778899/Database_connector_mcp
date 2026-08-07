@@ -1,0 +1,154 @@
+# Strings used to generate SKILL.md and INSTALL.md.
+#
+# The layout lives in SKILL.md.tmpl; this holds the parts that are only written
+# when they are true — a server with no inventory should not carry the table of
+# routes through one, and a token that cannot sample should not be told how to
+# sample responsibly.
+#
+# Braces are substitutions. Tool names, parameter names and claim names are
+# never translated: they are identifiers, and a localised `get_sample` would
+# describe a tool that does not exist.
+
+[skill]
+# The frontmatter description. This line is what a skill is matched against, so
+# it carries the words a request would actually use.
+#
+# Do not quote it yourself. It is wrapped as a valid YAML string, with escaping,
+# when the document is generated — a normal sentence sooner or later contains a
+# colon followed by a space, which an unquoted YAML scalar reads as a nested
+# mapping, and the whole frontmatter then fails to parse.
+description = "Explore the {engine_display} data catalog behind {server_name}: what tables and columns exist, what they mean, and how they join. Use when asked about the data itself rather than about code."
+role_line = " in the `{role}` role ({role_description})"
+role_line_plain = " in the `{role}` role"
+expiry = "The credential expires on {when}; after that every call is refused until someone issues a new one."
+
+[catalog]
+head = ["you want", "ask for", "what comes back"]
+empty = """
+This connection has no stored catalog to page through, so there is nothing to
+summarise or export. Work from `list_containers` and then `get_schema`, one
+container at a time, and keep what you learn in your own notes rather than
+asking again.
+"""
+closing = "Work outside in. Ask for counts, then narrow, then read one page."
+closing_export = "Reach for an export when the answer is \"all of it\" — the file is the deliverable and only its path comes back."
+
+[[catalog.routes]]
+tool = "inventory_summary"
+want = "how big is this"
+gets = "counts only, a few hundred bytes"
+
+[[catalog.routes]]
+tool = "inventory_search"
+want = "where is the thing I mean"
+gets = "narrow hits, no statistics"
+
+[[catalog.routes]]
+tool = "inventory_columns"
+want = "what is in this table"
+gets = "one page; pass `include_profile=False` on a wide one"
+
+[[catalog.routes]]
+tool = "inventory_export"
+want = "all of it"
+gets = "**a file** — only its path comes back, never the contents"
+
+[tools]
+heading = "## Tools you can call"
+catalog = "Catalog (asked of the source)"
+inventory = "Inventory (read from what a scan recorded)"
+withheld_heading = "### Served, but not to you"
+withheld_body = "Calling one of these is refused; it is not an outage and not worth a retry: {names}."
+
+[limits]
+heading = "## What this connection may see"
+databases_all = "- Databases: every database this connection reaches."
+databases_only = "- Databases: {names} only."
+containers_none = "- Containers: no name-based restriction."
+containers_allow = "- Containers: only {names}."
+containers_deny = "- Never readable: {names}. These are filtered out of listings too, so a name you cannot find may simply be one you are not shown."
+raw_granted = "- `get_sample(mask=False)` is granted. It is still the wrong default; use it when the task turns on the literal value."
+raw_denied = "- `get_sample(mask=False)` is **not** granted. Masked rows are all you get, and asking again will not change that."
+human = "- Descriptions you write are recorded as a person's rather than an agent's. Be correspondingly careful."
+
+[install]
+title = "# Installing `{server_name}` ({agent})"
+claude_code = """
+## Claude Code
+
+```bash
+cp -r {bundle} ~/.claude/plugins/{bundle}
+```
+
+Or point a marketplace at this directory. `.mcp.json` registers the server and
+`skills/` carries the usage guidance, so both arrive together.
+"""
+codex = """
+## Codex
+
+Append `codex.toml` to `~/.codex/config.toml`. Codex has no skills, so pass
+`skills/*/SKILL.md` in as context, or paste it into `AGENTS.md`.
+"""
+credential_inline = """
+## The credential
+
+`.mcp.json` carries the token itself, with 0600 on it. **This whole directory is
+a credential** — gitignore it, and do not copy it anywhere you would not copy the
+password.
+
+Written in rather than referenced as `${{{token_env}}}` because that form asks
+two things of you: that the client expands variables at all, and that the shell
+you exported it in is the one that started the client. A client launched from a
+desktop app never saw your terminal's exports, and what it sends is the literal
+text `${{{token_env}}}` — which the server rejects as malformed, in an error
+that says nothing about a variable. Set `PROVISION_INLINE_TOKEN=0` and re-run
+provision to go back to the variable.
+
+The server is expected at {url}. Change it in `.mcp.json` if you publish it
+elsewhere.
+"""
+credential_env = """
+## The credential
+
+The token is in `{token_name}`. `.mcp.json` refers to it as `${{{token_env}}}`
+rather than embedding it, so export it in **the shell that starts the client**:
+
+```bash
+export {token_env}=$(cat {token_name})
+```
+
+**If your client does not expand `${{...}}`**, it sends that text verbatim and
+the server rejects it as malformed — the error talks about the token's shape and
+not about the variable, so it is easy to misread. The same goes for a client
+launched from a desktop app, which never saw your terminal's exports. Two ways
+out: replace the placeholder in `.mcp.json` with the contents of `{token_name}`
+by hand, or re-run provision with `PROVISION_INLINE_TOKEN=1` to have it written
+in. Either way the file becomes a credential — gitignore it.
+
+The server is expected at {url}. Change it in `.mcp.json` if you publish it
+elsewhere.
+"""
+credential_stdio = """
+## The credential
+
+Over stdio the client spawns the container and there is no token: whoever can
+start the process already holds the database credential.
+
+Check the `-e` flags in `.mcp.json` — they pass the connection variables through
+from your own environment, and a file-backed engine needs a `-v` mount adding
+for its source.
+"""
+role_note = """
+## What this identity may do
+
+`{agent}` holds the `{role}` role: {role_description}
+
+The full list is in `skills/*/SKILL.md`, or from the server:
+
+```bash
+docker compose run --rm provision role show {role}
+```
+
+Change what it grants in `docker/roles.toml`, then re-run provision with
+`PROVISION_FORCE=1`.
+"""

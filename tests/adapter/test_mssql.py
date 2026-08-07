@@ -72,6 +72,33 @@ def test_from_connection_without_a_host_or_uri_is_refused():
         MssqlAdapter.from_connection(ConnectionInfo(user="reader"))
 
 
+def test_the_missing_variable_is_named_as_it_would_be_typed():
+    """`<REF>` is a placeholder to a reader and a literal to anyone pasting."""
+    with pytest.raises(ValueError, match="SHOP_HOST"):
+        MssqlAdapter.from_connection(ConnectionInfo(user="reader", prefix="SHOP"))
+
+
+def test_the_certificate_hint_names_the_real_variable(connected, monkeypatch):
+    """
+    The bug this guards: the hint said `<REF>_TRUST_SERVER_CERTIFICATE=1`, so
+    the one thing it existed to tell you was the one thing it did not say.
+    """
+    conn = ConnectionInfo(host="db.internal", prefix="SHOP")
+    adapter = MssqlAdapter.from_connection(conn)
+
+    def refuse(*_args: object, **_kwargs: object):
+        raise mssql.pyodbc.Error(
+            "08001", "SSL Provider: certificate verify failed:self-signed certificate"
+        )
+
+    monkeypatch.setattr(mssql.pyodbc, "connect", refuse)
+
+    with pytest.raises(
+        mssql.MssqlConnectionError, match="SHOP_TRUST_SERVER_CERTIFICATE=1"
+    ):
+        adapter._connect()
+
+
 def test_the_connection_string_is_built_from_the_parts(connected):
     MssqlAdapter.from_connection(
         ConnectionInfo(
@@ -85,20 +112,102 @@ def test_the_connection_string_is_built_from_the_parts(connected):
 
     assert connected.args[0] == (
         "DRIVER={ODBC Driver 18 for SQL Server};SERVER=db.internal,1434;"
-        "Encrypt=yes;DATABASE=shop;UID=reader;PWD=s3cret"
+        "Encrypt=yes;Connection Timeout=30;DATABASE=shop;UID=reader;PWD=s3cret"
     )
-    assert connected.kwargs == {"autocommit": True}
+    assert connected.kwargs == {
+        "autocommit": True,
+        "timeout": MssqlAdapter.DEFAULT_LOGIN_TIMEOUT,
+    }
 
 
 def test_encryption_stays_on_and_the_certificate_stays_checked():
-    """Trusting any certificate is a decision to make on purpose, in a
-    `<REF>_URI` — not this adapter's default."""
+    """Trusting any certificate is a decision to make on purpose — not this
+    adapter's default."""
     built = _build_connection_string(
         driver="d", host="h", port=1, user=None, password=None, database=""
     )
 
     assert "Encrypt=yes" in built
     assert "TrustServerCertificate" not in built
+
+
+def test_trusting_the_certificate_keeps_the_encryption(caplog):
+    """A self-signed certificate is the common case on-premises. Skipping the
+    check is a flag of its own, and it says so in the log."""
+    built = _build_connection_string(
+        driver="d",
+        host="h",
+        port=1,
+        user=None,
+        password=None,
+        database="",
+        trust_server_certificate=True,
+    )
+
+    assert "Encrypt=yes" in built
+    assert "TrustServerCertificate=yes" in built
+
+
+def test_the_trust_flag_reaches_the_connection_string(connected, caplog):
+    MssqlAdapter.from_connection(
+        ConnectionInfo(host="db.internal", trust_server_certificate=True)
+    )
+
+    assert "TrustServerCertificate=yes" in connected.args[0]
+    assert "not verified" in caplog.text
+
+
+def test_the_login_timeout_is_longer_than_the_drivers_own():
+    """The driver defaults to 15s, which a first connection over a site-to-site
+    link can miss — and HYT00 says nothing about the network being the cause."""
+    assert MssqlAdapter.DEFAULT_LOGIN_TIMEOUT > 15
+
+
+@pytest.mark.parametrize(
+    "sqlstate, detail, expected",
+    [
+        ("HYT00", "Login timeout expired", "host.docker.internal"),
+        (
+            "08001",
+            "SSL Provider: [error:0A000086:SSL routines::certificate verify failed:"
+            "self-signed certificate]",
+            # The variable as it would actually be typed, not a `<REF>`
+            # placeholder someone then pastes verbatim into their .env.
+            "SHOP_TRUST_SERVER_CERTIFICATE=1",
+        ),
+        ("28000", "Login failed for user 'reader'", "refused the login"),
+        ("IM002", "Data source name not found", "MCP_ENGINE=mssql"),
+    ],
+)
+def test_a_failed_login_says_what_to_change(sqlstate: str, detail: str, expected: str):
+    """
+    pyodbc's own text names the symptom; these name the remedy.
+
+    The original is kept on the end because it is the part anyone searching
+    the web will match on.
+    """
+    error = mssql._connection_error(
+        Exception(sqlstate, detail),
+        "DRIVER={x};SERVER=192.168.0.142,1433;PWD=s3cret",
+        30,
+        "SHOP_TRUST_SERVER_CERTIFICATE",
+    )
+
+    assert expected in str(error)
+    assert detail in str(error)
+
+
+def test_a_failed_login_does_not_repeat_the_password():
+    """An error gets pasted into tickets and chat windows."""
+    error = mssql._connection_error(
+        Exception("28000", "Login failed"),
+        "DRIVER={x};SERVER=db.internal,1433;UID=reader;PWD=s3cret",
+        30,
+        "SHOP_TRUST_SERVER_CERTIFICATE",
+    )
+
+    assert "s3cret" not in str(error)
+    assert "db.internal,1433" in str(error)
 
 
 def test_no_login_means_the_hosts_own_identity():

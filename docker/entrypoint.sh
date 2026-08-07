@@ -2,11 +2,17 @@
 #
 # Two roles out of one image:
 #
-#   provision   one-shot. Makes a key pair and signs a token, then exits.
-#               The private half is written to /private, which the serving
-#               container does not mount: a server that cannot sign is a
-#               server that, once taken, still cannot issue itself a token.
+#   provision   one-shot. Makes a key pair per identity and signs each one a
+#               token, then exits. The private halves are written to /private,
+#               which the serving container does not mount: a server that
+#               cannot sign is a server that, once taken, still cannot issue
+#               itself a token.
 #   serve       long-running. Reads /keys (public halves only) and serves.
+#
+# An identity is `<kid>=<role>`: the name the token speaks for, and the role in
+# docker/roles.toml that says what it may do. Several are the normal case — a
+# `de` that runs the scans and a `pm` that reads the result are not the same
+# credential and should not be.
 #
 # Everything printed here goes to stderr on purpose. Under the stdio transport
 # stdout carries JSON-RPC, and one stray line of chatter breaks the handshake
@@ -125,20 +131,29 @@ PY
 }
 
 cmd_provision() {
-    local kid="${PROVISION_KID:-}"
-    local has_scope=0
     local -a cli_args=()
-    local -a env_args=()
+    local cli_kid=""
+    local cli_role=""
+    local has_scope=0
 
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --kid)
                 [ "$#" -ge 2 ] || die "--kid needs a value"
-                kid="$2"
+                cli_kid="$2"
                 shift 2
                 ;;
             --kid=*)
-                kid="${1#--kid=}"
+                cli_kid="${1#--kid=}"
+                shift
+                ;;
+            --role)
+                [ "$#" -ge 2 ] || die "--role needs a value"
+                cli_role="$2"
+                shift 2
+                ;;
+            --role=*)
+                cli_role="${1#--role=}"
                 shift
                 ;;
             --scope | --scope=*)
@@ -152,6 +167,81 @@ cmd_provision() {
                 ;;
         esac
     done
+
+    mkdir -p "$KEYS_DIR" "$PRIVATE_DIR" "$OUT_DIR"
+
+    # `--kid` on the command line provisions that one identity and nothing else:
+    # `docker compose run --rm provision --kid alice --role pm` is how a person
+    # gets added without re-running the whole set.
+    if [ -n "$cli_kid" ]; then
+        _provision_one "$cli_kid" "$cli_role" "$has_scope" "${cli_args[@]}"
+        return
+    fi
+
+    local -a identities=()
+    _collect_identities identities
+    [ "${#identities[@]}" -gt 0 ] || die \
+        "nothing to provision. Set PROVISION_IDENTITIES to <kid>=<role> pairs," \
+        "e.g. PROVISION_IDENTITIES=de=de,pm=pm — \`role list\` shows the roles."
+
+    local pair
+    for pair in "${identities[@]}"; do
+        _provision_one "${pair%%=*}" "${pair#*=}" 0
+    done
+}
+
+# The identities to provision, as `<kid>=<role>` words in the named array.
+#
+# PROVISION_KID and PROVISION_SCOPES came first and are still honoured: a
+# deployment that set them keeps working, with the scopes standing in for a
+# role. New ones should use PROVISION_IDENTITIES, which is the only spelling
+# that can name more than one agent.
+_collect_identities() {
+    local -n _out="$1"
+    _out=()
+
+    if [ -n "${PROVISION_IDENTITIES:-}" ]; then
+        local -a raw=()
+        IFS=',' read -ra raw <<<"$PROVISION_IDENTITIES"
+        local item kid role
+        for item in "${raw[@]}"; do
+            item="${item//[[:space:]]/}"
+            [ -n "$item" ] || continue
+            kid="${item%%=*}"
+            role="${item#*=}"
+            [ "$kid" != "$item" ] || die \
+                "PROVISION_IDENTITIES wants <kid>=<role> pairs; got $item. The kid" \
+                "is the agent's name, the role is a section in the roles file."
+            [ -n "$kid" ] && [ -n "$role" ] || die \
+                "PROVISION_IDENTITIES entry $item has an empty half"
+            _out+=("$kid=$role")
+        done
+        return
+    fi
+
+    if [ -n "${PROVISION_KID:-}" ]; then
+        # No role: the scopes below carry the grants, as they used to.
+        _out+=("${PROVISION_KID}=")
+    fi
+}
+
+# Sign for one identity and write its bundle.
+#
+#   $1 kid, $2 role (may be empty), $3 whether --scope was given on the command
+#   line, $4… extra arguments passed straight to `token issue`
+_provision_one() {
+    local kid="$1"
+    local role="$2"
+    local has_scope="$3"
+    shift 3
+    local -a extra_args=("$@")
+    local -a env_args=()
+
+    [ -n "$kid" ] || die "an identity needs a name"
+
+    if [ -n "$role" ]; then
+        env_args+=(--role "$role")
+    fi
 
     # Compose is easier to read with scalars than with a long command, so the
     # common knobs get an environment spelling too. Flags come last, so an
@@ -176,18 +266,20 @@ cmd_provision() {
         env_args+=(--audience "$MCP_AUDIENCE")
     fi
 
-    [ -n "$kid" ] || die \
-        "provision needs --kid (or PROVISION_KID): the agent's name, and the" \
-        "filename its public key takes."
-    [ "$has_scope" -eq 1 ] || die \
-        "no --scope given (or PROVISION_SCOPES), so this token could call" \
-        "nothing. Name the tools the agent may use, e.g. --scope" \
-        "list_containers --scope get_columns."
+    [ -n "$role" ] || [ "$has_scope" -eq 1 ] || die \
+        "$kid was given neither a role nor a scope, so its token could call" \
+        "nothing. Name a role — \`role list\` shows them — or pass --scope."
 
-    mkdir -p "$KEYS_DIR" "$PRIVATE_DIR" "$OUT_DIR"
-
+    # Everything for one agent under one directory, the token included: an
+    # INSTALL.md telling you to \`cat\` a file that turned out to be a level up
+    # is a bad first five minutes.
+    local bundle="$OUT_DIR/$kid"
     local private_key="$PRIVATE_DIR/$kid.pem"
-    local token_file="$OUT_DIR/$kid.jwt"
+    local token_file="$bundle/$kid.jwt"
+    mkdir -p "$bundle"
+
+    say ""
+    say "=== $kid${role:+  ($role)}"
 
     # --if-missing because `docker compose up` runs this again on every start,
     # and a fresh pair would silently invalidate every token already handed out.
@@ -217,7 +309,7 @@ cmd_provision() {
             --key "$private_key" \
             --kid "$kid" \
             "${env_args[@]}" \
-            "${cli_args[@]}" \
+            "${extra_args[@]}" \
             --out "$token_file"
         chmod 600 "$token_file"
         say ""
@@ -228,9 +320,13 @@ cmd_provision() {
     fi
 
     # Regenerated even when the token was kept, so that a change to the server's
-    # configuration — an export directory added, a staging database removed —
-    # reaches the skill without anyone having to remember to re-issue.
-    PROVISION_KID="$kid" PROVISION_TOKEN_FILE="$token_file" MCP_OUT_DIR="$OUT_DIR" \
+    # configuration — an export directory added, a staging database removed, a
+    # role edited — reaches the skill without anyone having to remember to
+    # re-issue.
+    PROVISION_KID="$kid" \
+        PROVISION_ROLE="$role" \
+        PROVISION_TOKEN_FILE="$token_file" \
+        MCP_OUT_DIR="$OUT_DIR" \
         python "$PROVISION_HOME/provision.py"
 }
 
@@ -251,7 +347,11 @@ case "$1" in
     -*)
         cmd_serve "$@"
         ;;
-    token)
+    # The CLI's own subcommands, passed straight through. Two are worth knowing
+    # about: `role list` answers "what can I put in PROVISION_IDENTITIES", and
+    # `test-connection` answers "why will the server not start" — which cannot
+    # be asked of the server itself, because it is not running.
+    token | role | test-connection)
         exec mcp-connector "$@"
         ;;
     *)

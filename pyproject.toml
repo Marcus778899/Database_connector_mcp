@@ -33,6 +33,9 @@ dev = [
     "pyjwt>=2.8",
     "cryptography>=42",
     "pyarrow>=17",
+    # Tests only, to check that a generated SKILL.md's frontmatter parses. The
+    # server never reads YAML; the clients that load a skill do.
+    "pyyaml>=6",
 ]
 
 [build-system]
