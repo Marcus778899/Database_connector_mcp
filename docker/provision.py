@@ -138,7 +138,11 @@ def _summarise(doc: str | None) -> str:
         return collapsed
     # A docstring that runs on past a semicolon is being cut mid-thought, so the
     # clause that is kept ends as a sentence rather than as a dangling ';'.
-    return match.group(1).rstrip(";") + "." if match.group(1).endswith(";") else match.group(1)
+    return (
+        match.group(1).rstrip(";") + "."
+        if match.group(1).endswith(";")
+        else match.group(1)
+    )
 
 
 def discover_tools(source: Path) -> list[Tool]:
@@ -173,8 +177,7 @@ def served(tools: list[Tool], *, staging: bool, export: bool) -> list[Tool]:
     return [
         tool
         for tool in tools
-        if (staging or not tool.inventory)
-        and (export or tool.name != NEEDS_EXPORT_DIR)
+        if (staging or not tool.inventory) and (export or tool.name != NEEDS_EXPORT_DIR)
     ]
 
 
@@ -253,10 +256,23 @@ def mcp_json(
     prefix = re.sub(r"[^A-Za-z0-9]+", "_", connection_ref).strip("_").upper()
     args = ["run", "-i", "--rm", "-e", f"MCP_ENGINE={engine}"]
     args += ["-e", f"MCP_CONNECTION_REF={connection_ref}"]
-    for suffix in ("HOST", "PORT", "USER", "PASSWORD", "DATABASE", "URI", "PATH", "TOKEN"):
+    for suffix in (
+        "HOST",
+        "PORT",
+        "USER",
+        "PASSWORD",
+        "DATABASE",
+        "URI",
+        "PATH",
+        "TOKEN",
+    ):
         args += ["-e", f"{prefix}_{suffix}"]
     args += [image, "serve"]
-    return {"mcpServers": {server_name: {"type": "stdio", "command": "docker", "args": args}}}
+    return {
+        "mcpServers": {
+            server_name: {"type": "stdio", "command": "docker", "args": args}
+        }
+    }
 
 
 def plugin_json(*, slug: str, server_name: str, engine: str) -> dict[str, Any]:
@@ -318,7 +334,9 @@ def render(template: str, values: dict[str, str]) -> str:
 
     output = re.sub(r"\{\{(\w+)\}\}", replace, template)
     if missing:
-        raise ProvisionError(f"template asks for unknown values: {sorted(set(missing))}")
+        raise ProvisionError(
+            f"template asks for unknown values: {sorted(set(missing))}"
+        )
     # A placeholder that resolved to nothing leaves the blank lines that framed
     # it behind, and three blank lines is a heading gap in rendered markdown.
     return re.sub(r"\n{3,}", "\n\n", output)
@@ -332,7 +350,9 @@ def catalog_guidance(callable_names: set[str]) -> str:
     names a tool that is not there.
     """
     rows = [
-        (want, tool, note) for want, tool, note in CATALOG_ROUTES if tool in callable_names
+        (want, tool, note)
+        for want, tool, note in CATALOG_ROUTES
+        if tool in callable_names
     ]
     if not rows:
         return (
@@ -346,7 +366,7 @@ def catalog_guidance(callable_names: set[str]) -> str:
     closing = "\nWork outside in. Ask for counts, then narrow, then read one page."
     if NEEDS_EXPORT_DIR in callable_names:
         closing += (
-            " Reach\nfor an export when the answer is \"all of it\" — the file is the "
+            ' Reach\nfor an export when the answer is "all of it" — the file is the '
             "deliverable\nand only its path comes back."
         )
     return "\n".join(lines) + "\n" + closing
@@ -463,14 +483,14 @@ def install_notes(
         "## Codex",
         "",
         "Append `codex.toml` to `~/.codex/config.toml`. Codex has no skills, so",
-        f"pass `skills/*/SKILL.md` in as context, or paste it into `AGENTS.md`.",
+        "pass `skills/*/SKILL.md` in as context, or paste it into `AGENTS.md`.",
         "",
         "## The credential",
         "",
     ]
     if transport in NETWORK_TRANSPORTS and inline_token:
         lines += [
-            f"`.mcp.json` carries the token itself, because PROVISION_INLINE_TOKEN",
+            "`.mcp.json` carries the token itself, because PROVISION_INLINE_TOKEN",
             "was set. **That file is now a credential** — gitignore it, and do not",
             "copy it anywhere you would not copy the password.",
             "",
@@ -586,27 +606,37 @@ def main() -> int:
     )
 
     written = [
-        (plugin_dir / ".claude-plugin" / "plugin.json", json.dumps(
-            plugin_json(slug=slug, server_name=server_name, engine=engine), indent=2
-        ) + "\n"),
+        (
+            plugin_dir / ".claude-plugin" / "plugin.json",
+            json.dumps(
+                plugin_json(slug=slug, server_name=server_name, engine=engine), indent=2
+            )
+            + "\n",
+        ),
         (plugin_dir / ".mcp.json", json.dumps(entry, indent=2) + "\n"),
         (skill_dir / "SKILL.md", skill),
-        (plugin_dir / "codex.toml", codex_toml(
-            server_name=server_name,
-            transport=transport,
-            url=url,
-            token_env=token_env,
-            entry=entry,
-        )),
-        (plugin_dir / "INSTALL.md", install_notes(
-            plugin_dir=plugin_dir,
-            server_name=server_name,
-            transport=transport,
-            url=url,
-            token_env=token_env,
-            token_file=token_path,
-            inline_token=inline,
-        )),
+        (
+            plugin_dir / "codex.toml",
+            codex_toml(
+                server_name=server_name,
+                transport=transport,
+                url=url,
+                token_env=token_env,
+                entry=entry,
+            ),
+        ),
+        (
+            plugin_dir / "INSTALL.md",
+            install_notes(
+                plugin_dir=plugin_dir,
+                server_name=server_name,
+                transport=transport,
+                url=url,
+                token_env=token_env,
+                token_file=token_path,
+                inline_token=inline,
+            ),
+        ),
     ]
     for path, content in written:
         path.write_text(content, encoding="utf-8")
@@ -637,8 +667,8 @@ def main() -> int:
         )
     elif transport in NETWORK_TRANSPORTS:
         print(
-            f"\n.mcp.json carries the token itself and is now a credential (0600). "
-            f"Gitignore it.",
+            "\n.mcp.json carries the token itself and is now a credential (0600). "
+            "Gitignore it.",
             file=sys.stderr,
         )
     return 0
