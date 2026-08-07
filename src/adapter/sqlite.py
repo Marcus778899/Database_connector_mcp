@@ -11,6 +11,7 @@ from src.adapter.base import (
     AdapterBase,
     SqlAdapterBase,
     UnknownContainerError,
+    render_sql,
 )
 from src.core.config import ConnectionInfo
 from src.core.contracts import (
@@ -33,21 +34,8 @@ _CATALOG_WHERE = r"type IN ('table','view') AND name NOT LIKE 'sqlite\_%' ESCAPE
 
 
 def _render(sql: str, params: Sequence[Any] = ()) -> str:
-    """
-    The statement with its parameters inlined, for the audit trail.
-
-    Split once rather than replacing `?` repeatedly: a value that itself contains
-    a `?` would become the next placeholder, and the audit line would then be
-    quietly wrong about what ran — worse than having no line at all, because it
-    reads as authoritative.
-    """
-    head, *tails = sql.split("?")
-    rendered = [head]
-    for index, tail in enumerate(tails):
-        # more placeholders than parameters: leave the extras as placeholders
-        rendered.append(repr(params[index]) if index < len(params) else "?")
-        rendered.append(tail)
-    return "".join(rendered)
+    """The statement with its parameters inlined, for the audit trail."""
+    return render_sql(sql, params, SqliteAdapter._PARAM)
 
 
 class SqliteAdapter(SqlAdapterBase):

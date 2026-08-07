@@ -4,9 +4,11 @@ import pytest
 
 from src.adapter.base import (
     AdapterBase,
+    DbApiAdapterBase,
     SqlAdapterBase,
     UnknownColumnError,
     UnknownContainerError,
+    render_sql,
 )
 from src.core.contracts import (
     ColumnInfo,
@@ -399,6 +401,58 @@ def test_a_type_that_merely_contains_a_hint_is_not_taken_for_one(native_type: st
     assert _modes_for(native_type) == (ProfileMode.NULL_RATIO,)
 
 
+# ---- SqlAdapterBase: a name with a schema in it ----
+
+
+class QualifiedAdapter(DummySqlAdapter):
+    """An engine whose catalog names a container by schema and table."""
+
+    def list_containers(self, database=None, schema=None, limit=None, cursor=None):
+        page = super().list_containers(
+            database=database, schema=schema, limit=limit, cursor=cursor
+        )
+        for info in page.containers:
+            info.container_name = f"public.{info.container_name}"
+        return page
+
+
+def test_a_qualified_name_is_quoted_a_part_at_a_time():
+    """One identifier holding a dot is a different table, if it exists at all."""
+    adapter = QualifiedAdapter()
+
+    assert adapter._require_container("public.users") == '"public"."users"'
+
+
+def test_a_bare_name_is_resolved_where_one_schema_has_it():
+    """An agent relaying a name somebody said will not have the schema."""
+    assert QualifiedAdapter()._require_container("users") == '"public"."users"'
+
+
+def test_a_bare_name_in_two_schemas_is_refused_rather_than_guessed():
+    class TwoSchemas(QualifiedAdapter):
+        def list_containers(self, database=None, schema=None, limit=None, cursor=None):
+            page = super().list_containers(
+                database=database, schema=schema, limit=limit, cursor=cursor
+            )
+            page.containers[0].container_name = "sales.users"
+            return page
+
+    with pytest.raises(UnknownContainerError, match="more than one schema"):
+        TwoSchemas()._require_container("users")
+
+
+def test_a_flat_catalog_never_reaches_the_search():
+    assert DummySqlAdapter()._require_container("users") == '"users"'
+
+    with pytest.raises(UnknownContainerError, match="not_exist"):
+        DummySqlAdapter()._require_container("not_exist")
+
+
+def test_every_part_still_has_to_be_a_plain_identifier():
+    with pytest.raises(ValueError, match="illegal identifier"):
+        DummySqlAdapter()._quote_container("public.users; drop table t")
+
+
 def test_profile_mode_enum_is_fully_covered_by_templates():
     adapter = DummySqlAdapter()
     builders = {
@@ -411,3 +465,153 @@ def test_profile_mode_enum_is_fully_covered_by_templates():
     for build in builders.values():
         sql, _ = build('"users"', '"id"')
         assert sql.startswith("SELECT")
+
+
+# ---- DbApiAdapterBase ----
+
+
+class DummyDbApiAdapter(_ContractMixin, DbApiAdapterBase):
+    """A driver-shaped adapter over a scripted connection."""
+
+    def __init__(self, connection: Any, **kwargs: Any) -> None:
+        self._connection = connection
+        super().__init__(database="test_db", **kwargs)
+
+    def _connect(self) -> Any:
+        return self._connection
+
+
+def test_rows_come_back_keyed_by_the_cursors_description(connection):
+    """The one thing every driver reports the same way, where the row objects
+    themselves differ per driver."""
+    adapter = DummyDbApiAdapter(
+        connection([("SELECT", ("id", "name"), [(1, "ada"), (2, "bob")])])
+    )
+
+    assert adapter._rows("SELECT id, name FROM users") == [
+        {"id": 1, "name": "ada"},
+        {"id": 2, "name": "bob"},
+    ]
+
+
+def test_a_statement_with_no_result_set_is_no_rows(connection):
+    """A `SET …` has no description to read column names off."""
+    assert DummyDbApiAdapter(connection())._rows("SET SESSION x = 1") == []
+
+
+def test_no_parameters_means_none_are_passed_at_all(connection):
+    """A driver that interpolates client-side reads the statement's own `%` as a
+    placeholder the moment it is given parameters, empty or not."""
+    adapter = DummyDbApiAdapter(connection())
+
+    adapter._rows("SELECT 'a%b'")
+
+    assert adapter._conn.passed == [None]
+
+
+def test_parameters_reach_the_driver_rather_than_the_statement(connection):
+    """The one defence against injection that does not depend on quoting."""
+    adapter = DummyDbApiAdapter(connection())
+
+    adapter._rows("SELECT * FROM t WHERE name > ?", ("a?b",))
+
+    assert adapter._conn.executed[-1] == ("SELECT * FROM t WHERE name > ?", ("a?b",))
+
+
+def test_the_statement_is_recorded_with_its_parameters_inlined(connection):
+    adapter = DummyDbApiAdapter(connection())
+
+    adapter._rows("SELECT * FROM t WHERE name > ?", ("a?b",))
+
+    assert adapter.pop_rendered_sql() == "SELECT * FROM t WHERE name > 'a?b'"
+
+
+def test_the_adapters_own_bookkeeping_stays_out_of_the_audit_trail(connection):
+    adapter = DummyDbApiAdapter(connection())
+
+    adapter._unrecorded("SELECT current_database()")
+    adapter._session_sql("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY")
+
+    assert adapter.pop_rendered_sql() is None
+    assert len(adapter._conn.executed) == 2
+
+
+def test_a_session_setting_an_older_server_refuses_is_not_fatal():
+    class Refusing(DummyDbApiAdapter):
+        def _after_connect(self) -> None:
+            self._session_sql("SET SESSION TRANSACTION READ ONLY")
+
+    class Grumpy:
+        closed = False
+
+        def cursor(self):
+            raise RuntimeError("unknown statement")
+
+        def close(self):
+            self.closed = True
+
+    # constructing it is the test: the settings harden a connection that works
+    assert Refusing(Grumpy()).ping() is False
+
+
+def test_scalar_reads_the_first_column_of_the_first_row(connection):
+    adapter = DummyDbApiAdapter(connection([("SELECT", ("n",), [(7,)])]))
+
+    assert adapter._scalar("SELECT count(*) AS n FROM t") == 7
+
+
+def test_scalar_over_no_rows(connection):
+    assert DummyDbApiAdapter(connection())._scalar("SELECT n FROM t") is None
+
+
+def test_ping(connection):
+    adapter = DummyDbApiAdapter(connection())
+
+    assert adapter.ping() is True
+    assert adapter._conn.statements == ["SELECT 1"]
+    assert adapter.pop_rendered_sql() is None
+
+
+def test_close_then_ping(connection):
+    """The pool rebuilds an adapter that fails its ping."""
+    adapter = DummyDbApiAdapter(connection())
+
+    adapter.close()
+
+    assert adapter._conn.closed is True
+    assert adapter.ping() is False
+
+
+def test_close_is_idempotent(connection):
+    adapter = DummyDbApiAdapter(connection())
+
+    adapter.close()
+    adapter.close()
+
+
+# ---- rendering a statement for the audit trail ----
+
+
+@pytest.mark.parametrize(
+    ("sql", "params", "placeholder", "expected"),
+    [
+        ("SELECT 1", (), "?", "SELECT 1"),
+        ("SELECT ?, ?", (1, 2), "?", "SELECT 1, 2"),
+        # an unfilled placeholder stays one rather than vanishing
+        ("SELECT ?, ?", (1,), "?", "SELECT 1, ?"),
+        ("SELECT ?", (1, 2), "?", "SELECT 1"),
+        ("SELECT %s", (None,), "%s", "SELECT None"),
+        ("SELECT %s, %s", ("a", 2), "%s", "SELECT 'a', 2"),
+    ],
+)
+def test_render_sql(sql: str, params: tuple, placeholder: str, expected: str):
+    assert render_sql(sql, params, placeholder) == expected
+
+
+def test_a_value_holding_a_placeholder_does_not_shift_the_rest():
+    """
+    The bug this guards: repeated replacement would find the placeholder inside
+    the value it had just inlined and substitute there, so the audit line came
+    out wrong about what ran while still reading as authoritative.
+    """
+    assert render_sql("SELECT %s, %s", ("a%sb", 5), "%s") == "SELECT 'a%sb', 5"
