@@ -11,6 +11,23 @@ x-image: &image
     context: .
     target: ${MCP_TARGET:-slim}
 
+# What the server is, shared by both services. `provision` needs it not to
+# serve anything but to describe it: which tools exist depends on whether a
+# staging database and an export directory were configured, and a SKILL.md
+# naming tools that are not registered costs the agent turns to find out.
+x-shape: &shape
+  MCP_SERVER_NAME: ${MCP_SERVER_NAME:-etl-agent-mcp}
+  MCP_AUDIENCE: ${MCP_AUDIENCE:-etl-agent-mcp}
+  MCP_TRANSPORT: streamable-http
+  MCP_ENGINE: ${MCP_ENGINE:-sqlite}
+  # Names the prefix of the <REF>_HOST / <REF>_URI / <REF>_PATH … variables.
+  # The connection itself is never a build argument: that would put it in
+  # `docker history`.
+  MCP_CONNECTION_REF: ${MCP_CONNECTION_REF:-shop}
+  # State, all of it on the volume rather than in the image.
+  MCP_STAGING_DB: /data/staging.db
+  MCP_EXPORT_DIR: /data/export
+
 services:
   # One-shot. `server` waits for this to exit 0, so a failed provision keeps
   # the server down rather than serving an allowlist nobody is in.
@@ -19,13 +36,15 @@ services:
     command: provision
     restart: "no"
     environment:
+      <<: *shape
       PROVISION_KID: ${PROVISION_KID:-agent}
       # Comma separated; the tools this token may call. Nothing else is
-      # reachable with it.
-      PROVISION_SCOPES: ${PROVISION_SCOPES:-list_containers,get_columns,get_sample}
+      # reachable with it, and the generated SKILL.md lists exactly these.
+      PROVISION_SCOPES: ${PROVISION_SCOPES:-list_containers,get_schema,get_sample,inventory_summary,inventory_search,inventory_columns,inventory_export}
       PROVISION_LIFETIME: ${PROVISION_LIFETIME:-30d}
-      # Must match the server's, or every request verifies as forged.
-      MCP_AUDIENCE: ${MCP_AUDIENCE:-etl-agent-mcp}
+      # Where the agent will reach the server from, which the container cannot
+      # work out for itself — it only knows the port it bound inside.
+      PROVISION_PUBLIC_URL: ${PROVISION_PUBLIC_URL:-http://localhost:${MCP_PUBLISHED_PORT:-8000}/mcp}
     volumes:
       - mcp-keys:/keys # public halves, shared with the server
       - mcp-private:/private # signing key, deliberately not shared
@@ -39,23 +58,12 @@ services:
       provision:
         condition: service_completed_successfully
     environment:
-      MCP_TRANSPORT: streamable-http
+      <<: *shape
       MCP_HOST: 0.0.0.0
       MCP_PORT: 8000
       MCP_REQUIRE_AUTH: "true"
-      MCP_AUDIENCE: ${MCP_AUDIENCE:-etl-agent-mcp}
       MCP_AUTHORIZED_KEYS_DIR: /keys
-
-      MCP_ENGINE: ${MCP_ENGINE:-sqlite}
-      # Names the prefix of the <REF>_HOST / <REF>_URI / <REF>_PATH … variables
-      # below. The connection itself is never a build argument: that would put
-      # it in `docker history`.
-      MCP_CONNECTION_REF: ${MCP_CONNECTION_REF:-shop}
-
-      # State, all of it on the volume rather than in the image.
-      MCP_STAGING_DB: /data/staging.db
       MCP_AUDIT_LOG: /data/audit/audit.jsonl
-      MCP_EXPORT_DIR: /data/export
     # Connection secrets come from a file git never sees. SHOP_HOST,
     # SHOP_USER, SHOP_PASSWORD, SHOP_DB … for MCP_CONNECTION_REF=shop.
     env_file:

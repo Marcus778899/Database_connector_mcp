@@ -93,6 +93,10 @@ RUN mkdir -p /data /keys /out /private \
     && chown app:app /data /keys /out /private
 
 COPY --chmod=0755 docker/entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY docker/provision.py /opt/provision/provision.py
+COPY docker/templates/ /opt/provision/templates/
+
+ENV PROVISION_HOME=/opt/provision
 
 WORKDIR /app
 

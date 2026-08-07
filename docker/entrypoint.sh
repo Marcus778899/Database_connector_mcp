@@ -18,6 +18,9 @@ DATA_DIR="${MCP_DATA_DIR:-/data}"
 KEYS_DIR="${MCP_AUTHORIZED_KEYS_DIR:-/keys}"
 PRIVATE_DIR="${MCP_PRIVATE_KEY_DIR:-/private}"
 OUT_DIR="${MCP_OUT_DIR:-/out}"
+# provision.py and its templates. Defaulted so the script also runs from a
+# checkout, where they sit next to it.
+PROVISION_HOME="${PROVISION_HOME:-$(cd -- "$(dirname -- "$0")" && pwd)}"
 
 say() { printf '%s\n' "$*" >&2; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
@@ -153,24 +156,28 @@ cmd_provision() {
     if [ -e "$token_file" ] && ! is_true "${PROVISION_FORCE:-}"; then
         say "token         $token_file   already there, keeping it" \
             "(PROVISION_FORCE=1 to sign a new one)"
-        return 0
+    else
+        # --out keeps the token off stdout: it belongs in a file with 0600 on
+        # it, not in a compose log that anything can scroll back through.
+        mcp-connector token issue \
+            --key "$private_key" \
+            --kid "$kid" \
+            "${env_args[@]}" \
+            "${cli_args[@]}" \
+            --out "$token_file"
+        chmod 600 "$token_file"
+        say ""
+        say "token         $token_file   hand this to the agent; it is a credential"
+        say "signing key   $private_key   keep this off the serving container"
+        say "public key    $KEYS_DIR/$kid.pub   the server reads this"
+        say "revoke with   rm $KEYS_DIR/$kid.pub"
     fi
 
-    # --out keeps the token off stdout: it belongs in a file with 0600 on it,
-    # not in a compose log that anything can scroll back through.
-    mcp-connector token issue \
-        --key "$private_key" \
-        --kid "$kid" \
-        "${env_args[@]}" \
-        "${cli_args[@]}" \
-        --out "$token_file"
-    chmod 600 "$token_file"
-
-    say ""
-    say "token         $token_file   hand this to the agent; it is a credential"
-    say "signing key   $private_key   keep this off the serving container"
-    say "public key    $KEYS_DIR/$kid.pub   the server reads this"
-    say "revoke with   rm $KEYS_DIR/$kid.pub"
+    # Regenerated even when the token was kept, so that a change to the server's
+    # configuration — an export directory added, a staging database removed —
+    # reaches the skill without anyone having to remember to re-issue.
+    PROVISION_KID="$kid" PROVISION_TOKEN_FILE="$token_file" MCP_OUT_DIR="$OUT_DIR" \
+        python "$PROVISION_HOME/provision.py"
 }
 
 # --------------------------------------------------------------- dispatch ---
