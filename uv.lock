@@ -342,7 +342,7 @@ requires-dist = [
     { name = "cryptography", marker = "extra == 'server'", specifier = ">=42" },
     { name = "fastmcp", marker = "extra == 'mcp'", specifier = ">=3.0" },
     { name = "fastmcp", marker = "extra == 'server'", specifier = ">=3.0" },
-    { name = "loggerhelper", path = "lib/loggerhelper-1.0.0-py3-none-any.whl" },
+    { name = "loggerhelper", path = "lib/loggerhelper-2.0.0-py3-none-any.whl" },
     { name = "psycopg", extras = ["binary"], marker = "extra == 'postgres'", specifier = ">=3.1" },
     { name = "pyarrow", marker = "extra == 'datalake'", specifier = ">=17" },
     { name = "pydantic", specifier = ">=2.7" },
@@ -667,10 +667,10 @@ wheels = [
 
 [[package]]
 name = "loggerhelper"
-version = "1.0.0"
-source = { path = "lib/loggerhelper-1.0.0-py3-none-any.whl" }
+version = "2.0.0"
+source = { path = "lib/loggerhelper-2.0.0-py3-none-any.whl" }
 wheels = [
-    { filename = "loggerhelper-1.0.0-py3-none-any.whl", hash = "sha256:78a505064b0475d1d1ca9e7ecb6830676d52c20f3b93b74f49477bc437863037" },
+    { filename = "loggerhelper-2.0.0-py3-none-any.whl", hash = "sha256:4c8bc2c09c2323f094c5cf4cfd3617b955c45880efe5476b494a9ed9fd8f31c1" },
 ]
 
 [[package]]

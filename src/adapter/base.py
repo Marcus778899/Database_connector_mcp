@@ -7,8 +7,9 @@ from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from typing import Any, ClassVar
 
+from loggerhelper import log
+
 from src.core.contracts import ColumnInfo, ContainerPage, ProfileMode, ProfileResult
-from src.core.log import log
 
 
 class UnknownContainerError(Exception):

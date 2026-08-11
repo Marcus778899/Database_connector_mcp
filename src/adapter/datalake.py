@@ -6,6 +6,7 @@ from typing import Any, ClassVar
 
 import pyarrow.compute as _pc
 import pyarrow.dataset as pads
+from loggerhelper import log
 from pyarrow.fs import FileSelector, FileSystem, FileType
 
 from src.adapter.base import (
@@ -14,7 +15,6 @@ from src.adapter.base import (
     UnknownContainerError,
 )
 from src.core.config import ConnectionInfo
-from src.core.log import log
 from src.core.contracts import (
     ColumnInfo,
     ContainerInfo,

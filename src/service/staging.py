@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from loggerhelper import log
 from pydantic import BaseModel
 
 from src.core.contracts import (
@@ -18,7 +19,6 @@ from src.core.contracts import (
     ProfileResult,
     Sensitivity,
 )
-from src.core.log import log
 
 # NULL in a primary key lets duplicates in (SQLite treats NULLs as distinct).
 NO_SCHEMA = ""

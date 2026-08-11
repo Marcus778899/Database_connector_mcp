@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Any, ClassVar
 from urllib.parse import quote
 
+from loggerhelper import log
+
 from src.adapter.base import (
     AdapterBase,
     SqlAdapterBase,
@@ -23,7 +25,6 @@ from src.core.contracts import (
     ProfileResult,
     TopValue,
 )
-from src.core.log import log
 from src.utils.serialize import jsonify
 
 _CONTAINER_TYPES = {"table": ContainerType.TABLE, "view": ContainerType.VIEW}

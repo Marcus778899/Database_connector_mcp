@@ -5,11 +5,11 @@ import re
 from pathlib import Path
 from typing import Literal, Mapping, Any
 
+from loggerhelper import log
 from pydantic import BaseModel, model_validator
 
 from src.core.contracts import ProfileMode
 from src.core.engines import SourceEngine
-from src.core.log import log
 
 # Re-exported: every caller says `from src.core.config import SourceEngine`, and
 # the enum only moved because the Dockerfile has to read it before pydantic is

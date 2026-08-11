@@ -16,6 +16,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from fastmcp import FastMCP
+from loggerhelper import log
 from pydantic import ValidationError
 
 from src.auth import AuthConfigurationError
@@ -36,7 +37,6 @@ from src.core.config import (
     resolve_connection,
 )
 from src.core.contracts import ProfileMode
-from src.core.log import log
 from src.server import build_server
 from src.service.factory import AdapterNotAvailableError, load_adapter_class
 from src.service.inventory import InventoryService

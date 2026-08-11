@@ -5,6 +5,7 @@ import re
 from typing import Any, ClassVar
 
 from bson import Binary, Code, Decimal128, ObjectId, Regex, Timestamp
+from loggerhelper import log
 from pymongo import MongoClient
 from pymongo.collection import Collection
 from pymongo.errors import ConfigurationError, PyMongoError
@@ -24,7 +25,6 @@ from src.core.contracts import (
     ProfileResult,
     TopValue,
 )
-from src.core.log import log
 from src.utils.serialize import as_text, jsonify
 
 # The server's own databases. Never a user's catalog.

@@ -4,6 +4,7 @@ from typing import Any, ClassVar
 from urllib.parse import unquote, urlparse
 
 import pymysql
+from loggerhelper import log
 
 from src.adapter.base import (
     AdapterBase,
@@ -20,7 +21,6 @@ from src.core.contracts import (
     ProfileResult,
     TopValue,
 )
-from src.core.log import log
 from src.utils.serialize import as_text, jsonify
 
 _CONTAINER_TYPES = {

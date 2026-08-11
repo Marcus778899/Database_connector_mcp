@@ -5,6 +5,7 @@ import uuid
 from collections.abc import Sequence
 from typing import ClassVar
 
+from loggerhelper import log
 from pydantic import BaseModel
 
 from src.core.contracts import (
@@ -14,7 +15,6 @@ from src.core.contracts import (
     ProfileResult,
     SourceAdaptor,
 )
-from src.core.log import log
 from src.service import sensitivity
 from src.service.pool import AdapterProvider
 from src.service.staging import StagingStore, schema_hash

@@ -8,6 +8,7 @@ from typing import Any, Literal
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from fastmcp.server.dependencies import get_access_token
+from loggerhelper import log
 
 from src.auth import verifier_from_config
 from src.auth.permissions import Permissions
@@ -20,7 +21,6 @@ from src.core.contracts import (
     Sensitivity,
     SourceAdaptor,
 )
-from src.core.log import log
 from src.service import sensitivity
 from src.service.audit import AuditLogger
 from src.service.export import ExportFormat, ExportResult, export_inventory
