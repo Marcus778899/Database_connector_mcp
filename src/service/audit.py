@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, ClassVar
 
-from src.core.log import log
+from loggerhelper import log
 
 
 @dataclass

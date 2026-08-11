@@ -17,9 +17,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 
+from loggerhelper import log
 from pydantic import BaseModel
 
-from src.core.log import log
 from src.service.staging import StagingStore, StoredColumn, StoredContainer
 
 ExportFormat = Literal["markdown", "csv", "dbt_yaml"]

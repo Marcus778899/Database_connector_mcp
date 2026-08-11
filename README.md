@@ -14,6 +14,7 @@
 - [角色與身分](#角色與身分)
 - [交給 agent](#交給-agent)
 - [有哪些工具](#有哪些工具)
+- [跑一次完整盤點](#跑一次完整盤點)
 - [遇到問題](#遇到問題)
 - [不用 Docker](#不用-docker)
 
@@ -139,6 +140,30 @@ DBeaver、SSMS 這類客戶端預設就勾著「信任伺服器憑證」，所�
 docker compose run --rm server test-connection
 ```
 
+### 日誌
+
+一個等級一個檔，寫在容器裡的 `/data/log/<日期>/<LEVEL>.log`，跟 staging 和稽核記錄
+一起在 `mcp-data` volume 上。console 那份走 stderr，所以用 stdio transport 時
+protocol 不會被日誌混進去。
+
+```bash
+docker compose exec server sh -c 'tail -f /data/log/$(date +%F)/ERROR.log'
+```
+
+預設保留 30 天，超過的整個日期目錄會在第一次寫 log 和跨日換檔時被刪掉：
+
+```bash
+LOG_RETENTION_DAYS=0     # 不刪
+LOG_LEVEL=INFO           # DEBUG / INFO / WARNING / ERROR / CRITICAL
+```
+
+刪的只有 `log/` 底下名字剛好是 `YYYY-MM-DD` 的目錄。**稽核記錄不在裡面**——那是
+`/data/audit/audit.jsonl`，`LOG_RETENTION_DAYS` 碰不到它。
+
+這兩個變數只有 server 讀得到（`env_file` 只掛在 server 上）。`LOG_DIR` 不要從 `.env`
+改：Dockerfile 已經把它指到 volume 上的 `/data/log`，改掉會寫進容器的可寫層，重建就
+沒了。不用 Docker 跑的時候沒有這個變數，log 會落在專案根目錄的 `log/<日期>/`。
+
 ---
 
 ## 角色與身分
@@ -150,9 +175,46 @@ docker compose run --rm server test-connection
 | `pm` | 跟客戶對資料的人 | 讀盤點結果、看 schema、取遮罩過的樣本、匯出資料字典。**不能**啟動掃描、不能改盤點內容 |
 | `de` | 做盤點交付的工程師 | `pm` 的全部，再加跑掃描、即時統計、補描述、匯出 `dbt schema.yml` |
 
+`de` 是 `pm` 的**超集**——`roles.toml` 裡是 `extends = "pm"` 加 `add_tools`，所以
+`pm` 叫得動的 `de` 一定也叫得動。逐個工具攤開是這樣（完整回傳內容見
+[有哪些工具](#有哪些工具)）：
+
+| 工具 | `pm` | `de` | 為什麼 |
+|---|:--:|:--:|---|
+| `list_databases` | ✅ | ✅ | 唯讀，只回名字 |
+| `list_containers` | ✅ | ✅ | 唯讀，一次一頁 |
+| `get_schema` | ✅ | ✅ | 唯讀，一張表的欄位 |
+| `get_sample` | ✅ | ✅ | 唯讀，且**兩個角色都只拿得到遮罩過的值** |
+| `profile_column` | ❌ | ✅ | 會讓來源當場做工（`costly`），不給對客戶的人 |
+| `inventory_start` | ❌ | ✅ | 會讓來源做很久的工，而且寫入盤點 |
+| `inventory_status` | ❌ | ✅ | 沒有 `inventory_start` 就沒有 job id 可問 |
+| `inventory_cancel` | ❌ | ✅ | 同上；而且它會中斷別人的掃描 |
+| `inventory_summary` | ✅ | ✅ | 讀盤點，幾百個位元組 |
+| `inventory_containers` | ✅ | ✅ | 讀盤點 |
+| `inventory_columns` | ✅ | ✅ | 讀盤點 |
+| `inventory_search` | ✅ | ✅ | 讀盤點 |
+| `inventory_relationships` | ✅ | ✅ | 讀盤點，「這兩張表怎麼接」 |
+| `inventory_changes` | ❌ | ✅ | 兩次掃描之間的 diff，是盤點者在看的東西 |
+| `inventory_annotate` | ❌ | ✅ | **唯一會寫入的工具**（寫盤點，不寫來源） |
+| `inventory_export` | ✅ | ✅ | 只回傳路徑；`pm` 用 `markdown`，`de` 另外用 `dbt_yaml` |
+
+不是工具、但一樣寫在 token 裡的三項，預設兩個角色都**沒有**：
+
+| 設定 | 預設 | 打開之後 |
+|---|---|---|
+| `allow_raw_sample` | 關 | `get_sample(mask=False)` 才拿得到未遮罩的真值 |
+| `annotate_as_human` | 關 | `inventory_annotate` 寫進去的描述記成人寫的，而不是 agent 猜的 |
+| `databases` / `containers` | 不限制 | 限定只讀某幾個 database、或用 glob 擋掉某些表 |
+
 ```bash
 docker compose run --rm provision role list       # 有哪些角色
 docker compose run --rm provision role show de    # 展開繼承後的實際權限
+```
+
+要看**手上這張 token 實際帶了什麼**（上面那張表是設定檔，這是既成事實）：
+
+```bash
+python3 -c 'import base64,json,sys;b=open(sys.argv[1]).read().strip().split(".")[1];print(json.dumps(json.loads(base64.urlsafe_b64decode(b+"="*(-len(b)%4))),indent=1))' out/de/de.jwt
 ```
 
 ### 發身分
@@ -177,11 +239,7 @@ docker compose run --rm provision rm /keys/bob.pub
 
 ### 改權限
 
-編輯 `docker/roles.toml`，然後重簽：
-
-```bash
-PROVISION_FORCE=1 docker compose up provision
-```
+編輯 `docker/roles.toml`：
 
 ```toml
 [roles.analyst]
@@ -194,6 +252,41 @@ lifetime   = "7d"
 
 工具名在載入時會比對真實的工具清單，打錯字直接報錯。可用的設定寫在
 `roles.toml` 的檔頭。
+
+### 重簽
+
+`roles.toml` 和 SKILL.md 的範本都**烤在 image 裡**，所以改完要先 build 再重簽：
+
+```bash
+PROVISION_FORCE=1 docker compose up provision --build
+```
+
+`--build` 只有在改了 `docker/` 底下的東西之後才需要；只是想換一張新的 token 的話
+`PROVISION_FORCE=1 docker compose up provision` 就夠了。（不想每次 build，把
+`docker-compose.yml` 裡 `./docker/roles.toml:/etc/mcp/roles.toml:ro` 那行的註解拿
+掉，roles.toml 就變成掛進去的。）
+
+`PROVISION_FORCE` 的意思是「就算手上這張還驗得過也重簽一張」。**沒有它的時候
+provision 不會重簽**——它只在 server 現在會拒絕手上這張 token 時才動手（金鑰換了、
+過期了、audience 改了）。分得出來的地方在 log：
+
+```
+signing a token: PROVISION_FORCE is set          ← 重簽了
+token /out/de/de.jwt still verifies …, keeping it ← 沒重簽，舊的還在
+```
+
+跑完之後：
+
+1. `out/<名字>/` 整包**重新產生**，包含新的 `.jwt`、把 token 寫進去的 `.mcp.json`、
+   和照新權限重寫的 `SKILL.md`。舊 token 不會被撤銷，只是沒人用了——要真的讓它失
+   效，刪掉那把公鑰（見上面的[撤銷](#發身分)）。
+2. **重新交付一次**。agent 手上那包是舊的，`cp -r out/de ~/.claude/plugins/de` 要再
+   跑一次，然後重開 agent 讓它重讀。權限改了但沒重新交付，agent 會照舊的 SKILL.md
+   做事，並且拿舊 token 去撞新的權限。
+3. server **不用重啟**。它每 30 秒重讀一次公鑰目錄，而權限是寫在 token 裡的。
+
+改的只是 SKILL.md 的文字、權限沒動的話，token 其實不用換，但重簽一張最省事——反正
+整包都要重新交付。
 
 ---
 
@@ -230,28 +323,32 @@ Codex：把 `codex.toml` 附加到 `~/.codex/config.toml`，並把 `SKILL.md` �
 
 ## 有哪些工具
 
-**直接問來源**（永遠都在）：
+**直接問來源**（永遠都在）。每一次呼叫都真的送一句 SQL 出去：
 
-| 工具 | 回傳 |
-|---|---|
-| `list_databases` | 這條連線碰得到的資料庫 |
-| `list_containers` | 一頁的表 / view / collection |
-| `get_schema` | 某個 container 的欄位，含主鍵與可否為 null |
-| `get_sample` | 幾筆資料，**預設遮罩個資** |
-| `profile_column` | 單一欄位的單一統計值，當場算 |
+| 工具 | 主要參數 | 回傳什麼 |
+|---|---|---|
+| `list_databases` | 無 | 一個字串陣列。被 `databases` 限制的名字直接不出現在裡面 |
+| `list_containers` | `database` `schema` `limit` `cursor` | `{containers[], next_cursor}`。每筆有 `database` `schema_name` `container_name` `container_type` `estimated_count`（概估列數）`native_description`（來源自己的表註解）`last_modified_at`。`next_cursor` 是 `null` 就是最後一頁 |
+| `get_schema` | `container` `database` | 一個 `ColumnInfo` 陣列：`name` `ordinal` `native_type` `nullable` `is_pk` `is_fk` `native_description` `references_container` / `references_column`（外鍵指到哪） |
+| `get_sample` | `container` `limit=3` `mask=True` | 幾筆 row 的 dict 陣列。`limit` 會被 `MCP_MAX_SAMPLE_LIMIT`（預設 100）夾住。個資欄位是 `a***@***.com`、`***`；`mask=False` 沒有授權的話**直接報錯**，不是靜靜回遮罩值 |
+| `profile_column` | `container` `column` `mode` | 一個 `ProfileResult`，只填 `mode` 要的那一項：`distinct_count` / `null_ratio` / `top_values[]` / `min_value` / `max_value`。`approximate=true` 代表來源沒有掃完整份資料 |
 
-**讀盤點結果**（`MCP_STAGING_DB` 設了才有，compose 預設有）：
+**讀盤點結果**（`MCP_STAGING_DB` 設了才有，compose 預設有）。除了 `inventory_start`
+的背景工作以外，這些**完全不碰來源資料庫**，讀的是 staging 裡上次掃描記下來的東西：
 
-| 工具 | 做什麼 |
-|---|---|
-| `inventory_start` / `inventory_status` / `inventory_cancel` | 背景掃描 |
-| `inventory_summary` | 盤點結果的統計數字 —— **先問這個** |
-| `inventory_containers` / `inventory_columns` | 一頁已盤點的表 / 欄位 |
-| `inventory_search` | 用關鍵字找表和欄位 |
-| `inventory_relationships` | 所有外鍵，可以直接畫 ER 圖 |
-| `inventory_changes` | 兩次掃描之間上游 schema 變了什麼 |
-| `inventory_annotate` | 寫下這張表或欄位到底裝什麼 |
-| `inventory_export` | 整份寫成檔案，**只回傳路徑**（`markdown` / `csv` / `dbt_yaml`） |
+| 工具 | 主要參數 | 回傳什麼 |
+|---|---|---|
+| `inventory_start` | `database` `profile_modes` `force=False` `resume=True` | **一個 job id 字串，就這樣**。掃描還在背景跑。同一個 database 已經有掃描在跑會報 `ScanAlreadyRunningError` |
+| `inventory_status` | `job_id` | `{job_id, database, state, containers_done, containers_failed, containers_skipped, cursor, error, started_at, finished_at}`。`state` 是 `running` / `done` / `failed` / `cancelled` |
+| `inventory_cancel` | `job_id` | `true` / `false`。手上這張表跑完才停，已經做的進度留著 |
+| `inventory_summary` | `database` | `{database, containers, containers_failed, estimated_rows, columns, columns_profiled}`。**幾百個位元組，先問這個**。全 0 代表還沒盤點過，不是「你沒有權限」 |
+| `inventory_containers` | `database` `limit=100` `cursor` | `{containers[], next_cursor}`，每筆帶著它最後一次的掃描狀態 |
+| `inventory_columns` | `container` `database` `schema` `limit` `cursor` `include_profile=True` | `{columns[], next_cursor}`，依 `ordinal` 排。每筆除了型別與鍵，還有 `description` / `description_source`（`agent` 還是人寫的）/ `sensitivity` / `profile`。寬表用 `include_profile=False`，統計佔的量比欄位本身多 |
+| `inventory_search` | `keyword` `database` `kind` `limit` | `SearchHit[]`：`container_name` `column_name`（表本身命中時是 `null`）`native_type` `description` `match_in`（命中在名稱還是描述）。**刻意不帶統計**，所以一百筆也很便宜 |
+| `inventory_relationships` | `database` | `Relationship[]`：`from_container` `from_column` → `to_container` `to_column`。夠直接畫 ER 圖 |
+| `inventory_changes` | `database` `since` `limit` | `SchemaChange[]`，新的在前：`change_type`、`detail`（新增／刪除／改型別的欄位名）、`detected_at` |
+| `inventory_annotate` | `database` `container` `container_description` `columns[]` | `{containers_updated, columns_updated, unknown_columns[]}`。**唯一會寫的工具，而且只寫盤點**。沒填的欄位保持原狀，填空字串是清掉。盤點裡不存在的欄位名會回在 `unknown_columns`，不會被吞掉 |
+| `inventory_export` | `format` `database` `path` | `{path, bytes_written, containers, columns}`——**只有路徑，永遠不是內容**。`markdown`（給人讀的資料字典）/ `csv`（一列一欄位）/ `dbt_yaml`（dbt 的 `schema.yml`）。`path` 相對於 export 目錄，出不去 |
 
 典型的交付流程：`inventory_start` 跑一次掃描 → `inventory_annotate` 把看懂的東西寫
 回去 → `inventory_export(format="dbt_yaml")` 產出 `schema.yml`。之後 PM 讀的就是這
@@ -263,6 +360,84 @@ Codex：把 `codex.toml` 附加到 `~/.codex/config.toml`，並把 `SKILL.md` �
 
 postgres 和 mssql 的 container 名字帶 schema（`dbo.orders`）；只有一個 schema 有那
 張表的話，寫 `orders` 也可以。
+
+---
+
+## 跑一次完整盤點
+
+`inventory_start` **一次掃一個 database**——`database` 是單數，沒有「全部」這個值。
+所以「先盤出所有資料庫」是兩步，需要 `de`（`pm` 沒有 `inventory_start`）：
+
+```
+list_databases()                        → ["shop", "MSSQL2019_VMData_COLA", …]
+
+# 每個 database 各叫一次，各自拿到一個 job id
+inventory_start(database="MSSQL2019_VMData_COLA")   → "9f3c…"
+inventory_start(database="shop")                    → "1ab7…"
+
+inventory_status(job_id="9f3c…")        → state 從 running 到 done
+```
+
+不同 database 可以同時跑；**同一個** database 重開會被擋（`ScanAlreadyRunningError`），
+因為沒跑完的掃描本來就會從自己的 cursor 接著跑，沒變動的表會跳過。掃描慢不是理由，
+重開只會繞遠路到同一個地方。要重新掃已經掃過而且沒變的表才用 `force=True`。
+
+掃完之後 `inventory_summary` 的數字才會動，`inventory_search` /
+`inventory_relationships` / `inventory_export` 才有東西可讀——在那之前它們回空的是
+**盤點是空的**，不是權限問題。
+
+給 agent 下這件事的時候，把「先 `list_databases`，再對每個 database 各跑一次
+`inventory_start`」講出來。它讀到的 `SKILL.md` 會提醒它掃描很貴，模型有時候會把
+「應該謹慎」理解成「我不被允許」，然後**連試都不試就宣稱自己沒權限**。
+
+### 產出落在哪，怎麼取出來
+
+`inventory_export` 只回傳路徑，檔案本身寫在容器裡的 `MCP_EXPORT_DIR`
+（compose 預設 `/data/export`）。整個 `/data` 在 `mcp-data` 這個 volume 上——包含
+staging、稽核記錄和匯出——所以容器重建不會弄丟它，但檔案不會自己出現在專案目錄裡。
+
+取一個檔案：
+
+```bash
+docker compose cp server:/data/export/inventory.md ./export/
+```
+
+`export/` 已經在 `.gitignore` 裡：那是交付物，而且內容是客戶資料庫的表名與欄位名，
+要不要進版控是客戶的決定。
+
+看稽核記錄不用取出來：
+
+```bash
+docker compose exec server tail -f /data/audit/audit.jsonl
+```
+
+**server 沒在跑也拿得到。** volume 是獨立的，用一個丟掉的容器掛上去就好——image 壞
+掉、compose 整組停掉都不影響：
+
+```bash
+docker run --rm -u "$(id -u):$(id -g)" \
+  -v database-mcp-connector_mcp-data:/data -v "$PWD:/out" \
+  alpine cp /data/export/inventory.md /out/
+```
+
+整包備份：
+
+```bash
+docker run --rm -v database-mcp-connector_mcp-data:/data -v "$PWD:/out" \
+  alpine tar czf /out/mcp-data.tgz -C /data .
+```
+
+volume 全名是 `<專案名>_mcp-data`，專案名來自 `docker-compose.yml` 的 `name:`；
+`docker volume ls` 可以確認。
+
+> 沒有把 `/data` 或它底下任何一層 bind mount 到 host，是刻意的。容器裡的 process 是
+> `uid 10001`，在 macOS 上 Docker Desktop 會把 host 目錄的 ownership 蓋掉所以寫得進
+> 去，同一份 compose 換到 Linux 就是 `EACCES`——那會變成這份設定裡唯一「本機過、上線
+> 炸」的東西。另外 `staging.db` 是開著 WAL 的 SQLite，檔案鎖跨 bind mount 不可靠；
+> `audit/` 是稽核記錄，host 改得動的記錄不能拿來當證據。
+>
+> 代價是 `docker compose down -v` 會把 volume 一起帶走，**匯出的檔案也在裡面**。交付
+> 物取出來再跑那個指令。
 
 ---
 
@@ -308,8 +483,28 @@ docker compose run --rm server test-connection
 簽。
 
 **agent 說某個工具被拒絕**
-那是設定，不是故障。`docker compose run --rm provision role show <角色>` 看它實際拿
-到什麼。
+先確認**它真的被拒絕過**。權限是在 server 裡擋的，擋下來一定會留一筆稽核記錄：
+
+```bash
+docker compose exec server sh -c 'tail -40 /data/audit/audit.jsonl'
+```
+
+看那個 `key_id` 有沒有一筆 `tool` 是它說被擋的那個工具、`outcome` 不是 `ok`。
+
+- **有**——那是設定，不是故障。`docker compose run --rm provision role show <角色>`
+  看它實際拿到什麼。
+- **沒有那筆**——它根本沒呼叫過，這句「我沒有權限」是它自己編的。模型讀了
+  `SKILL.md` 裡「掃描很貴」「取樣會進 transcript」那些話，有時候會歸納成「我大概不
+  該做」再說成「我不被允許」。直接叫它去呼叫那個工具；真的沒權限的話它會拿到一句
+  明確的錯誤，那才是答案。
+
+要看 token 本身帶了哪些 scope，見[角色與身分](#角色與身分)最後那段。
+
+**同一台機器上裝了好幾包身分**
+每一包的 skill 名字和 MCP server 名字都是 `MCP_SERVER_NAME`（預設 `etl-agent-mcp`），
+所以 `out/de` 和 `out/pm` 裝在一起會互相蓋掉，舊的 `out/<名字>/` 留著也一樣。要並存
+就用不同的 `MCP_SERVER_NAME` 各發一包，不然**同一時間只裝一包**，換身分之前先把上一
+包刪掉。稽核記錄的 `key_id` 是判斷「現在用的到底是哪一張 token」最準的地方。
 
 ---
 

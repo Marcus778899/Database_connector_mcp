@@ -2,11 +2,11 @@ from __future__ import annotations
 
 from typing import Any, ClassVar
 
+from loggerhelper import log
 import jwt
 from fastmcp.server.auth.auth import AccessToken, TokenVerifier
 
 from src.auth.keys import AuthKeyError, PublicKeyDirectory
-from src.core.log import log
 
 # Asymmetric only, and named explicitly. Accepting an HMAC algorithm here is the
 # classic JWT forgery: the attacker signs with HS256 using the *public* key as

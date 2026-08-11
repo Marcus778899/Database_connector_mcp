@@ -5,10 +5,11 @@ import os
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
+from loggerhelper import log
+
 from src.core.config import ConnectionInfo, SourceEngine
 from src.core.contracts import SourceAdaptor
 from src.core.engines import EXTRAS
-from src.core.log import log
 
 _ADAPTER_REGISTRY: dict[SourceEngine, tuple[str, str]] = {
     SourceEngine.SQLITE: ("src.adapter.sqlite", "SqliteAdapter"),

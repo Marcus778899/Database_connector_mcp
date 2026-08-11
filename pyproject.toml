@@ -58,4 +58,4 @@ asyncio_mode = "auto"
 pythonpath = ["."]
 
 [tool.uv.sources]
-loggerhelper = { path = "lib/loggerhelper-1.0.0-py3-none-any.whl" }
+loggerhelper = { path = "lib/loggerhelper-2.0.0-py3-none-any.whl" }

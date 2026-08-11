@@ -58,6 +58,13 @@ services:
       PROVISION_IDENTITIES: ${PROVISION_IDENTITIES:-de=de,pm=pm}
       PROVISION_LIFETIME: ${PROVISION_LIFETIME:-}
       PROVISION_LANG: ${PROVISION_LANG:-zh-TW}
+      # Sign new tokens even for identities whose current one still verifies.
+      # Has to be listed here to exist at all: compose passes through what this
+      # block names and nothing else, so `PROVISION_FORCE=1 docker compose up
+      # provision` — which is what every document here tells you to run after
+      # editing roles.toml — otherwise reaches the shell and stops there,
+      # leaving the old token in place while reporting that it kept it.
+      PROVISION_FORCE: ${PROVISION_FORCE:-}
       # Where the agent will reach the server from, which the container cannot
       # work out for itself — it only knows the port it bound inside.
       PROVISION_PUBLIC_URL: ${PROVISION_PUBLIC_URL:-http://localhost:${MCP_PUBLISHED_PORT:-8000}/mcp}
@@ -89,6 +96,11 @@ services:
         required: false
     volumes:
       - mcp-keys:/keys:ro # read-only: the server only ever verifies
+      # All of /data, including the exports, which are collected with
+      # `docker compose cp` rather than through a bind mount. A bind mount
+      # would be the one thing here that behaves differently on Linux — the
+      # process is uid 10001, and a host directory it does not own is not
+      # writable once Docker Desktop is not the one papering over ownership.
       - mcp-data:/data
       # A file-backed engine needs its source reachable from inside the
       # container, and read-only says the connector is not the thing that

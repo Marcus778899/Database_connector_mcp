@@ -10,6 +10,7 @@ from typing import Any, Sequence
 import jwt
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from loggerhelper import log
 
 from src.auth.keys import KEY_SUFFIX, MalformedKeyIdError, valid_kid
 from src.auth.permissions import (
@@ -18,7 +19,6 @@ from src.auth.permissions import (
     CLAIM_DATABASES,
     CLAIM_RAW_SAMPLE,
 )
-from src.core.log import log
 
 # Ed25519: one curve, no parameters to choose badly, and a public key short
 # enough to paste. The verifier accepts RS256 and ES256 too, for keys issued

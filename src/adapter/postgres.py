@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any, ClassVar
 
 import psycopg
+from loggerhelper import log
 
 from src.adapter.base import (
     AdapterBase,
@@ -19,7 +20,6 @@ from src.core.contracts import (
     ProfileResult,
     TopValue,
 )
-from src.core.log import log
 from src.utils.serialize import as_text, jsonify
 
 # relkind -> what to call it. A partitioned table (`p`) and a foreign table (`f`)

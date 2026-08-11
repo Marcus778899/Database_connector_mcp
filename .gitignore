@@ -20,5 +20,9 @@ private/
 keys/
 out/
 
+# `docker compose cp` 把 inventory_export 的產物取出來的落點。是交付物不是原始碼，
+# 而且內容是客戶資料庫的表名與欄位名——那份東西要不要進版控是客戶的決定，不是預設。
+export/
+
 # loggerhelper 在專案根目錄建立 log/<date>/
 log/

@@ -9,6 +9,7 @@ from typing import Any, ClassVar
 from fastmcp import Client
 from fastmcp.client.auth import BearerAuth
 from fastmcp.exceptions import FastMCPError
+from loggerhelper import log
 from mcp.shared.exceptions import McpError
 
 from src.adapter.base import AdapterBase
@@ -19,7 +20,6 @@ from src.core.contracts import (
     ProfileMode,
     ProfileResult,
 )
-from src.core.log import log
 
 
 # HTTP 408, the code the mcp session reports when a request outlives its timeout.

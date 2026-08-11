@@ -342,6 +342,14 @@ def tool_reference(
 ) -> str:
     section = phrases["tools"]
     lines = [section["heading"], ""]
+    # Said before the list, not after it. The rest of this document is about
+    # what to be careful of — cost, masking, the audit trail — and a model
+    # reading only that tends to round "be deliberate" down to "I had better
+    # not", then reports it as a permission it does not have. The list is the
+    # grant; nothing here needs asking for twice.
+    preamble = section.get("preamble")
+    if preamble:
+        lines += [preamble, ""]
     for group, label in (
         (ToolGroup.CATALOG, section["catalog"]),
         (ToolGroup.INVENTORY, section["inventory"]),

@@ -7,9 +7,10 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import ClassVar, Protocol, runtime_checkable
 
+from loggerhelper import log
+
 from src.core.config import ConnectionInfo, SourceEngine
 from src.core.contracts import SourceAdaptor
-from src.core.log import log
 from src.service.factory import create_adapter, load_adapter_class, resolve_engine
 
 
@@ -271,7 +272,7 @@ class AdapterPool:
         while not self._stop_reaping.wait(self._reaper_interval):
             self._reap_quietly()
 
-    @log.error
+    @log.catch(reraise=False)
     def _reap_quietly(self) -> None:
         """A failed sweep must not kill the thread; `reap()` keeps raising for
         callers who ask for it directly."""
@@ -308,8 +309,8 @@ def _is_alive(adapter: SourceAdaptor) -> bool:
         return False
 
 
-@log.error
+@log.catch(reraise=False)
 def _close_quietly(adapter: SourceAdaptor) -> None:
     """One failing close must not leave the rest open — swallowing is the point,
-    which is why `log.error` belongs here."""
+    which is why `reraise=False` belongs here and nowhere it can hide a result."""
     adapter.close()

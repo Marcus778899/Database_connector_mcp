@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from src.core.log import log
+from loggerhelper import log
 
 
 def _find_dotenv(filename: str, start: Path) -> Path | None:

@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 from typing import ClassVar
 
-from src.core.log import log
+from loggerhelper import log
 
 # The public half only. Nothing here can sign, which is the point: this server
 # can verify a token and cannot mint one, so taking the server does not get you

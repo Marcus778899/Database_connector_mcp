@@ -55,6 +55,16 @@ gets = "**a file** — only its path comes back, never the contents"
 
 [tools]
 heading = "## Tools you can call"
+preamble = """
+This list is the grant. What came above — that scans are expensive, that samples
+stay in the transcript — is about picking the right **order**, not about holding
+back. When one of these is the right call, make it; you do not need to ask first.
+
+Nothing here lets you infer that you are probably not allowed. If you are not,
+you get an explicit refusal, and that is the answer. **Do not refuse on the
+server's behalf**, and never report "this felt heavy" as "I lack the permission"
+— that misleads the person who asked you to do the work.
+"""
 catalog = "Catalog (asked of the source)"
 inventory = "Inventory (read from what a scan recorded)"
 withheld_heading = "### Served, but not to you"
