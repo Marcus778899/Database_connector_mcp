@@ -7,6 +7,7 @@ caller reading the database. So this module pays for a server on a socket.
 """
 
 import asyncio
+import json
 import socket
 import sqlite3
 import threading
@@ -16,6 +17,7 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 from fastmcp import Client
 from fastmcp.client.auth import BearerAuth
@@ -26,6 +28,9 @@ from src.adapter.sqlite import SqliteAdapter
 from src.auth.issue import generate_keypair, install_public_key, issue_token
 from src.core.config import ServerConfig
 from src.server import build_server
+from src.service.inventory import InventoryService
+from src.service.pool import SingleAdapter
+from src.service.staging import StagingStore
 
 AUDIENCE = "etl-agent-mcp"
 
@@ -166,3 +171,162 @@ def test_the_audit_trail_records_who_rather_than_local(served: str, signing_key)
     trail = (signing_key[1].parent / "audit.jsonl").read_text(encoding="utf-8")
     assert '"key_id": "pm-alice"' in trail
     assert '"key_id": "local"' not in trail
+
+
+# ---- downloading an export ----
+#
+# The route FastMCP does not wrap in RequireAuthMiddleware, so every refusal
+# below is one this project's own handler has to make. Same reason this module
+# pays for a socket: nothing else proves what the middleware actually covers.
+
+
+@pytest.fixture(scope="module")
+def exporting(
+    source: Path, signing_key, tmp_path_factory
+) -> Iterator[tuple[str, Path]]:
+    """A second server, this one with somewhere to export to."""
+    _, keys_dir = signing_key
+    root = tmp_path_factory.mktemp("exporting")
+    exports = root / "exports"
+    exports.mkdir()
+    port = _free_port()
+    config = ServerConfig(
+        transport="http",
+        host="127.0.0.1",
+        port=port,
+        require_auth=True,
+        authorized_keys_dir=keys_dir,
+        audit_log_path=root / "audit.jsonl",
+        staging_db_path=root / "staging.db",
+        export_dir=exports,
+        public_url=f"http://127.0.0.1:{port}",
+    )
+    adapter = SqliteAdapter(source)
+    store = StagingStore(root / "staging.db")
+    service = InventoryService(SingleAdapter(adapter), store)
+    mcp = build_server(config, adapter, inventory=service)
+
+    threading.Thread(
+        target=lambda: mcp.run(transport="http", host="127.0.0.1", port=port),
+        daemon=True,
+        name="test-http-export-server",
+    ).start()
+    _wait_until_listening(port)
+    yield f"http://127.0.0.1:{port}", exports
+
+
+def _download(base: str, name: str, token: str | None) -> httpx.Response:
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    # Sent unnormalised: httpx would otherwise collapse `..` client-side and
+    # the refusal being tested would never reach the server.
+    with httpx.Client() as client:
+        return client.send(
+            httpx.Request("GET", f"{base}/export/{name}", headers=headers)
+        )
+
+
+@pytest.fixture(scope="module")
+def exported(exporting, signing_key) -> str:
+    """One real export to fetch, made the way an agent would make it."""
+    base, _ = exporting
+    token = _token(
+        signing_key[0],
+        scopes=["inventory_start", "inventory_status", "inventory_export"],
+    )
+
+    async def run() -> Any:
+        transport = StreamableHttpTransport(f"{base}/mcp", auth=BearerAuth(token))
+        async with Client(transport) as client:
+            job = (await client.call_tool("inventory_start", {})).data
+            for _ in range(200):
+                status = (
+                    await client.call_tool("inventory_status", {"job_id": job})
+                ).data
+                if status.state != "running":
+                    break
+                await asyncio.sleep(0.05)
+            return (await client.call_tool("inventory_export", {})).data
+
+    return asyncio.run(run()).download_url
+
+
+def test_an_export_says_where_to_fetch_it(exported: str, exporting):
+    base, _ = exporting
+
+    assert exported == f"{base}/export/inventory.md"
+
+
+def test_the_right_token_gets_the_file(exported: str, exporting, signing_key):
+    base, exports = exporting
+    response = _download(
+        base, "inventory.md", _token(signing_key[0], scopes=["inventory_export"])
+    )
+
+    assert response.status_code == 200
+    assert response.text == (exports / "inventory.md").read_text(encoding="utf-8")
+    # a download, not something a browser renders: these files carry a client's
+    # table and column names
+    assert "attachment" in response.headers["content-disposition"]
+
+
+def test_no_token_is_turned_away_from_the_download_too(exported: str, exporting):
+    """The route the framework does not guard; this is our own 401."""
+    base, _ = exporting
+    response = _download(base, "inventory.md", None)
+
+    assert response.status_code == 401
+    assert response.headers["www-authenticate"] == "Bearer"
+
+
+def test_a_token_without_the_export_scope_may_not_download(
+    exported: str, exporting, signing_key
+):
+    """Authenticated is not authorised, the same as for a tool call."""
+    base, _ = exporting
+    response = _download(
+        base, "inventory.md", _token(signing_key[0], scopes=["get_schema"])
+    )
+
+    assert response.status_code == 403
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        pytest.param("..%2F..%2F..%2Fetc%2Fpasswd", id="climbing out"),
+        pytest.param("nope.md", id="not there"),
+    ],
+)
+def test_what_is_not_there_and_what_is_out_of_bounds_answer_alike(
+    exported: str, exporting, signing_key, name: str
+):
+    """Telling those two apart hands the caller a way to map the filesystem one
+    request at a time. The difference goes to the log instead."""
+    base, _ = exporting
+    response = _download(
+        base, name, _token(signing_key[0], scopes=["inventory_export"])
+    )
+
+    assert response.status_code == 404
+    assert response.text == "no such export\n"
+
+
+def test_a_download_is_on_the_record(exported: str, exporting, signing_key):
+    """The one call that takes the whole catalog off the server. If anything
+    here is audited, it is this."""
+    base, exports = exporting
+    _download(
+        base,
+        "inventory.md",
+        _token(signing_key[0], subject="de-bob", scopes=["inventory_export"]),
+    )
+
+    trail = [
+        json.loads(line)
+        for line in (exports.parent / "audit.jsonl").read_text().splitlines()
+    ]
+    record = next(
+        r for r in reversed(trail) if r["tool"] == "inventory_export_download"
+    )
+    assert record["key_id"] == "de-bob"
+    assert record["bytes_sent"] == (exports / "inventory.md").stat().st_size

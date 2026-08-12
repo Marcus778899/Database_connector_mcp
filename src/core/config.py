@@ -98,6 +98,12 @@ class ServerConfig(BaseModel):
     transport: Transport = "stdio"
     host: str = "127.0.0.1"
     port: int = 8000
+    # Where callers reach this server from, for turning an export into a link
+    # someone can fetch. The container cannot work this out — it knows the port
+    # it bound inside and nothing about what is in front of it — and the `Host`
+    # header is not an answer: that is a string the caller sent. Unset only
+    # costs the absolute form; the download itself works either way.
+    public_url: str | None = None
 
     # Whether to open a real connection before serving. `require` is the default
     # because the alternative is a server that starts, reports itself healthy,

@@ -75,6 +75,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--transport", choices=_TRANSPORTS, help="env MCP_TRANSPORT")
     parser.add_argument("--host", help="env MCP_HOST")
     parser.add_argument("--port", help="env MCP_PORT")
+    parser.add_argument(
+        "--public-url",
+        help="where callers reach this server from, e.g. https://mcp.example.com. "
+        "Only used to hand back an absolute download link for an export. "
+        "env MCP_PUBLIC_URL",
+    )
     parser.add_argument("--max-sample-limit", help="env MCP_MAX_SAMPLE_LIMIT")
     parser.add_argument(
         "--connection-check",
@@ -202,6 +208,7 @@ def config_from_args(
     pick("transport", args.transport, "MCP_TRANSPORT")
     pick("host", args.host, "MCP_HOST")
     pick("port", args.port, "MCP_PORT")
+    pick("public_url", args.public_url, "MCP_PUBLIC_URL")
     pick("staging_db_path", args.staging_db, "MCP_STAGING_DB")
     pick("export_dir", args.export_dir, "MCP_EXPORT_DIR")
     pick("audit_log_path", args.audit_log, "MCP_AUDIT_LOG")

@@ -37,6 +37,12 @@ x-shape: &shape
   # State, all of it on the volume rather than in the image.
   MCP_STAGING_DB: /data/staging.db
   MCP_EXPORT_DIR: /data/export
+  # Where callers reach this server from, so that an export can hand back a
+  # link rather than a path inside a container nobody can get a shell on. Same
+  # value as PROVISION_PUBLIC_URL without the /mcp: the download path is
+  # appended to it. Set this to the real address once the server is not on
+  # localhost — an ECS task does not know its own public name.
+  MCP_PUBLIC_URL: ${MCP_PUBLIC_URL:-http://localhost:${MCP_PUBLISHED_PORT:-8000}}
 
 services:
   # One-shot. `server` waits for this to exit 0, so a failed provision keeps

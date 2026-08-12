@@ -589,6 +589,96 @@ def test_annotating_something_never_inventoried_is_a_tool_error(
         )
 
 
+def test_a_batch_describes_several_containers_in_one_call(config, adapter, inventory):
+    """The counterpart of a page of columns that spans tables: what came back
+    in one read goes back in one write."""
+    mcp = build_server(config, adapter, inventory=inventory)
+
+    async def body(call):
+        inventory.wait(await call("inventory_start", {}), timeout=20)
+        written = await call(
+            "inventory_annotate",
+            {
+                "database": "datalake",
+                "containers": [
+                    {
+                        "container": "users",
+                        "container_description": "everyone who signed up",
+                        "columns": [{"column": "id", "description": "surrogate key"}],
+                    },
+                    {
+                        "container": "orders",
+                        "columns": [{"column": "id", "description": "order key"}],
+                    },
+                ],
+            },
+        )
+        return written, await call(
+            "inventory_columns",
+            {"database": "datalake", "only_missing_description": True},
+        )
+
+    written, remaining = _session(mcp, body)
+
+    assert (written.containers_updated, written.columns_updated) == (1, 2)
+    assert written.unknown_containers == []
+    assert [one.container for one in written.per_container] == ["users", "orders"]
+    assert ("users", "id") not in {
+        (c.container_name, c.column_name) for c in remaining.columns
+    }
+
+
+def test_a_batch_reports_a_container_nobody_inventoried(config, adapter, inventory):
+    """Unlike the single-container form, which raises: one mistyped name should
+    not cost the rest of the batch its writes."""
+    mcp = build_server(config, adapter, inventory=inventory)
+
+    async def body(call):
+        inventory.wait(await call("inventory_start", {}), timeout=20)
+        return await call(
+            "inventory_annotate",
+            {
+                "database": "datalake",
+                "containers": [
+                    {"container": "ghost", "container_description": "nothing here"},
+                    {
+                        "container": "users",
+                        "columns": [{"column": "id", "description": "surrogate key"}],
+                    },
+                ],
+            },
+        )
+
+    result = _session(mcp, body)
+
+    assert result.unknown_containers == ["ghost"]
+    assert result.columns_updated == 1
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        pytest.param({"database": "datalake"}, id="neither"),
+        pytest.param(
+            {
+                "database": "datalake",
+                "container": "users",
+                "containers": [{"container": "users"}],
+            },
+            id="both",
+        ),
+    ],
+)
+def test_one_form_or_the_other_but_not_a_guess(config, adapter, inventory, arguments):
+    """An empty call would otherwise be reported as a successful write."""
+    with pytest.raises(ToolError, match="either `container`"):
+        _call(
+            build_server(config, adapter, inventory=inventory),
+            "inventory_annotate",
+            arguments,
+        )
+
+
 def test_a_write_is_audited_by_how_much_it_wrote(config, adapter, inventory):
     """rows_returned accounts for reads; a write needs its own counterpart."""
     trail = AuditLogger(config.audit_log_path)
@@ -752,7 +842,17 @@ def test_an_export_returns_a_path_and_not_the_catalog(
     assert result.containers == 2
     assert result.bytes_written > 0
     # where and how much, and nothing that could carry the catalog itself
-    assert set(vars(result)) == {"path", "bytes_written", "containers", "columns"}
+    assert set(vars(result)) == {
+        "path",
+        "bytes_written",
+        "containers",
+        "columns",
+        # two more ways of saying where, added for the caller who has to fetch
+        # it; both are None here, because stdio has nothing to serve it over
+        "download_path",
+        "download_url",
+    }
+    assert result.download_path is None and result.download_url is None
     assert Path(result.path).read_text(encoding="utf-8"), "the content is in the file"
 
 

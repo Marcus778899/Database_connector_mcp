@@ -14,7 +14,8 @@
 - [角色與身分](#角色與身分)
 - [交給 agent](#交給-agent)
 - [有哪些工具](#有哪些工具)
-- [跑一次完整盤點](#跑一次完整盤點)
+- [誰在什麼時候做什麼](#誰在什麼時候做什麼)
+- [產出落在哪，怎麼取出來](#產出落在哪怎麼取出來)
 - [遇到問題](#遇到問題)
 - [不用 Docker](#不用-docker)
 
@@ -343,16 +344,17 @@ Codex：把 `codex.toml` 附加到 `~/.codex/config.toml`，並把 `SKILL.md` �
 | `inventory_cancel` | `job_id` | `true` / `false`。手上這張表跑完才停，已經做的進度留著 |
 | `inventory_summary` | `database` | `{database, containers, containers_failed, estimated_rows, columns, columns_profiled}`。**幾百個位元組，先問這個**。全 0 代表還沒盤點過，不是「你沒有權限」 |
 | `inventory_containers` | `database` `limit=100` `cursor` | `{containers[], next_cursor}`，每筆帶著它最後一次的掃描狀態 |
-| `inventory_columns` | `container` `database` `schema` `limit` `cursor` `include_profile=True` | `{columns[], next_cursor}`，依 `ordinal` 排。每筆除了型別與鍵，還有 `description` / `description_source`（`agent` 還是人寫的）/ `sensitivity` / `profile`。寬表用 `include_profile=False`，統計佔的量比欄位本身多 |
+| `inventory_columns` | `database` `container` `schema` `limit` `cursor` `include_profile=True` `only_missing_description=False` | `{columns[], next_cursor}`，依 `ordinal` 排。每筆除了型別與鍵，還有 `description` / `description_source`（`agent` 還是人寫的）/ `sensitivity` / `profile`。寬表用 `include_profile=False`，統計佔的量比欄位本身多。**不給 `container` 就是跨整個 database 分頁**，配 `only_missing_description=True` 就是「還沒補描述的欄位」清單。兩種分頁的 cursor 不通用 |
 | `inventory_search` | `keyword` `database` `kind` `limit` | `SearchHit[]`：`container_name` `column_name`（表本身命中時是 `null`）`native_type` `description` `match_in`（命中在名稱還是描述）。**刻意不帶統計**，所以一百筆也很便宜 |
-| `inventory_relationships` | `database` | `Relationship[]`：`from_container` `from_column` → `to_container` `to_column`。夠直接畫 ER 圖 |
-| `inventory_changes` | `database` `since` `limit` | `SchemaChange[]`，新的在前：`change_type`、`detail`（新增／刪除／改型別的欄位名）、`detected_at` |
-| `inventory_annotate` | `database` `container` `container_description` `columns[]` | `{containers_updated, columns_updated, unknown_columns[]}`。**唯一會寫的工具，而且只寫盤點**。沒填的欄位保持原狀，填空字串是清掉。盤點裡不存在的欄位名會回在 `unknown_columns`，不會被吞掉 |
-| `inventory_export` | `format` `database` `path` | `{path, bytes_written, containers, columns}`——**只有路徑，永遠不是內容**。`markdown`（給人讀的資料字典）/ `csv`（一列一欄位）/ `dbt_yaml`（dbt 的 `schema.yml`）。`path` 相對於 export 目錄，出不去 |
+| `inventory_relationships` | `database` | `Relationship[]`：`from_container` `from_column` → `to_container` `to_column`。夠直接畫 ER 圖。**只認來源自己宣告的外鍵**，沒宣告 FK 的資料庫這裡是空的 |
+| `inventory_changes` | `database` `since` `limit` | `SchemaChange[]`，新的在前：`change_type`、`detail`（新增／刪除／改型別的欄位名）、`detected_at`。第一次掃描只會是一排 `container_added` |
+| `inventory_annotate` | `database` + `container` `container_description` `columns[]`，**或** `containers[]` | `{containers_updated, columns_updated, unknown_columns[], per_container[], unknown_containers[]}`。**唯一會寫的工具，而且只寫盤點**。沒填的欄位保持原狀，填空字串是清掉。盤點裡不存在的欄位名會回在 `unknown_columns`，不會被吞掉。`containers[]` 是批次形式，一個 transaction 寫完；批次裡沒盤過的表名回在 `unknown_containers`，不會害其他表一起回滾 |
+| `inventory_export` | `format` `database` `path` | `{path, bytes_written, containers, columns, download_path, download_url}`——**只有位置，永遠不是內容**。`markdown`（給人讀的資料字典）/ `csv`（一列一欄位）/ `dbt_yaml`（dbt 的 `schema.yml`）。`path` 相對於 export 目錄，出不去。下載見[產出落在哪，怎麼取出來](#產出落在哪怎麼取出來) |
 
-典型的交付流程：`inventory_start` 跑一次掃描 → `inventory_annotate` 把看懂的東西寫
-回去 → `inventory_export(format="dbt_yaml")` 產出 `schema.yml`。之後 PM 讀的就是這
-份盤點結果，不會再去打資料庫。
+典型的交付流程：`inventory_start` 跑一次掃描 → `inventory_columns` 讀出還沒描述的
+欄位 → `inventory_annotate` 把看懂的東西寫回去 → `inventory_export` 產出交付物。
+之後 PM 讀的就是這份盤點結果，不會再去打資料庫。逐步的做法與可以直接貼給 agent 的
+指令，見[誰在什麼時候做什麼](#誰在什麼時候做什麼)。
 
 `get_sample` 預設把個資遮罩成 `a***@***.com`、`***`——形狀留著，值不留，因為取樣出
 來的資料會進 agent 的 context 並留在每一份對話記錄裡。要看真值需要
@@ -363,47 +365,180 @@ postgres 和 mssql 的 container 名字帶 schema（`dbo.orders`）；只有一�
 
 ---
 
-## 跑一次完整盤點
+## 誰在什麼時候做什麼
 
-`inventory_start` **一次掃一個 database**——`database` 是單數，沒有「全部」這個值。
-所以「先盤出所有資料庫」是兩步，需要 `de`（`pm` 沒有 `inventory_start`）：
+[角色與身分](#角色與身分)那張表講的是**能做什麼**，這一段講的是**順序**——同樣一組
+工具，先叫哪個後叫哪個，決定了要花多少時間、以及答案有多可信。
+
+| | DE（盤點交付） | PM（對客戶） |
+|---|---|---|
+| 前置 | 確認連得到來源 | 等 DE 盤完 |
+| 主線 | 掃描 → 看掃到什麼 → 補描述 → 交付 | 找東西在哪 → 看那張表 → 真的講不清楚才看值 |
+| 之後 | 下一次只補差異 | 同一份盤點一直讀，不會再打資料庫 |
+
+下面每一步都附一段可以直接貼給 agent 的話。agent 手上有 `SKILL.md`，知道工具名和
+參數，所以這些指令講的是**目的和邊界**，不是 API。
+
+### DE：把一個新客戶的資料庫盤出來
+
+**0. 先確認連得到。** 這步不用 agent，直接在部署的機器上跑——連不上的時候，讓 agent
+去試只會拿到一個轉譯過兩層的錯誤訊息：
+
+```bash
+docker compose run --rm server test-connection
+```
+
+**1. 掃描。** `inventory_start` **一次掃一個 database**，`database` 是單數，沒有
+「全部」這個值，所以這是兩步：`list_databases` 之後對每個 database 各叫一次。
 
 ```
-list_databases()                        → ["shop", "MSSQL2019_VMData_COLA", …]
-
-# 每個 database 各叫一次，各自拿到一個 job id
-inventory_start(database="MSSQL2019_VMData_COLA")   → "9f3c…"
-inventory_start(database="shop")                    → "1ab7…"
-
-inventory_status(job_id="9f3c…")        → state 從 running 到 done
+先列出這個 server 有哪些 database，然後對每一個各跑一次完整盤點。
+掃描很花時間是正常的，這件事就是我要你做的，不用先問過我。
+每個 job id 都記下來，跑完之後回報各自掃了幾張表、跳過幾張、失敗幾張。
 ```
 
-不同 database 可以同時跑；**同一個** database 重開會被擋（`ScanAlreadyRunningError`），
-因為沒跑完的掃描本來就會從自己的 cursor 接著跑，沒變動的表會跳過。掃描慢不是理由，
-重開只會繞遠路到同一個地方。要重新掃已經掃過而且沒變的表才用 `force=True`。
+**「不用先問過我」那句要留著。** agent 讀到的 `SKILL.md` 會提醒它掃描很貴，而模型
+常常把「應該謹慎」理解成「我不被允許」，然後**連試都不試就宣稱自己沒權限**。
 
-掃完之後 `inventory_summary` 的數字才會動，`inventory_search` /
-`inventory_relationships` / `inventory_export` 才有東西可讀——在那之前它們回空的是
-**盤點是空的**，不是權限問題。
+不同 database 可以同時跑；**同一個** database 重開會被擋
+（`ScanAlreadyRunningError`），因為沒跑完的掃描本來就會從自己的 cursor 接著跑，沒
+變動的表會跳過。要重新掃「掃過而且沒變」的表才用 `force=True`。
 
-給 agent 下這件事的時候，把「先 `list_databases`，再對每個 database 各跑一次
-`inventory_start`」講出來。它讀到的 `SKILL.md` 會提醒它掃描很貴，模型有時候會把
-「應該謹慎」理解成「我不被允許」，然後**連試都不試就宣稱自己沒權限**。
+**2. 看掃到什麼。** 掃完先問總量，再看有沒有表是失敗的：
 
-### 產出落在哪，怎麼取出來
+```
+盤點結果總覽給我，然後列出掃描失敗的表和失敗原因。
+```
 
-`inventory_export` 只回傳路徑，檔案本身寫在容器裡的 `MCP_EXPORT_DIR`
+`inventory_summary` 幾百個位元組就回答完「這裡有多大」；`inventory_containers` 每
+筆帶著那張表最後一次的掃描狀態，`error` 不是 null 的就是沒讀成功的。
+
+**3. 補描述。** 這是整段裡最重要的一個指令，因為它決定 agent 是跑 50 圈還是 500
+圈。把業務背景講出來——agent 推欄位語意靠的就是這個：
+
+```
+這是一家做 <業務描述> 的公司的 <系統名稱> 資料庫。
+
+請把 <database> 裡還沒有描述的欄位補完。做法：
+一次讀一頁待補欄位（不要帶 profile，一頁 200 筆），
+根據欄位名、型別、以及同一張表的其他欄位推斷它裝什麼，
+然後一次把整批表的描述寫回去，再用 next_cursor 繼續下一頁。
+
+推不出來的欄位，描述裡直接寫「用途不明」加上你的推測依據，
+不要寫一句看起來很篤定的話。
+每處理完一頁跟我回報進度，不要一次跑完才講話。
+```
+
+背後是 `inventory_columns(only_missing_description=True, include_profile=False)`
+一頁跨多張表地讀，配 `inventory_annotate(containers=[…])` 一次寫回一整批。一張表叫
+一次是幾百次往返，而且每次都順便搬來用不到的統計。
+
+**能省的是往返，不是產出。** 一萬個欄位就是一萬條描述的 output token，這是地板；
+分頁省掉的是來回的次數。所以「每處理完一頁回報一次」不是客套，是讓你在第二頁就能
+發現方向錯了，而不是等四十分鐘之後。
+
+來源自己有註解的欄位（Postgres 的 `COMMENT ON`、MSSQL 的 extended property）不會
+出現在待補清單裡：那些通常比 agent 猜的準，而且客戶維護過的東西不該被蓋掉。
+
+**4. 交付。** 兩種格式，看交付對象：
+
+```
+把 <database> 的盤點結果匯出成資料字典（markdown），給我下載網址。
+```
+
+`markdown` 是給人讀的資料字典，`dbt_yaml` 是可以直接丟進 dbt 專案的 `schema.yml`，
+`csv` 是一列一欄位、給試算表或別的工具吃的。回傳裡的 `download_url` 就是下載位置，
+取法見[產出落在哪，怎麼取出來](#產出落在哪怎麼取出來)。
+
+**5. 第二次以後：只補差異。**
+
+```
+重新掃一次 <database>，然後告訴我上次盤點之後上游改了什麼：
+哪些表是新的、哪些不見了、哪些欄位加了或改了型別。
+只針對新的欄位和改過型別的欄位補描述，其他的不要動。
+```
+
+這是 `inventory_changes` 存在的理由。重掃不會動到已經寫好的描述，所以第二次之後的
+成本只跟「上游改了多少」有關，跟資料庫多大沒關係。
+
+### PM：回答客戶關於資料的問題
+
+**1–2. 找東西並看懂。** 實際上這是一個問題，所以一起問：
+
+```
+客戶問「會員的手機號碼存在哪」。
+先在盤點裡搜尋，找到之後告訴我是哪張表哪個欄位、那張表大概多少筆、
+以及它跟其他表是怎麼接的。
+```
+
+`inventory_search` 是目錄太大時的入口——回傳刻意不帶統計，所以一百筆命中也很便宜。
+鎖定之後再用 `inventory_columns` 讀那一張表的描述與統計（null 率、distinct 數、
+最常見的值都在 `profile` 裡），`inventory_relationships` 回答怎麼接。
+
+**3. 真的需要看實際的值。**
+
+```
+我需要看 <表名> 實際長什麼樣，取幾筆給我。
+```
+
+> 回來的個資欄位是遮罩過的（`a***@***.com`、`***`）。**這不是資料壞了，也不是取樣
+> 失敗**，是 server 在把資料放進對話之前遮的——取樣出來的東西會進 agent 的 context
+> 並留在每一份對話記錄裡。`pm` 和 `de` 兩個角色預設都拿不到真值。真的需要，發一張
+> 短效期、開了 `allow_raw_sample` 的 token，不要把 `roles.toml` 打開。
+
+`get_sample` 是這些工具裡**唯一會即時去打來源資料庫**的一個，所以它排在最後：描述
+和統計講得清楚的時候就不必用它。
+
+### 兩個角色都會踩到的三件事
+
+**盤點沒跑之前，`inventory_*` 回空的是「盤點是空的」，不是權限問題。**
+`inventory_summary` 全 0、`inventory_search` 沒命中、`inventory_relationships` 空
+陣列——先確認掃描跑過沒有，再去懷疑 token。
+
+**`inventory_relationships` 靠來源自己宣告的外鍵。** 很多營運資料庫、以及 ETL 落地
+的 staging 表，根本沒有 FK constraint，這時它就是回空 list，ER 圖畫不出來。**第一次
+盤點就該確認這件事**，不要等到交付前才發現——沒有 FK 的話，表跟表的關聯只能靠
+`inventory_annotate` 用文字描述補上去。
+
+**`inventory_annotate` 只寫盤點，永遠不碰來源資料庫。** 客戶的 DB 從頭到尾是唯讀
+的。而 export 出來那些 description 全部從這裡來——沒有補描述那一步，交付出去的資料
+字典就只有表名和欄位名，沒有一句解釋。
+
+---
+
+## 產出落在哪，怎麼取出來
+
+`inventory_export` 不回傳內容，檔案本身寫在容器裡的 `MCP_EXPORT_DIR`
 （compose 預設 `/data/export`）。整個 `/data` 在 `mcp-data` 這個 volume 上——包含
 staging、稽核記錄和匯出——所以容器重建不會弄丟它，但檔案不會自己出現在專案目錄裡。
 
-取一個檔案：
+### 從自己的機器下載（http 部署）
+
+server 用 http transport 起的時候，export 目錄同一個 port 也服務得到，用的是**同一
+張 token**：
+
+```bash
+curl -H "Authorization: Bearer $(cat out/de/de.jwt)" -O http://localhost:8000/export/inventory.md
+```
+
+網址就是 `inventory_export` 回傳的 `download_url`。那是絕對網址的前提是 server 有設
+`MCP_PUBLIC_URL`（compose 預設指到 `localhost:${MCP_PUBLISHED_PORT}`）；沒設的話回
+傳的是 `download_path`（`/export/inventory.md`），自己接在 server 位址後面就好——
+container 不可能知道自己對外叫什麼名字，而 `Host` header 是呼叫端送來的字串，不能
+拿來當答案。**佈到雲端就要把 `MCP_PUBLIC_URL` 改成真實位址。**
+
+這條路徑跟 MCP 工具走同一套授權：沒帶 token 是 401，token 沒有 `inventory_export`
+這個 scope 是 403，路徑指到 export 目錄外面或檔案不存在都是 404（**同一句話**，能
+分辨這兩者等於送人一支目錄探測器）。每一次下載都會進稽核記錄，帶著 `bytes_sent`。
+
+`export/` 已經在 `.gitignore` 裡：那是交付物，而且內容是客戶資料庫的表名與欄位名，
+要不要進版控是客戶的決定。
+
+### 直接從 volume 拿（stdio、或 server 沒在跑）
 
 ```bash
 docker compose cp server:/data/export/inventory.md ./export/
 ```
-
-`export/` 已經在 `.gitignore` 裡：那是交付物，而且內容是客戶資料庫的表名與欄位名，
-要不要進版控是客戶的決定。
 
 看稽核記錄不用取出來：
 
@@ -530,6 +665,7 @@ uv run mcp-connector --engine postgres --connection-ref shop --staging-db ./var/
 | `--database` | `MCP_DATABASE` | engine 自己的預設 |
 | `--transport` | `MCP_TRANSPORT` | `stdio` |
 | `--host` / `--port` | `MCP_HOST` / `MCP_PORT` | `127.0.0.1` / `8000` |
+| `--public-url` | `MCP_PUBLIC_URL` | 未設 —— export 只回相對的 `download_path` |
 | `--max-sample-limit` | `MCP_MAX_SAMPLE_LIMIT` | `100` |
 | `--connection-check` | `MCP_CONNECTION_CHECK` | `require` —— 也可以是 `warn` / `off` |
 | `--staging-db` | `MCP_STAGING_DB` | 未設 —— **沒有 inventory 工具** |

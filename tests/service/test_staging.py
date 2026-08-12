@@ -23,6 +23,7 @@ from src.service.staging import (
     SOURCE_AI,
     SOURCE_HUMAN,
     ColumnAnnotation,
+    ContainerAnnotation,
     InvalidCursorError,
     NotAStagingStoreError,
     OutdatedStagingSchemaError,
@@ -559,6 +560,169 @@ def test_annotations_of_one_container_do_not_reach_another(store: StagingStore):
     assert store.columns("main", "orders").columns[0].description is None
 
 
+# ---- annotating a batch ----
+
+
+def test_a_batch_writes_every_container_it_was_given(store: StagingStore):
+    _inventoried(store, "users")
+    _inventoried(store, "orders")
+
+    result = store.annotate_many(
+        "main",
+        [
+            ContainerAnnotation(
+                container="users",
+                container_description="signups",
+                columns=[ColumnAnnotation(column="email", description="login address")],
+            ),
+            ContainerAnnotation(
+                container="orders",
+                columns=[ColumnAnnotation(column="id", description="order key")],
+            ),
+        ],
+    )
+
+    assert (result.containers_updated, result.columns_updated) == (1, 2)
+    assert store.columns("main", "users").columns[1].description == "login address"
+    assert store.columns("main", "orders").columns[0].description == "order key"
+
+
+def test_a_container_no_one_inventoried_costs_the_batch_nothing(store: StagingStore):
+    """The one place this differs from `annotate`: one mistyped name in a batch
+    of fifteen should not throw away fourteen tables' worth of descriptions."""
+    _inventoried(store, "users")
+
+    result = store.annotate_many(
+        "main",
+        [
+            ContainerAnnotation(
+                container="ghost", container_description="never inventoried"
+            ),
+            ContainerAnnotation(
+                container="users",
+                columns=[ColumnAnnotation(column="id", description="key")],
+            ),
+        ],
+    )
+
+    assert result.unknown_containers == ["ghost"]
+    assert result.columns_updated == 1
+    assert store.columns("main", "users").columns[0].description == "key"
+
+
+def test_an_unknown_column_in_a_batch_says_which_container_it_was_in(
+    store: StagingStore,
+):
+    _inventoried(store, "users")
+    _inventoried(store, "orders")
+
+    result = store.annotate_many(
+        "main",
+        [
+            ContainerAnnotation(
+                container="users",
+                columns=[ColumnAnnotation(column="emial", description="typo")],
+            ),
+            ContainerAnnotation(
+                container="orders",
+                columns=[ColumnAnnotation(column="emial", description="typo")],
+            ),
+        ],
+    )
+
+    assert result.unknown_columns == ["users.emial", "orders.emial"]
+    assert [one.unknown_columns for one in result.per_container] == [
+        ["emial"],
+        ["emial"],
+    ]
+
+
+def test_a_batch_lands_whole_or_not_at_all(store: StagingStore):
+    """
+    One page read is one page written. A failure between two containers of the
+    same batch must not leave half of it on disk — and must not leave the half
+    it wrote open on the shared connection either, where the next writer's
+    commit would adopt it.
+    """
+    _inventoried(store, "users")
+    _inventoried(store, "orders")
+
+    class _Boom(Exception):
+        pass
+
+    original = store._annotate_one
+    calls = {"n": 0}
+
+    def explode(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise _Boom
+        return original(*args, **kwargs)
+
+    store._annotate_one = explode  # type: ignore[method-assign]
+    with pytest.raises(_Boom):
+        store.annotate_many(
+            "main",
+            [
+                ContainerAnnotation(
+                    container="users",
+                    columns=[ColumnAnnotation(column="id", description="key")],
+                ),
+                ContainerAnnotation(
+                    container="orders",
+                    columns=[ColumnAnnotation(column="id", description="key")],
+                ),
+            ],
+        )
+    store._annotate_one = original  # type: ignore[method-assign]
+
+    assert store.columns("main", "users").columns[0].description is None
+
+    # And the next write commits only itself, rather than carrying the failed
+    # batch in with it.
+    store.annotate(
+        "main", "orders", columns=[ColumnAnnotation(column="id", description="order")]
+    )
+    assert store.columns("main", "users").columns[0].description is None
+
+
+def test_a_batch_of_one_says_the_same_thing_as_annotate(store: StagingStore):
+    _inventoried(store, "users")
+
+    batched = store.annotate_many(
+        "main",
+        [
+            ContainerAnnotation(
+                container="users",
+                container_description="signups",
+                columns=[ColumnAnnotation(column="id", description="key")],
+            )
+        ],
+    )
+
+    assert (batched.containers_updated, batched.columns_updated) == (1, 1)
+    assert batched.unknown_containers == []
+
+
+def test_a_batch_carries_the_schema_of_each_container(store: StagingStore):
+    store.upsert_container(_container("users", schema_name="dbo"), hash_="h")
+    store.replace_columns("main", "dbo", "users", [_column("id")])
+
+    result = store.annotate_many(
+        "main",
+        [
+            ContainerAnnotation(
+                container="users",
+                schema_name="dbo",
+                columns=[ColumnAnnotation(column="id", description="key")],
+            )
+        ],
+    )
+
+    assert result.columns_updated == 1
+    assert store.columns("main", "users", "dbo").columns[0].description == "key"
+
+
 # ---- profiles ----
 
 
@@ -1048,6 +1212,133 @@ def test_a_cursor_that_is_not_one_is_an_error_rather_than_page_one(
 
 def test_no_cursor_still_means_the_first_page(catalog: StagingStore):
     assert catalog.columns("main", "users", cursor=None).columns[0].column_name == "id"
+
+
+# ---- paging columns across containers ----
+
+
+@pytest.fixture
+def described(store: StagingStore) -> StagingStore:
+    """Three containers, one column of each already spoken for."""
+    store.upsert_container(_container("orders"), hash_="h")
+    store.replace_columns(
+        "main",
+        None,
+        "orders",
+        [_column("id"), _column("total", 2), _column("note", 3)],
+    )
+    store.upsert_container(_container("users"), hash_="h")
+    store.replace_columns(
+        "main",
+        None,
+        "users",
+        [
+            _column("id"),
+            # the source described this one; nobody has to describe it again
+            _column("email", 2, native_description="the login address"),
+        ],
+    )
+    store.upsert_container(_container("audit_log"), hash_="h")
+    store.replace_columns("main", None, "audit_log", [_column("id")])
+    store.annotate(
+        "main", "orders", columns=[ColumnAnnotation(column="total", description="金額")]
+    )
+    return store
+
+
+def test_without_a_container_a_page_spans_the_database(described: StagingStore):
+    page = described.columns("main", limit=4)
+
+    assert [(c.container_name, c.column_name) for c in page.columns] == [
+        ("audit_log", "id"),
+        ("orders", "id"),
+        ("orders", "total"),
+        ("orders", "note"),
+    ]
+
+
+def test_a_cross_container_walk_reaches_every_column_exactly_once(
+    described: StagingStore,
+):
+    seen: list[tuple[str, str]] = []
+    cursor = None
+    while True:
+        page = described.columns("main", limit=2, cursor=cursor)
+        seen.extend((c.container_name, c.column_name) for c in page.columns)
+        if page.next_cursor is None:
+            break
+        cursor = page.next_cursor
+
+    assert seen == [
+        ("audit_log", "id"),
+        ("orders", "id"),
+        ("orders", "total"),
+        ("orders", "note"),
+        ("users", "id"),
+        ("users", "email"),
+    ]
+    assert len(set(seen)) == len(seen)
+
+
+def test_only_missing_description_leaves_out_what_is_already_described(
+    described: StagingStore,
+):
+    """Both kinds of described: written here, and read from the source. A
+    source's own comment beats a guess, so re-describing it is a loss."""
+    page = described.columns("main", only_missing_description=True, limit=99)
+
+    assert [(c.container_name, c.column_name) for c in page.columns] == [
+        ("audit_log", "id"),
+        ("orders", "id"),
+        ("orders", "note"),
+        ("users", "id"),
+    ]
+
+
+def test_the_filter_applies_within_one_container_too(described: StagingStore):
+    page = described.columns("main", "orders", only_missing_description=True)
+
+    assert [c.column_name for c in page.columns] == ["id", "note"]
+
+
+def test_describing_a_column_takes_it_off_the_list(described: StagingStore):
+    described.annotate(
+        "main", "users", columns=[ColumnAnnotation(column="id", description="流水號")]
+    )
+
+    page = described.columns("main", only_missing_description=True, limit=99)
+
+    assert ("users", "id") not in [
+        (c.container_name, c.column_name) for c in page.columns
+    ]
+
+
+def test_a_single_container_cursor_cannot_continue_a_database_wide_page(
+    described: StagingStore,
+):
+    """
+    The two shapes order by different keys, so a bare ordinal read as a
+    cross-container cursor would silently answer with page one — the circle
+    that a cursor exists to prevent.
+    """
+    with pytest.raises(InvalidCursorError, match="next_cursor"):
+        described.columns("main", cursor="2")
+
+
+def test_a_cross_container_cursor_survives_a_container_name_with_punctuation(
+    store: StagingStore,
+):
+    """A separator that can occur in a name is a cursor that splits in the
+    wrong place, which is a silently wrong page rather than an error."""
+    store.upsert_container(_container("dbo.orders:2024|q1"), hash_="h")
+    store.replace_columns(
+        "main", None, "dbo.orders:2024|q1", [_column("id"), _column("total", 2)]
+    )
+
+    first = store.columns("main", limit=1)
+    second = store.columns("main", limit=1, cursor=first.next_cursor)
+
+    assert [c.column_name for c in second.columns] == ["total"]
 
 
 def test_a_long_description_is_cut_down_in_a_search_hit(store: StagingStore):

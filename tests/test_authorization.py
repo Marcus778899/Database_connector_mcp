@@ -240,6 +240,41 @@ def test_the_columns_of_a_denied_container_are_refused(served, monkeypatch):
         )
 
 
+def test_a_database_wide_page_of_columns_is_filtered_too(served, monkeypatch):
+    """
+    The hole a container-less page opens: `_require_access` can only check the
+    database, so a key denied `users_pii` would otherwise read its column names
+    by asking for the whole database instead of that one table.
+    """
+    _as(monkeypatch, ["inventory_columns"], containers={"deny": ["*_pii"]})
+
+    page = _call(served, "inventory_columns", {"database": "main", "limit": 99})
+
+    assert {c.container_name for c in page.columns} == {"dim_product", "users"}
+    assert "ssn" not in {c.column_name for c in page.columns}
+
+
+def test_filtering_a_page_does_not_stall_the_paging(served, monkeypatch):
+    """The cursor comes from the unfiltered page, so a run of denied containers
+    is skipped over rather than answered with an empty page and no way on."""
+    _as(monkeypatch, ["inventory_columns"], containers={"allow": ["users"]})
+
+    seen: list[str] = []
+    cursor = None
+    for _ in range(20):
+        page = _call(
+            served,
+            "inventory_columns",
+            {"database": "main", "limit": 1, "cursor": cursor},
+        )
+        seen.extend(c.column_name for c in page.columns)
+        if page.next_cursor is None:
+            break
+        cursor = page.next_cursor
+
+    assert seen == ["id", "email", "note"]
+
+
 def test_an_export_covers_only_what_the_key_may_read(served, monkeypatch):
     """More use than a refusal, and the same rule the listings apply."""
     _as(monkeypatch, ["inventory_export"], containers={"allow": ["dim_*"]})

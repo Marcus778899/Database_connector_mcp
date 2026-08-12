@@ -35,26 +35,32 @@ class ExportError(Exception):
 
 
 class ExportResult(BaseModel):
-    """Where it went and how big it is — deliberately not what is in it."""
+    """
+    Where it went and how big it is — deliberately not what is in it.
+
+    The two download fields are filled by the server, which is the only layer
+    that knows where it is mounted; `download_url` is absolute only where the
+    server was told its public address.
+    """
 
     path: str
     bytes_written: int
     containers: int
     columns: int
+    download_path: str | None = None
+    download_url: str | None = None
 
 
-def resolve_target(export_dir: Path, path: str | None, format: str) -> Path:
+def under_root(export_dir: Path, path: str) -> Path:
     """
-    Where an export may be written, which is only ever under `export_dir`.
+    `path` as an absolute path under `export_dir`, or `ExportError`.
 
     Resolved before the check, so neither `../` nor a symlink pointing out of
     the directory gets there: the caller is an agent relaying a path it was
-    given, and this is the one place that can tell.
+    given — or, for a download, whatever arrived in a URL — and this is the one
+    place that can tell.
     """
     root = Path(export_dir).expanduser().resolve()
-    if path is None:
-        return root / f"inventory{_SUFFIXES[format]}"
-
     candidate = Path(path).expanduser()
     target = (
         (root / candidate).resolve()
@@ -66,6 +72,16 @@ def resolve_target(export_dir: Path, path: str | None, format: str) -> Path:
             f"{path!r} resolves outside the export directory ({root}); an export "
             "may only be written under it"
         )
+    return target
+
+
+def resolve_target(export_dir: Path, path: str | None, format: str) -> Path:
+    """Where an export may be written, which is only ever under `export_dir`."""
+    root = Path(export_dir).expanduser().resolve()
+    if path is None:
+        return root / f"inventory{_SUFFIXES[format]}"
+
+    target = under_root(root, path)
     if target == root or target.is_dir():
         raise ExportError(f"{path!r} is a directory; name the file to write")
     return target
