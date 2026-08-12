@@ -3,12 +3,15 @@ from __future__ import annotations
 from collections.abc import AsyncGenerator, Callable
 from contextlib import asynccontextmanager
 from functools import partial
+from pathlib import Path
 from typing import Any, Literal
 
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from fastmcp.server.dependencies import get_access_token
 from loggerhelper import log
+from starlette.requests import Request
+from starlette.responses import FileResponse, PlainTextResponse, Response
 
 from src.auth import verifier_from_config
 from src.auth.permissions import Permissions
@@ -23,7 +26,13 @@ from src.core.contracts import (
 )
 from src.service import sensitivity
 from src.service.audit import AuditLogger
-from src.service.export import ExportFormat, ExportResult, export_inventory
+from src.service.export import (
+    ExportError,
+    ExportFormat,
+    ExportResult,
+    export_inventory,
+    under_root,
+)
 from src.service.inventory import InventoryService, ScanStatus
 from src.service.pool import AdapterPool, AdapterProvider, SingleAdapter
 from src.service.staging import (
@@ -34,6 +43,7 @@ from src.service.staging import (
     SOURCE_HUMAN,
     AnnotateResult,
     ColumnAnnotation,
+    ContainerAnnotation,
     InventorySummary,
     Relationship,
     SchemaChange,
@@ -51,6 +61,19 @@ Identify = Callable[[str], tuple[str, Permissions]]
 
 # A key may only claim its descriptions are a person's if it carries this.
 HUMAN_ANNOTATION_SCOPE = "annotate:human"
+
+# Where the export directory is served from over http. Not `/`-rooted anywhere
+# near the MCP endpoint, and never a directory listing: one file at a time, by
+# the name an export already handed back.
+DOWNLOAD_PREFIX = "/export"
+
+# Only what an export can produce. Anything else is a file this server did not
+# write, and it is not this route's job to guess how to render it.
+_DOWNLOAD_TYPES: dict[str, str] = {
+    ".md": "text/markdown; charset=utf-8",
+    ".csv": "text/csv; charset=utf-8",
+    ".yml": "application/yaml; charset=utf-8",
+}
 
 
 def build_server(
@@ -96,6 +119,7 @@ def build_server(
     _register_tools(mcp, config, provider, trail, identify, inventory)
     if inventory is not None:
         _register_inventory_tools(mcp, config, inventory, trail, identify)
+        _register_export_route(mcp, config, trail)
     return mcp
 
 
@@ -444,19 +468,30 @@ def _register_inventory_tools(
 
     @mcp.tool
     def inventory_columns(
-        container: str,
         database: str,
+        container: str | None = None,
         schema: str | None = None,
         limit: int = DEFAULT_COLUMN_PAGE,
         cursor: str | None = None,
         include_profile: bool = True,
+        only_missing_description: bool = False,
     ) -> StoredColumnPage:
         """
-        One page of a container's recorded columns, in ordinal order.
+        One page of recorded columns, in ordinal order.
 
         Pass `next_cursor` back as `cursor` to continue. On a wide table the
         profiles are most of the weight, so `include_profile=False` is the way
         to read its shape without them.
+
+        Without a `container` the page spans the whole database — that, with
+        `only_missing_description=True` and `include_profile=False`, is how to
+        describe a catalog: read a page of what is still undescribed, write it
+        back with `inventory_annotate`, continue from the cursor. One table at
+        a time costs a round trip per table and reads statistics that
+        describing them does not use.
+
+        A cursor belongs to the shape of page that produced it; one from a
+        single-container page cannot continue a database-wide one.
         """
         key_id, rights = identify("inventory_columns")
         _require_access(key_id, rights, database=database, container=container)
@@ -467,6 +502,7 @@ def _register_inventory_tools(
             "limit": limit,
             "cursor": cursor,
             "include_profile": include_profile,
+            "only_missing_description": only_missing_description,
         }
         with trail.operation(
             key_id=key_id, tool="inventory_columns", params=params
@@ -478,7 +514,19 @@ def _register_inventory_tools(
                 limit=limit,
                 cursor=cursor,
                 include_profile=include_profile,
+                only_missing_description=only_missing_description,
             )
+            # Named container: `_require_access` already settled it. Without
+            # one the page spans containers this key may not read, so it is
+            # filtered here for the same reason the listings are — and the
+            # cursor still comes from the unfiltered page, so a run of denied
+            # containers does not stall the paging.
+            if container is None:
+                page.columns = [
+                    column
+                    for column in page.columns
+                    if rights.may_read(column.container_name)
+                ]
             ctx.rows_returned = len(page.columns)
             return page
 
@@ -561,42 +609,76 @@ def _register_inventory_tools(
     @mcp.tool
     def inventory_annotate(
         database: str,
-        container: str,
+        container: str | None = None,
         schema: str | None = None,
         container_description: str | None = None,
         columns: list[ColumnAnnotation] | None = None,
+        containers: list[ContainerAnnotation] | None = None,
     ) -> AnnotateResult:
         """
-        Describe what an inventoried table and its columns actually hold.
+        Describe what inventoried tables and their columns actually hold.
 
         The only tool here that writes, and it writes to the inventory alone —
         the source database is never touched. A rescan keeps what is written
         here; a field left out is left as it was, and a blank one clears it.
         Column names that are not in the inventory come back in
         `unknown_columns` instead of being ignored.
+
+        One table at a time with `container`, or a whole batch with
+        `containers` — the counterpart of reading a page of columns that spans
+        tables. A batch is one transaction, and a name that was never
+        inventoried comes back in `unknown_containers` rather than costing the
+        rest of the batch its writes.
         """
         key_id, rights = identify("inventory_annotate")
-        _require_access(key_id, rights, database=database, container=container)
+        # Named separately in the message: an agent that sent both usually
+        # means the batch, and one that sent neither has built an empty call
+        # it will otherwise report as a write.
+        if (container is None) == (containers is None):
+            raise ToolError(
+                "inventory_annotate takes either `container` (one table) or "
+                "`containers` (a batch), not both and not neither"
+            )
         source = _annotation_source(rights)
+        batch = containers or [
+            ContainerAnnotation(
+                container=str(container),
+                schema_name=schema,
+                container_description=container_description,
+                columns=columns or [],
+            )
+        ]
+        # Every name in the batch, not just the first: this is the check that
+        # keeps a key out of the tables it may not read, and a batch is exactly
+        # the shape that would smuggle one past a check that looked once.
+        for item in batch:
+            _require_access(key_id, rights, database=database, container=item.container)
         params = {
             "database": database,
             "container": container,
+            "containers": [item.container for item in batch] if containers else None,
             "schema": schema,
             "source": source,
         }
         with trail.operation(
             key_id=key_id, tool="inventory_annotate", params=params
         ) as ctx:
-            result = _guard(store.annotate)(
-                database,
-                container,
-                schema,
-                container_description=container_description,
-                columns=columns or (),
-                source=source,
-            )
+            if containers is None:
+                result = _guard(store.annotate)(
+                    database,
+                    str(container),
+                    schema,
+                    container_description=container_description,
+                    columns=columns or (),
+                    source=source,
+                )
+            else:
+                result = _guard(store.annotate_many)(database, batch, source=source)
             # what a write cost, the counterpart of rows_returned for a read
             ctx.extra["columns_written"] = result.columns_updated
+            ctx.extra["containers_written"] = len(batch) - len(
+                result.unknown_containers
+            )
             return result
 
     # Last, and only with somewhere to write: an export has nowhere to go
@@ -619,6 +701,10 @@ def _register_inventory_tools(
         through a tool result. `markdown` is a data dictionary to read, `csv` a
         row per column, `dbt_yaml` a `schema.yml` for a dbt project. `path` is
         relative to the server's export directory and cannot leave it.
+
+        Over http the result also carries where to fetch the file from, which
+        is what the person who asked for it actually needs — the file is on the
+        server, and they are not.
         """
         key_id, rights = identify("inventory_export")
         params = {"format": format, "database": database, "path": path}
@@ -633,9 +719,113 @@ def _register_inventory_tools(
                 path=path,
                 permits=rights.may_read,
             )
+            _attach_download(result, config)
             ctx.rows_returned = result.columns
             ctx.extra["bytes_written"] = result.bytes_written
             return result
+
+
+def _attach_download(result: ExportResult, config: ServerConfig) -> None:
+    """
+    Say where the file can be fetched from, when there is anywhere to fetch it.
+
+    Filled here rather than in `export_inventory`, which has no business
+    knowing what path this server is mounted at — it writes files, and would
+    have to be told about http to answer this.
+    """
+    if config.export_dir is None or config.transport == "stdio":
+        return
+    try:
+        relative = Path(result.path).relative_to(Path(config.export_dir).resolve())
+    except ValueError:  # written outside the directory: nothing to serve
+        return
+    result.download_path = f"{DOWNLOAD_PREFIX}/{relative.as_posix()}"
+    if config.public_url:
+        result.download_url = f"{config.public_url.rstrip('/')}{result.download_path}"
+
+
+def _register_export_route(
+    mcp: FastMCP, config: ServerConfig, trail: AuditLogger
+) -> None:
+    """
+    Serve the export directory over the same port, to the same tokens.
+
+    An export writes a file the person who asked for it cannot reach: the
+    server is on someone else's machine, and `docker cp` needs a shell there.
+    So the file is served — but only the file, only under the export directory,
+    and only to a key that could have produced it in the first place.
+
+    Not an MCP tool, deliberately. A tool result travels into the caller's
+    context, and the whole point of an export is that the catalog does not.
+    """
+    export_dir = config.export_dir
+    if export_dir is None or config.transport == "stdio":
+        return
+
+    @mcp.custom_route(f"{DOWNLOAD_PREFIX}/{{name:path}}", methods=["GET"])
+    async def download_export(request: Request) -> Response:
+        # FastMCP wraps only the MCP endpoints in RequireAuthMiddleware; the
+        # app-level middleware authenticates a Bearer if one is there but lets
+        # a request with none through to here. So this route does its own
+        # refusing, and must: it is reachable by anyone who can reach the port.
+        user = request.scope.get("user")
+        token = getattr(user, "access_token", None)
+        if token is None:
+            if config.require_auth:
+                return PlainTextResponse(
+                    "this export requires an authenticated caller\n",
+                    status_code=401,
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+            # No auth required means stdio's bargain over http on purpose
+            # (`allow_insecure_http`): there is nothing here to protect that
+            # the tools were protecting either.
+            key_id, rights = LOCAL_KEY_ID, Permissions.local()
+        else:
+            rights = Permissions.from_claims(
+                list(token.scopes or []), getattr(token, "claims", None) or {}
+            )
+            key_id = token.subject or token.client_id or LOCAL_KEY_ID
+
+        if not rights.may_call("inventory_export"):
+            return PlainTextResponse(
+                f"{key_id} may not download exports\n", status_code=403
+            )
+
+        name = request.path_params["name"]
+        with trail.operation(
+            key_id=key_id, tool="inventory_export_download", params={"path": name}
+        ) as ctx:
+            try:
+                target = under_root(export_dir, name)
+                readable = target.is_file()
+            except ExportError as exc:
+                # Logged, not answered. Telling a caller apart "outside the
+                # directory" from "not there" hands them a way to map the
+                # filesystem one request at a time, and the same reasoning
+                # keeps the token verifier quiet about why it refused.
+                log.warning(f"refused export download of {name!r}: {exc}")
+                readable = False
+                target = None
+            if target is None or not readable:
+                ctx.extra["refused"] = True
+                return PlainTextResponse("no such export\n", status_code=404)
+
+            # Recorded before the response leaves: FileResponse streams after
+            # this block has closed, so anything measured later is measured
+            # after the audit record is already written.
+            ctx.extra["bytes_sent"] = target.stat().st_size
+            return FileResponse(
+                target,
+                # `filename` is what makes this a download rather than
+                # something a browser renders. These files carry a client's
+                # table and column names; they should land on a disk, not in a
+                # tab.
+                filename=target.name,
+                media_type=_DOWNLOAD_TYPES.get(
+                    target.suffix, "application/octet-stream"
+                ),
+            )
 
 
 def _guard(func: Any) -> Any:

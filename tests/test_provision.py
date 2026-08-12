@@ -239,6 +239,10 @@ def test_a_rendered_skill_parses_end_to_end(
         ("PROVISION_TOKEN_FILE", str(token_file)),
         ("MCP_OUT_DIR", str(tmp_path / "out")),
         ("PROVISION_LANG", lang),
+        # Pinned, not inherited: the slug below is derived from it, and
+        # `provision` reads the repo's own .env — so a developer whose .env
+        # names their server fails this test on an unrelated setting.
+        ("MCP_SERVER_NAME", "etl-agent-mcp"),
         ("MCP_ENGINE", "mssql"),
         ("MCP_TRANSPORT", "streamable-http"),
         ("MCP_STAGING_DB", "/data/staging.db"),

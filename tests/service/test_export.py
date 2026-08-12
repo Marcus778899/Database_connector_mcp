@@ -7,7 +7,12 @@ from pathlib import Path
 import pytest
 
 from src.core.contracts import ColumnInfo, ContainerInfo, ContainerType
-from src.service.export import ExportError, export_inventory, resolve_target
+from src.service.export import (
+    ExportError,
+    export_inventory,
+    resolve_target,
+    under_root,
+)
 from src.service.staging import ColumnAnnotation, StagingStore
 
 
@@ -145,6 +150,49 @@ def test_a_symlink_pointing_out_is_refused(export_dir: Path, tmp_path: Path):
 
     with pytest.raises(ExportError, match="outside the export directory"):
         resolve_target(export_dir, "link/escaped.md", "markdown")
+
+
+# ---- what a download may reach ----
+#
+# Writing and downloading share `under_root`, so the two cannot disagree about
+# where the boundary is. These cover it as the download calls it: a name off a
+# URL, with no format and no default.
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["../escaped.md", "../../etc/passwd", "sub/../../escaped.md"],
+)
+def test_a_download_path_climbing_out_is_refused(export_dir: Path, path: str):
+    with pytest.raises(ExportError, match="outside the export directory"):
+        under_root(export_dir, path)
+
+
+def test_a_download_path_inside_resolves(export_dir: Path):
+    assert (
+        under_root(export_dir, "sub/catalog.md")
+        == (export_dir / "sub" / "catalog.md").resolve()
+    )
+
+
+def test_a_download_symlink_pointing_out_is_refused(export_dir: Path, tmp_path: Path):
+    """The one that a check on the string alone would miss."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.md").write_text("not yours", encoding="utf-8")
+    try:
+        (export_dir / "link").symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("this platform will not let us make a symlink")
+
+    with pytest.raises(ExportError, match="outside the export directory"):
+        under_root(export_dir, "link/secret.md")
+
+
+def test_the_export_directory_itself_resolves_to_itself(export_dir: Path):
+    """`under_root` answers where, not whether: it is the download's job to
+    notice this is not a file, which it does by asking for `is_file`."""
+    assert under_root(export_dir, ".") == export_dir.resolve()
 
 
 # ---- what comes back ----

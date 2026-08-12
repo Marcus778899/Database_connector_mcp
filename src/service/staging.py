@@ -4,7 +4,8 @@ import hashlib
 import json
 import sqlite3
 import threading
-from collections.abc import Iterable, Sequence
+from collections.abc import Generator, Iterable, Sequence
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,11 @@ from src.core.contracts import (
 NO_SCHEMA = ""
 
 MARKER = "database-mcp-connector/staging"
+# Bumped only by a change that makes an existing file unreadable, because the
+# reaction to a bump is `delete it and rescan` — which throws away every
+# description `annotate` ever wrote. `_SCHEMA` runs in full on every open and
+# every statement in it is `IF NOT EXISTS`, so a new index or a new table
+# reaches an old file on its own and is not a reason to bump.
 SCHEMA_VERSION = 3
 
 # Page sizes for the two reads that can otherwise return a whole catalog.
@@ -44,6 +50,11 @@ _COLUMNS_WITHOUT_PROFILE = (
     "description_updated_at, references_container, references_column, "
     "sensitivity, sensitivity_source, scanned_at"
 )
+
+# Between the two halves of a cursor that spans containers. A control
+# character, because a container name may contain any of the punctuation that
+# would otherwise read as a separator.
+_CURSOR_SEPARATOR = "\x1f"
 
 # Who wrote a description. The server decides this, never the caller.
 SOURCE_NATIVE = "native"
@@ -119,6 +130,12 @@ CREATE INDEX IF NOT EXISTS columns_by_container
 -- For searching by column name across the whole catalog.
 CREATE INDEX IF NOT EXISTS columns_by_name ON columns (column_name);
 
+-- For walking a whole database's columns in one pass, which is how a caller
+-- describes an inventory it has just taken. The order is the keyset order, so
+-- the index answers the ORDER BY as well as the WHERE.
+CREATE INDEX IF NOT EXISTS columns_by_scan
+    ON columns (database, container_name, ordinal);
+
 -- Append-only: `schema_hash` keeps only the latest state, but "what changed
 -- upstream this week" is what a data engineer asks first, and the hash needed
 -- to answer it was already being computed and thrown away.
@@ -184,6 +201,33 @@ def _ordinal_cursor(cursor: str) -> int:
         raise InvalidCursorError(
             f"{cursor!r} is not a cursor from a previous page; pass back the "
             "`next_cursor` you were given, or nothing to start from the first"
+        ) from exc
+
+
+def _cross_container_cursor(cursor: str) -> tuple[str, int]:
+    """
+    The last (container, ordinal) returned, for a page that spans containers.
+
+    Ordinals only identify a row within one container, so walking a whole
+    database needs both halves or the page after `orders.7` would skip every
+    column past the seventh of every later table.
+
+    The separator is a unit separator rather than `:` or `|`, because a
+    container name may legitimately contain either and a cursor that splits in
+    the wrong place is a silently wrong page. Nothing reads this but the code
+    below; it is machine-made and travels back unchanged.
+    """
+    container, separator, ordinal = cursor.rpartition(_CURSOR_SEPARATOR)
+    try:
+        if not separator:
+            raise ValueError(cursor)
+        return container, int(ordinal)
+    except ValueError as exc:
+        raise InvalidCursorError(
+            f"{cursor!r} is not a cursor from a previous page of this shape; "
+            "pass back the `next_cursor` you were given, or nothing to start "
+            "from the first. A cursor from a single-container page does not "
+            "carry a container and cannot be continued across the database"
         ) from exc
 
 
@@ -284,13 +328,45 @@ class ColumnAnnotation(BaseModel):
     sensitivity: Sensitivity | None = None
 
 
+class ContainerAnnotation(BaseModel):
+    """
+    One container's worth of writing, for describing several at once.
+
+    `schema_name` rather than the tool's `schema`, which pydantic would read as
+    a shadow of `BaseModel.schema` — and it is the name every other model here
+    already uses for it.
+    """
+
+    container: str
+    schema_name: str | None = None
+    container_description: str | None = None
+    columns: list[ColumnAnnotation] = []
+
+
+class ContainerAnnotateResult(BaseModel):
+    """What one container in a batch took."""
+
+    container: str
+    container_updated: bool = False
+    columns_updated: int = 0
+    unknown_columns: list[str] = []
+
+
 class AnnotateResult(BaseModel):
-    """`unknown_columns` is reported rather than ignored: a name that is not
-    there usually means the agent is annotating the wrong container."""
+    """
+    `unknown_columns` is reported rather than ignored: a name that is not
+    there usually means the agent is annotating the wrong container.
+
+    `per_container` and `unknown_containers` are filled only by a batch; a
+    single container's result has the shape it always had, so nothing that
+    reads one has to learn about batches to keep working.
+    """
 
     containers_updated: int = 0
     columns_updated: int = 0
     unknown_columns: list[str] = []
+    per_container: list[ContainerAnnotateResult] = []
+    unknown_containers: list[str] = []
 
 
 class StoredContainerPage(BaseModel):
@@ -866,6 +942,26 @@ class StagingStore:
 
     # ---- annotations ----
 
+    @contextmanager
+    def _transaction(self) -> Generator[None, None, None]:
+        """
+        The lock, and a commit that only happens if the body finished.
+
+        The rollback is the point. Without it a write that raises part-way
+        leaves its statements open on a connection everything else shares, and
+        the *next* caller's commit adopts them — so a batch that failed lands
+        anyway, later, under someone else's name. `annotate_many` runs fifteen
+        containers between one commit and the next, which is enough exposure to
+        be worth saying out loud rather than relying on nothing ever throwing.
+        """
+        with self._lock:
+            try:
+                yield
+            except BaseException:
+                self._conn.rollback()
+                raise
+            self._conn.commit()
+
     def annotate(
         self,
         database: str,
@@ -887,77 +983,161 @@ class StagingStore:
         is making one statement about it, so a crash must not leave the table
         described and its columns not.
         """
-        schema_key = schema or NO_SCHEMA
-        key = (database, schema_key, container)
         written_at = _now()
-        result = AnnotateResult()
-
-        with self._lock:
-            if (
-                self._conn.execute(
-                    "SELECT 1 FROM containers WHERE database=? AND schema_name=? "
-                    "AND container_name=?",
-                    key,
-                ).fetchone()
-                is None
-            ):
+        with self._transaction():
+            one = self._annotate_one(
+                database,
+                ContainerAnnotation(
+                    container=container,
+                    schema_name=schema,
+                    container_description=container_description,
+                    columns=list(columns),
+                ),
+                source=source,
+                written_at=written_at,
+            )
+            if one is None:
                 raise UnknownStagedContainerError(
                     f"{container!r} is not in the inventory of {database!r}; "
                     "run inventory_start first"
                 )
 
-            if container_description is not None:
-                self._conn.execute(
-                    "UPDATE containers SET description=?, description_source=?, "
-                    "description_updated_at=? WHERE database=? AND schema_name=? "
-                    "AND container_name=?",
-                    (_blank_to_none(container_description), source, written_at, *key),
-                )
-                result.containers_updated = 1
-
-            known = {
-                row["column_name"]
-                for row in self._conn.execute(
-                    "SELECT column_name FROM columns WHERE database=? AND "
-                    "schema_name=? AND container_name=?",
-                    key,
-                )
-            }
-            for annotation in columns:
-                if annotation.column not in known:
-                    result.unknown_columns.append(annotation.column)
-                    continue
-                assignments, params = [], []
-                if annotation.description is not None:
-                    assignments += [
-                        "description=?",
-                        "description_source=?",
-                        "description_updated_at=?",
-                    ]
-                    params += [
-                        _blank_to_none(annotation.description),
-                        source,
-                        written_at,
-                    ]
-                if annotation.sensitivity is not None:
-                    assignments += ["sensitivity=?", "sensitivity_source=?"]
-                    params += [str(annotation.sensitivity), source]
-                if not assignments:
-                    continue
-                self._conn.execute(
-                    f"UPDATE columns SET {', '.join(assignments)} "  # noqa: S608
-                    "WHERE database=? AND schema_name=? AND container_name=? "
-                    "AND column_name=?",
-                    (*params, *key, annotation.column),
-                )
-                result.columns_updated += 1
-
-            self._conn.commit()
-
         log.info(
             f"annotated {database}.{container} by {source}: "
-            f"{result.columns_updated} columns"
+            f"{one.columns_updated} columns"
         )
+        return AnnotateResult(
+            containers_updated=int(one.container_updated),
+            columns_updated=one.columns_updated,
+            unknown_columns=one.unknown_columns,
+        )
+
+    def annotate_many(
+        self,
+        database: str,
+        containers: Sequence[ContainerAnnotation],
+        *,
+        source: str = SOURCE_AI,
+    ) -> AnnotateResult:
+        """
+        Describe several containers in one transaction.
+
+        The counterpart of reading a page of columns that spans containers:
+        what was read in one call is written back in one call, and the whole
+        page lands or none of it does.
+
+        A container that is not in the inventory is reported in
+        `unknown_containers` rather than raised, which is the one place this
+        differs from `annotate`. One mistyped name in a batch of fifteen should
+        not throw away fourteen tables' worth of descriptions — and the name
+        still comes back, so the caller can tell it was not written.
+        """
+        written_at = _now()
+        result = AnnotateResult()
+        with self._transaction():
+            for item in containers:
+                one = self._annotate_one(
+                    database, item, source=source, written_at=written_at
+                )
+                if one is None:
+                    result.unknown_containers.append(item.container)
+                    continue
+                result.per_container.append(one)
+                result.containers_updated += int(one.container_updated)
+                result.columns_updated += one.columns_updated
+                result.unknown_columns += [
+                    f"{item.container}.{name}" for name in one.unknown_columns
+                ]
+
+        log.info(
+            f"annotated {len(result.per_container)} containers of {database} "
+            f"by {source}: {result.columns_updated} columns"
+            + (
+                f"; not in the inventory: {', '.join(result.unknown_containers)}"
+                if result.unknown_containers
+                else ""
+            )
+        )
+        return result
+
+    def _annotate_one(
+        self,
+        database: str,
+        item: ContainerAnnotation,
+        *,
+        source: str,
+        written_at: str,
+    ) -> ContainerAnnotateResult | None:
+        """
+        One container's writes, or None if it was never inventoried.
+
+        Takes neither the lock nor a commit: both callers hold one transaction
+        open around however many containers they were given, and a helper that
+        committed its own share would be the thing that leaves half a batch
+        written.
+        """
+        key = (database, item.schema_name or NO_SCHEMA, item.container)
+        if (
+            self._conn.execute(
+                "SELECT 1 FROM containers WHERE database=? AND schema_name=? "
+                "AND container_name=?",
+                key,
+            ).fetchone()
+            is None
+        ):
+            return None
+
+        result = ContainerAnnotateResult(container=item.container)
+        if item.container_description is not None:
+            self._conn.execute(
+                "UPDATE containers SET description=?, description_source=?, "
+                "description_updated_at=? WHERE database=? AND schema_name=? "
+                "AND container_name=?",
+                (
+                    _blank_to_none(item.container_description),
+                    source,
+                    written_at,
+                    *key,
+                ),
+            )
+            result.container_updated = True
+
+        known = {
+            row["column_name"]
+            for row in self._conn.execute(
+                "SELECT column_name FROM columns WHERE database=? AND "
+                "schema_name=? AND container_name=?",
+                key,
+            )
+        }
+        for annotation in item.columns:
+            if annotation.column not in known:
+                result.unknown_columns.append(annotation.column)
+                continue
+            assignments, params = [], []
+            if annotation.description is not None:
+                assignments += [
+                    "description=?",
+                    "description_source=?",
+                    "description_updated_at=?",
+                ]
+                params += [
+                    _blank_to_none(annotation.description),
+                    source,
+                    written_at,
+                ]
+            if annotation.sensitivity is not None:
+                assignments += ["sensitivity=?", "sensitivity_source=?"]
+                params += [str(annotation.sensitivity), source]
+            if not assignments:
+                continue
+            self._conn.execute(
+                f"UPDATE columns SET {', '.join(assignments)} "  # noqa: S608
+                "WHERE database=? AND schema_name=? AND container_name=? "
+                "AND column_name=?",
+                (*params, *key, annotation.column),
+            )
+            result.columns_updated += 1
         return result
 
     # ---- reading ----
@@ -1017,34 +1197,69 @@ class StagingStore:
     def columns(
         self,
         database: str,
-        container: str,
+        container: str | None = None,
         schema: str | None = None,
         *,
         limit: int = DEFAULT_COLUMN_PAGE,
         cursor: str | None = None,
         include_profile: bool = True,
+        only_missing_description: bool = False,
     ) -> StoredColumnPage:
         """
-        One page of a container's columns, in ordinal order.
+        One page of columns, in ordinal order.
 
         Paged because a wide table is the other way an inventory floods a
         caller's context, and `include_profile=False` because on such a table
         the statistics are most of the weight — the escape hatch for reading
         the shape of a 300-column table without its every top-values list.
+
+        Without a `container` the page spans the whole database, ordered by
+        container and then ordinal. That is what describing an inventory
+        actually needs: one table at a time costs a round trip per table, and
+        on a catalog of any size the round trips outweigh the work. The cursor
+        then carries both halves and cannot be swapped with a single-container
+        one — see `_cross_container_cursor`.
+
+        `only_missing_description` narrows it to the columns nobody has
+        described *and* the source said nothing about, which is the whole of
+        what is left to do and shrinks with every write.
         """
         selected = "*" if include_profile else _COLUMNS_WITHOUT_PROFILE
-        clauses = ["database=?", "schema_name=?", "container_name=?"]
-        params: list[Any] = [database, schema or NO_SCHEMA, container]
-        if cursor is not None:
-            # keyset on the ordering column, as elsewhere; ordinals are unique
-            # within one container
-            clauses.append("ordinal>?")
-            params.append(_ordinal_cursor(cursor))
+        clauses = ["database=?"]
+        params: list[Any] = [database]
+        if container is not None:
+            clauses += ["schema_name=?", "container_name=?"]
+            params += [schema or NO_SCHEMA, container]
+            if cursor is not None:
+                # keyset on the ordering column, as elsewhere; ordinals are
+                # unique within one container
+                clauses.append("ordinal>?")
+                params.append(_ordinal_cursor(cursor))
+            order = "ordinal"
+        else:
+            # `schema` is not a filter here and the keyset does not carry it:
+            # an adapter with schemas qualifies the name (`dbo.orders`), so a
+            # container name is already unique within a database. `containers`
+            # keysets on the same assumption.
+            if cursor is not None:
+                last_container, last_ordinal = _cross_container_cursor(cursor)
+                clauses.append("(container_name>? OR (container_name=? AND ordinal>?))")
+                params += [last_container, last_container, last_ordinal]
+            order = "container_name, ordinal"
+
+        if only_missing_description:
+            # Nothing written, and nothing said upstream. A source that keeps
+            # its own comments has already answered better than a guess would,
+            # and overwriting that is the one loss this cannot undo.
+            clauses.append(
+                "description IS NULL AND "
+                "(native_description IS NULL OR native_description='')"
+            )
         params.append(limit + 1)  # one extra row tells us whether more remain
 
         rows = self._rows(
             f"SELECT {selected} FROM columns WHERE {' AND '.join(clauses)} "  # noqa: S608
-            "ORDER BY ordinal LIMIT ?",
+            f"ORDER BY {order} LIMIT ?",
             params,
         )
         page = []
@@ -1053,9 +1268,16 @@ class StagingStore:
             raw = item.get("profile")
             item["profile"] = json.loads(raw) if raw else None
             page.append(StoredColumn(**item))
+        if len(rows) <= limit:
+            return StoredColumnPage(columns=page)
+        last = page[-1]
         return StoredColumnPage(
             columns=page,
-            next_cursor=str(page[-1].ordinal) if len(rows) > limit else None,
+            next_cursor=(
+                str(last.ordinal)
+                if container is not None
+                else f"{last.container_name}{_CURSOR_SEPARATOR}{last.ordinal}"
+            ),
         )
 
     def search(

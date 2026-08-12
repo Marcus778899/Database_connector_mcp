@@ -49,9 +49,19 @@ want = "what is in this table"
 gets = "one page; pass `include_profile=False` on a wide one"
 
 [[catalog.routes]]
+tool = "inventory_relationships"
+want = "how do these two tables join"
+gets = "every foreign key as an edge; empty if the source declares none"
+
+[[catalog.routes]]
+tool = "get_sample"
+want = "what does this column actually look like"
+gets = "a few masked rows. **The only one that asks the source live** — reach for it when the description and the statistics both fall short"
+
+[[catalog.routes]]
 tool = "inventory_export"
 want = "all of it"
-gets = "**a file** — only its path comes back, never the contents"
+gets = "**a file** — only its path and download URL come back, never the contents"
 
 [tools]
 heading = "## Tools you can call"

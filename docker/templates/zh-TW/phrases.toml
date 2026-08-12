@@ -46,9 +46,19 @@ want = "這張表裡面有什麼"
 gets = "一頁；欄位很多的表加上 `include_profile=False`"
 
 [[catalog.routes]]
+tool = "inventory_relationships"
+want = "這兩張表怎麼接"
+gets = "所有外鍵，以邊的形式；來源沒宣告外鍵就是空的"
+
+[[catalog.routes]]
+tool = "get_sample"
+want = "這一欄實際長什麼樣"
+gets = "幾筆遮罩過的資料。**唯一會即時去問來源的一個**，描述和統計都講不清楚時才用"
+
+[[catalog.routes]]
 tool = "inventory_export"
 want = "我全部都要"
-gets = "**一個檔案**——回傳的只有路徑，永遠不會是內容"
+gets = "**一個檔案**——回傳的只有路徑與下載網址，永遠不會是內容"
 
 [tools]
 heading = "## 你可以呼叫的工具"
@@ -79,12 +89,12 @@ inventory_status = "掃描跑到哪了，以及為什麼停下來。"
 inventory_cancel = "在目前這張表跑完之後停止掃描。"
 inventory_summary = "已盤點內容的各項計數。"
 inventory_containers = "一頁已盤點的資料表，含掃描狀態。"
-inventory_columns = "一頁某張表已記錄的欄位，依 ordinal 排序。"
-inventory_relationships = "盤點裡的所有外鍵，以邊的形式回傳。"
-inventory_changes = "兩次掃描之間上游 schema 變了什麼，新的在前。"
+inventory_columns = "一頁已記錄的欄位，依 ordinal 排序。不給 `container` 就是跨整個 database 分頁。"
+inventory_relationships = "盤點裡的所有外鍵，以邊的形式回傳。**靠來源自己宣告的外鍵**——沒宣告的資料庫這裡會是空的，那不是盤點沒跑完。"
+inventory_changes = "兩次掃描之間上游 schema 變了什麼，新的在前。第一次掃描只會是一排 `container_added`，第二次之後才有資訊。"
+inventory_annotate = "描述已盤點的表和它們的欄位實際裝什麼。可以一次帶多張表。"
 inventory_search = "名稱或描述有提到某個關鍵字的表與欄位。"
-inventory_annotate = "描述一張已盤點的表和它的欄位實際裝什麼。"
-inventory_export = "把整份盤點寫成檔案，只回傳路徑。"
+inventory_export = "把整份盤點寫成檔案，回傳路徑與下載網址。"
 
 [limits]
 heading = "## 這個連線看得到什麼"

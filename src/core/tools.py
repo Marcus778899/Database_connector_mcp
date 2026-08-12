@@ -120,17 +120,28 @@ TOOLS: tuple[ToolSpec, ...] = (
     ToolSpec(
         name="inventory_columns",
         group=ToolGroup.INVENTORY,
-        summary="One page of a container's recorded columns, in ordinal order.",
+        summary=(
+            "One page of recorded columns, in ordinal order. Without a "
+            "`container` the page spans the whole database."
+        ),
     ),
     ToolSpec(
         name="inventory_relationships",
         group=ToolGroup.INVENTORY,
-        summary="Every foreign key in the inventory, as edges.",
+        summary=(
+            "Every foreign key in the inventory, as edges. Only the ones the "
+            "source declares — a database without foreign keys returns nothing "
+            "here, which is not an unfinished scan."
+        ),
     ),
     ToolSpec(
         name="inventory_changes",
         group=ToolGroup.INVENTORY,
-        summary="What the upstream schema did between scans, newest first.",
+        summary=(
+            "What the upstream schema did between scans, newest first. The "
+            "first scan of a source is all `container_added`; this earns its "
+            "keep from the second onwards."
+        ),
     ),
     ToolSpec(
         name="inventory_search",
@@ -140,13 +151,19 @@ TOOLS: tuple[ToolSpec, ...] = (
     ToolSpec(
         name="inventory_annotate",
         group=ToolGroup.INVENTORY,
-        summary="Describe what an inventoried table and its columns actually hold.",
+        summary=(
+            "Describe what inventoried tables and their columns actually hold. "
+            "Takes a batch of tables as readily as one."
+        ),
         writes=True,
     ),
     ToolSpec(
         name="inventory_export",
         group=ToolGroup.INVENTORY,
-        summary="Write the whole inventory to a file and return only its path.",
+        summary=(
+            "Write the whole inventory to a file and return where to fetch it, "
+            "never its contents."
+        ),
         needs_export_dir=True,
     ),
 )
